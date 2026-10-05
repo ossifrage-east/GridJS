@@ -69,7 +69,6 @@ export class App {
             throw new Error(`Element with id ${id} not found`);
         }
         this.worktop = worktop as HTMLDivElement;  // 工作区域
-        document.body.appendChild(this.worktop);
         this.initContainerSplit();
         this.initMenu();
         this.initToolbar();
