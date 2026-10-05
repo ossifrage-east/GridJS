@@ -326,7 +326,7 @@ export class BtnBase extends EventEmitter {
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                fontSize: '12px',
+                fontSize: '14px',
                 borderRadius: `${textBorderRadius}`,
             },
         });

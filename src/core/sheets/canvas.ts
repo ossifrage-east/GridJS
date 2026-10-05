@@ -14,6 +14,8 @@ import { EventEmitter } from "../../utils/eventEmitter";
 import { CELL_PADDING, DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE, GRID_LINE_COLOR, KEYWORDS, MouseLocation, TEXT_COLOR } from "../constant";
 import { DataCollection } from "../dataArchitecture/dataCollection";
 import { Menu, MenuContent } from "../common/menu";
+import { Dialog } from "../common/dialog";
+import { createDiv, createInput, createButton } from "../../utils/dom";
 
 
 /**
@@ -624,7 +626,7 @@ export class Canvas extends EventEmitter {
      * - 删除：行头删行、列头删列、单元格清除内容；删除后选区保持原位置（越界收缩）；
      * - 隐藏：隐藏选区行/列（单元格上无隐藏语义，忽略）；
      * - 取消隐藏：取消选区范围内隐藏的行/列（非全表）；
-     * - 行高：prompt 输入行高，应用到选区内所有行；
+     * - 行高：弹出行高对话框（Bootstrap 风格），确认后应用到选区内所有行；
      * - 分割线：切换网格线显示（showGridLines）；
      * - 清除内容：清空选区内容（保留样式）；
      * - 设置单元格格式：prompt 输入背景颜色，应用到选区内所有单元格。
@@ -683,19 +685,10 @@ export class Canvas extends EventEmitter {
                     return;
                 }
                 break;
-            case 'rowHeight': {
-                const current = data.rowHeaders.getAt(startRow - 1)?.height || 20;
-                const input = window.prompt('请输入行高（像素）：', String(Math.round(current)));
-                if (input === null) return;
-                const height = Number(input);
-                if (!Number.isFinite(height) || height <= 0) return;
-                data.runWithFullStateUndo('调整行高', () => {
-                    for (let r = startRow; r <= endRow; r++) {
-                        data.adjustRowHeight(r, height);
-                    }
-                });
-                break;
-            }
+            case 'rowHeight':
+                // 弹出行高对话框：确认后经 runWithFullStateUndo 应用并重绘（见 openRowHeightDialog）
+                this.openRowHeightDialog(startRow, endRow);
+                return;
             case 'gridLines':
                 data.runWithFullStateUndo('切换分割线', () => {
                     data.showGridLines = !data.showGridLines;
@@ -718,6 +711,240 @@ export class Canvas extends EventEmitter {
             }
         }
         this.refreshAfterContextMenu();
+    }
+
+    /**
+     * 弹出行高设置对话框（Bootstrap 风格，替代原 window.prompt 交互）
+     *
+     * 确认后把输入高度应用到选区内所有行，并经 runWithFullStateUndo 包裹以支持整体撤销/重做；
+     * 取消、ESC、点击遮罩或非法输入（空/非数字/小于最小行高 24）不产生任何变更，非法输入时对话框保持打开。
+     * 对话框关闭后自毁（destroy），避免 DOM 与事件监听累积。
+     * @param {number} startRow - 选区起始行（1-based）
+     * @param {number} endRow - 选区结束行（1-based）
+     * @private
+     */
+    private openRowHeightDialog(startRow: number, endRow: number): void {
+        const data = this.data;
+        const MIN_ROW_HEIGHT = 24; // 最小行高，与 DataCollection.adjustRowHeight 的钳制及行表头拖拽调高保持一致
+        const current = data.rowHeaders.getAt(startRow - 1)?.height || MIN_ROW_HEIGHT;
+
+        // 内容区：标签 + 数字输入框（Bootstrap form-control 视觉）
+        const label = createDiv({
+            textContent: '行高（像素）',
+            style: { fontSize: '0.875rem', color: '#212529' }
+        });
+        // 输入框：自身无边框透明底，边框/圆角/聚焦高亮由外层 group 统一提供；
+        // 用 text + inputmode=numeric 替代 type=number：后者不支持任何选区 API
+        // （selectionStart 恒为 null、setSelectionRange 抛 InvalidStateError），
+        // 无法实现鼠标点击定位光标与拖拽选区；数字约束改由 input 事件过滤保证
+        const input = createInput({
+            type: 'text',
+            attributes: { inputmode: 'numeric', autocomplete: 'off', spellcheck: 'false' },
+            style: {
+                flex: '1',
+                minWidth: '0',
+                boxSizing: 'border-box',
+                padding: '0.25rem 0.5rem',
+                fontSize: '0.875rem',
+                lineHeight: '1.5',
+                color: '#212529',
+                backgroundColor: 'transparent',
+                border: 'none',
+                outline: 'none',
+            }
+        });
+        input.value = String(Math.round(current));
+        // 数字过滤：剥离非数字字符（含中文输入法产生的全角数字），保持等价于 type=number 的输入约束
+        input.addEventListener('input', () => {
+            const cleaned = input.value.replace(/\D/g, '');
+            if (cleaned !== input.value) {
+                input.value = cleaned;
+            }
+        });
+
+        // 自定义步进：单击 ±1；按住持续 ±1（初始延迟 400ms，之后每 80ms 重复），抬起即停止
+        const applyStep = (delta: number): void => {
+            const value = Number(input.value);
+            const base = Number.isFinite(value) ? value : 0;
+            input.value = String(Math.max(MIN_ROW_HEIGHT, base + delta));
+        };
+        const startRepeat = (delta: number): void => {
+            applyStep(delta);
+            let timer: ReturnType<typeof setTimeout> | null = null;
+            const tick = () => {
+                applyStep(delta);
+                timer = setTimeout(tick, 80);
+            };
+            timer = setTimeout(tick, 400);
+            // 在 window 上监听抬起/取消：即使指针移出按钮也能停止连发
+            const stop = () => {
+                if (timer !== null) {
+                    clearTimeout(timer);
+                    timer = null;
+                }
+                window.removeEventListener('pointerup', stop);
+                window.removeEventListener('pointercancel', stop);
+            };
+            window.addEventListener('pointerup', stop);
+            window.addEventListener('pointercancel', stop);
+        };
+        // 步进按钮：无独立边框，内嵌于 group 右侧，仅以细分隔线与输入框分界（Bootstrap input-group 视觉）；
+        // flex: 1 1 0 让每个按钮各占列高的一半，hover 背景色因此铺满整个按钮区域
+        const createSpinnerButton = (glyph: string, withDivider: boolean): HTMLButtonElement => createButton({
+            textContent: glyph,
+            style: {
+                flex: '1 1 0',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: '1.4rem',
+                padding: '0',
+                fontSize: '0.55rem',
+                lineHeight: '1',
+                color: '#6c757d',
+                backgroundColor: 'transparent',
+                border: 'none',
+                borderTop: withDivider ? '1px solid #dee2e6' : 'none',
+                cursor: 'pointer',
+                userSelect: 'none',
+            }
+        });
+        const bindSpinner = (button: HTMLButtonElement, delta: number): void => {
+            button.addEventListener('pointerdown', (e) => {
+                if (e.button !== 0) return;
+                e.preventDefault(); // 阻止焦点转移与文本选择，保证按住期间连发不被打断
+                startRepeat(delta);
+            });
+            button.addEventListener('mouseenter', () => { button.style.backgroundColor = '#e9ecef'; });
+            button.addEventListener('mouseleave', () => { button.style.backgroundColor = 'transparent'; });
+        };
+
+        const upButton = createSpinnerButton('▲', false);
+        const downButton = createSpinnerButton('▼', true);
+        bindSpinner(upButton, 1);
+        bindSpinner(downButton, -1);
+        const spinnerColumn = createDiv({
+            children: [upButton, downButton],
+            style: {
+                display: 'flex',
+                flexDirection: 'column',
+                borderLeft: '1px solid #ced4da', // 输入框与步进按钮之间的分隔线
+            }
+        });
+
+        // 组合容器（Bootstrap input-group）：输入框与步进按钮共用同一边框/圆角/白底，连为一体；
+        // overflow hidden 让子元素随容器圆角裁切
+        const group = createDiv({
+            children: [input, spinnerColumn],
+            style: {
+                display: 'flex',
+                alignItems: 'stretch',
+                backgroundColor: '#fff',
+                border: '1px solid #ced4da',
+                borderRadius: '0.375rem',
+                overflow: 'hidden',
+                transition: 'border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out',
+            }
+        });
+        // 聚焦态高亮作用到整个组合容器（对应 Bootstrap input-group 的 focus 视觉）
+        input.addEventListener('focus', () => {
+            group.style.borderColor = '#86b7fe';
+            group.style.boxShadow = '0 0 0 0.25rem rgba(13, 110, 253, 0.25)';
+        });
+        input.addEventListener('blur', () => {
+            group.style.borderColor = '#ced4da';
+            group.style.boxShadow = 'none';
+        });
+        // —— 鼠标点击定位光标 + 拖拽选区 ——
+        // Chromium 怪癖：输入框持有非折叠选区时（如打开对话框时的全选），mousedown 重新聚焦
+        // 会「恢复原选区」而不是把光标定位到点击处（表现为全选不消选，只有方向键能移动光标）。
+        // 处理策略：仅在存在选区时接管鼠标行为（preventDefault + 手动定位/拖拽选区）；
+        // 无选区时完全不干预，点击定位与拖拽选择均走原生行为。
+        const measureCtx = document.createElement('canvas').getContext('2d');
+        /** 依据点击横坐标计算输入框内最近的字符边界索引（镜像 canvas 测量字符宽度） */
+        const caretIndexFromClientX = (clientX: number): number => {
+            const rect = input.getBoundingClientRect();
+            const style = window.getComputedStyle(input);
+            measureCtx.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+            const x = clientX - rect.left - parseFloat(style.paddingLeft) + input.scrollLeft;
+            let acc = 0;
+            for (let i = 0; i < input.value.length; i++) {
+                const w = measureCtx.measureText(input.value[i]).width;
+                if (x < acc + w / 2) return i; // 落在字符前半段则定位到该字符之前
+                acc += w;
+            }
+            return input.value.length;
+        };
+        let selectionAnchor = 0; // 拖拽起点（按下时的光标索引）
+        const handleSelectionDrag = (e: MouseEvent): void => {
+            const idx = caretIndexFromClientX(e.clientX);
+            input.setSelectionRange(Math.min(selectionAnchor, idx), Math.max(selectionAnchor, idx));
+        };
+        const handleSelectionEnd = (): void => {
+            window.removeEventListener('mousemove', handleSelectionDrag);
+            window.removeEventListener('mouseup', handleSelectionEnd);
+        };
+        input.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
+            if (input.selectionStart === input.selectionEnd) return; // 无选区：原生行为即可
+            e.preventDefault(); // 阻止 Chromium 恢复原选区，改由下方手动定位
+            input.focus();
+            selectionAnchor = caretIndexFromClientX(e.clientX);
+            input.setSelectionRange(selectionAnchor, selectionAnchor);
+            window.addEventListener('mousemove', handleSelectionDrag);
+            window.addEventListener('mouseup', handleSelectionEnd);
+        });
+        // 双击全选（mousedown 被接管后原生双击选词不再生效，此处显式补齐该惯例行为）
+        input.addEventListener('dblclick', () => {
+            input.setSelectionRange(0, input.value.length);
+        });
+
+        const wrapper = createDiv({
+            children: [label, group],
+            style: { display: 'flex', flexDirection: 'column', gap: '0.5rem' }
+        });
+
+        // 应用输入高度到选区内所有行；非法输入返回 false（由调用方决定是否保持对话框打开）
+        const apply = (): boolean => {
+            const value = input.value.trim();
+            const height = Number(value);
+            if (value === '' || !Number.isFinite(height) || height < MIN_ROW_HEIGHT) return false;
+            data.runWithFullStateUndo('调整行高', () => {
+                for (let r = startRow; r <= endRow; r++) {
+                    data.adjustRowHeight(r, height);
+                }
+            });
+            this.refreshAfterContextMenu();
+            return true;
+        };
+
+        const dialog = new Dialog({
+            title: '行高',
+            content: wrapper,
+            size: 'sm',
+            buttons: [
+                { text: '取消', variant: 'secondary' },
+                {
+                    text: '确定',
+                    variant: 'primary',
+                    close: false, // 校验通过才手动关闭，非法输入时保持打开
+                    onClick: (d) => {
+                        if (apply()) d.hide();
+                    }
+                },
+            ],
+            onClose: () => dialog.destroy()
+        });
+        dialog.show();
+        // 打开后聚焦并全选输入内容，便于直接键入新值；Enter 确认，ESC 由 Dialog 的文档级监听处理
+        input.focus();
+        input.select();
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                if (apply()) dialog.hide();
+            }
+        });
     }
 
     /**
