@@ -3,7 +3,7 @@
 > 会道者，一缕藕丝牵大象。寡道者，千钧铁棒打苍蝇。
 > —— The wise, with a lotus filament, can lead an elephant. The unwise, with an iron club, can but beat flies.
 
-**SilkSpaces（藕丝空间）** GridJS
+**SilkSpaces（藕丝空间）** —— GridJS
  是一个轻量级的 Web 电子表格组件，使用原生 JavaScript/TypeScript + HTML5 Canvas 实现，尽量不依赖第三方库，在浏览器中提供类似 Excel 的表格编辑体验。
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
