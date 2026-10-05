@@ -80,7 +80,7 @@ module.exports = {
         ]
       },
       {	// 图片文件
-        test: /\.(jpe?g|png|gif|bmp|tiff|webp)$/i,
+        test: /\.(jpe?g|png|ico|gif|bmp|tiff|webp)$/i,
         type: "asset", // 一般会转换为 "asset/resource"
         parser: {
           dataUrlCondition: {

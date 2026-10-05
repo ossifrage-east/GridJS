@@ -34,6 +34,7 @@ import { Scroller } from "./common/scroller";
 import { Toolbar } from "./toolbar/toolbar";
 import { Menu } from "./common/menu";
 import { QuickAccess } from "./toolbar/quickAccess";
+import favicon from "../assets/images/favicon.ico";
 
 
 export class App {
@@ -52,6 +53,11 @@ export class App {
      * 初始化工具栏
      */
     constructor(id: string) {
+        const link = document.createElement('link');
+        link.rel = 'icon';
+        link.type = 'image/x-icon';
+        link.href = favicon;
+        document.head.appendChild(link);
         this.initUI(id);
     }
     /**
@@ -63,6 +69,7 @@ export class App {
             throw new Error(`Element with id ${id} not found`);
         }
         this.worktop = worktop as HTMLDivElement;  // 工作区域
+        document.body.appendChild(this.worktop);
         this.initContainerSplit();
         this.initMenu();
         this.initToolbar();
