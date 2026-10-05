@@ -1,0 +1,18 @@
+{
+    "compilerOptions": {
+      "outDir": "./dist/",
+      "noImplicitAny": true,
+      "module": "ES6",
+      "target": "ES5", // 输出 ES5
+      "lib": ["ES6", "DOM", "ES2022"], // 但使用 ES6 特性
+      "downlevelIteration": true, // 添加这个以支持迭代器
+      "sourceMap": true,
+      "allowJs": true,
+      "moduleResolution": "node",
+      "experimentalDecorators": true,
+      "emitDecoratorMetadata": true,
+      "skipLibCheck": true,
+      "allowSyntheticDefaultImports": true,
+      "esModuleInterop": true
+    }
+}

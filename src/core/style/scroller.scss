@@ -1,0 +1,189 @@
+/*  # scroll 模块的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+// 定义变量
+$scroll-size: 12px;
+$scroll-thumb-color: #888;
+$scroll-thumb-hover-color: #666;
+$scroll-thumb-active-color: #444;
+$scroll-direction-color: rgb(236, 236, 236);
+$scroll-direction-hover-color: #ccc;
+$scroll-direction-active-color: #aaa;
+$scroll-border-radius: 6px;
+// $scroll-transition-duration: 0.3s;
+
+// 水平滚动条轨道
+.scroll-horizontal {
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    top: 0;
+    left: 10px;
+    // right: $scroll-size; // 为垂直滚动条留出空间
+    width: calc(100% - 36px);
+    height: 100%;
+
+    // 自定义滚动条轨道
+    .scroll-track {
+        position: absolute;
+        left: 24px;
+        margin: 0 10px;
+        width: calc(100% - 72px);
+        height: $scroll-size;
+        // background: $scroll-track-color;
+        border-radius: $scroll-border-radius;
+
+            // 自定义滚动条滑块
+        .scroll-thumb {
+            position: absolute;
+            background: $scroll-thumb-color;
+            border-radius: $scroll-border-radius;
+            // cursor: pointer;
+            height: 100%;
+            min-width: 30px; // 最小宽度
+            
+            &:hover {
+                background: $scroll-thumb-hover-color;
+            }
+
+            &:active {
+                background: $scroll-thumb-active-color;
+            }
+        }
+    }
+
+    .scroll-back {
+        position: absolute;
+        left: 0;
+        width: calc($scroll-size * 2);
+        height: 100%;
+        background-color: $scroll-direction-color;
+        border-radius: $scroll-border-radius;
+
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpolygon points='12,2 12,14 4,8' fill='%23888'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: center;
+
+        &:hover {
+            background-color: $scroll-direction-hover-color;
+        }
+
+        &:active {
+            background-color: $scroll-direction-active-color;
+        }
+    }
+
+    .scroll-forward {
+        position: absolute;
+        right: 0;
+        width: calc($scroll-size * 2);
+        height: 100%;
+        background-color: $scroll-direction-color;
+        border-radius: $scroll-border-radius;
+
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpolygon points='4,2 4,14 12,8' fill='%23888'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: center;
+
+        &:hover {
+            background-color: $scroll-direction-hover-color;
+        }
+
+        &:active {
+            background-color: $scroll-direction-active-color;
+        }
+    }
+}
+
+// 垂直滚动条轨道
+.scroll-vertical {
+    position: relative;
+    overflow: hidden;
+    top: 10px;
+    right: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    // bottom: $scroll-size; // 为水平滚动条留出空间
+    width: 100%;
+    height: calc(100% - 24px);
+
+    // 自定义滚动条轨道
+    .scroll-track {
+        position: absolute;
+        top: 24px;
+        margin: 10px 0;
+        width: $scroll-size;
+        height: calc(100% - 72px);
+        // background: $scroll-track-color;
+        border-radius: $scroll-border-radius;
+
+            // 自定义滚动条滑块
+        .scroll-thumb {
+            position: absolute;
+            background: $scroll-thumb-color;
+            border-radius: $scroll-border-radius;
+            // cursor: pointer;
+            width: 100%;
+            min-height: 30px; // 最小宽度
+            
+            &:hover {
+                background: $scroll-thumb-hover-color;
+            }
+
+            &:active {
+                background: $scroll-thumb-active-color;
+            }
+        }
+    }
+
+    
+
+    .scroll-back {
+        position: absolute;
+        top: 0;
+        width: 100%;
+        height: calc($scroll-size * 2);
+        background-color: $scroll-direction-color;
+        border-radius: $scroll-border-radius;
+
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpolygon points='8,2 14,12 2,12' fill='%23888'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: center;
+
+        &:hover {
+            background-color: $scroll-direction-hover-color;
+        }
+
+        &:active {
+            background-color: $scroll-direction-active-color;
+        }
+    }
+
+    .scroll-forward {
+        position: absolute;
+        bottom: 0;
+        width: 100%;
+        height: calc($scroll-size * 2);
+        background-color: $scroll-direction-color;
+        border-radius: $scroll-border-radius;
+
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpolygon points='2,4 14,4 8,14' fill='%23888'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: center;
+
+        &:hover {
+            background-color: $scroll-direction-hover-color;
+        }
+
+        &:active {
+            background-color: $scroll-direction-active-color;
+        }
+    }
+}

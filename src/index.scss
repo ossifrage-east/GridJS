@@ -1,0 +1,63 @@
+/*  # 展示页面的全局 CSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+
+@font-face {
+  font-family: "HarmonyOS Sans SC Regular";
+  src: url("./assets/fonts/HarmonyOS_Sans_SC_Regular.ttf") format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap; /* 优化加载显示 */
+}
+
+@font-face {
+  font-family: "HarmonyOS Sans SC Black";
+  src: url("./assets/fonts/HarmonyOS_Sans_SC_Black.ttf") format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap; /* 优化加载显示 */
+}
+
+@font-face {
+  font-family: "HarmonyOS Sans SC Light";
+  src: url("./assets/fonts/HarmonyOS_Sans_SC_Light.ttf") format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap; /* 优化加载显示 */
+}
+
+html, body {
+  margin: 0px;
+  padding: 0px;
+  width: 100%;
+  height: 100%;    
+  min-width: 400px;
+  font-family: "HarmonyOS Sans SC Regular", sans-serif;
+  overflow: hidden;
+  /* background-color: whitesmoke; */
+  -webkit-touch-callout: none;  
+  -webkit-user-select: none;/*webkit浏览器*/
+  -khtml-user-select: none;  
+  -moz-user-select: none;/*火狐*/
+  -ms-user-select: none;/*IE10*/
+  user-select: none;
+}
+
+.container {
+  width: 100%;
+  height: 100%;
+  min-width: 800px;
+  min-height: 600px;
+}
+
+#worktop {
+  overflow: hidden;
+  // position: relative;
+  width: 100%;
+  height: 100%;
+}
+

@@ -1,0 +1,89 @@
+/*  # grid 模块主要是涉及到 hidden 组件的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+
+// 隐藏行列指示图标，主题色 #4CAF50，背景透明：
+// - row（隐藏行）：上下两个三角形——上三角顶点朝上、下三角顶点朝下，中间 2px 间隔
+// - col（隐藏列）：左右两个三角形——左三角顶点朝左、右三角顶点朝右，中间 2px 间隔
+.hidden-container {
+    position: absolute;
+    // 高于行头/列头/主画布（z-index: 4），低于筛选组件（6）与右键菜单（1000），
+    // 否则指示按钮会被后创建的画布层盖住（display: block 也不可见）
+    z-index: 5;
+    // 鼠标事件穿透：避免按钮拦截鼠标造成画布 mouseleave → 按钮隐藏 → 重新显示的闪烁循环
+    // pointer-events: none;
+    // 按钮可交互（点击取消隐藏对应行列块），悬停时显示默认光标；
+    // 闪烁循环已由画布 mouseleave 的 relatedTarget 检查 + 按钮自身 mouseleave 解决
+    cursor: default;
+    background-color: transparent;
+
+    // 行隐藏指示：竖向排列的两个三角（宽 10 = 三角宽，高 22 = 10 + 2 + 10）
+    &.row {
+        width: 10px;
+        height: 22px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+
+        // 上三角：顶点靠上（border-bottom 实色撑出朝上的顶点）
+        &::before {
+            content: '';
+            display: block;
+            width: 0;
+            height: 0;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-bottom: 10px solid #4CAF50;
+        }
+
+        // 下三角：顶点靠下（border-top 实色撑出朝下的顶点），与上三角间隔 2px
+        &::after {
+            content: '';
+            display: block;
+            width: 0;
+            height: 0;
+            margin-top: 2px;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 10px solid #4CAF50;
+        }
+    }
+
+    // 列隐藏指示：横向排列的两个三角（宽 22 = 10 + 2 + 10，高 10 = 三角高）
+    &.col {
+        width: 22px;
+        height: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+
+        // 左三角：顶点靠左（border-right 实色撑出朝左的顶点）
+        &::before {
+            content: '';
+            display: block;
+            width: 0;
+            height: 0;
+            border-top: 5px solid transparent;
+            border-bottom: 5px solid transparent;
+            border-right: 10px solid #4CAF50;
+        }
+
+        // 右三角：顶点靠右（border-left 实色撑出朝右的顶点），与左三角间隔 2px
+        &::after {
+            content: '';
+            display: block;
+            width: 0;
+            height: 0;
+            margin-left: 2px;
+            border-top: 5px solid transparent;
+            border-bottom: 5px solid transparent;
+            border-left: 10px solid #4CAF50;
+        }
+    }
+}
+

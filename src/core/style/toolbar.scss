@@ -1,0 +1,183 @@
+/*  # grid 模块主要是涉及到 toolbar 中的组件的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+.toolbar-container {
+    width: 100%;
+    border-bottom: 1px solid #ddd;
+    background-color: #f3f3f3;
+        
+    .toolbar-quick-access {
+        position: fixed;
+        left: 0;
+        display: flex;
+        gap: 6px;
+        i {
+            font-size: 16px;
+        }
+    }
+    
+    .toolbar-category {
+        display: flex;        
+        width: 100%;
+        height: 25px;
+        align-items: center;
+        justify-content: center; 
+        .toolbar-tabs {
+            display: flex;
+
+            .toolbar-tab {
+                width: 48px;
+                height: 100%;
+                text-align: center;
+                font-size: large;
+                padding: 0px 6px 0px 6px;
+            }
+
+            .toolbar-tab:hover {
+                cursor: pointer;
+                border-radius: 4px;
+                background-color:  lightgrey;
+            }
+            .toolbar-tab.active {
+                border-radius: 4px;
+                background: white;
+            }
+        }
+    }
+    .toolbar-content {
+        display: flex;
+        .toolbar-group {
+            display: none;
+            width: 100%;
+            // height: 100px;
+            margin: 6px 12px;
+            animation: 1s groupOpacity; 
+            -webkit-animation: 1s groupOpacity;
+            -moz-animation: 1s groupOpacity; 
+            align-items: center;
+            justify-content: center;  
+
+            .toolbar-section {
+                display: flex;
+                padding: 4px;
+                align-items: center;
+                justify-content: center;  
+                text-align: center;
+                gap: 6px;
+            }
+            
+            .toolbar-section-line {
+                width: 1px;
+                height: 30px;
+                background-color: #ddd;
+            }
+        }
+    }
+
+        @keyframes groupOpacity {
+            0%{opacity:0}
+            50%{opacity:.8;}
+            100%{opacity:1;}
+        }
+
+        @-webkit-keyframes groupOpacity {
+            0%{opacity:0}
+            50%{opacity:.8;}
+            100%{opacity:1;}
+        }
+
+        @-moz-keyframes groupOpacity {
+            0%{opacity:0}
+            50%{opacity:.8;}
+            100%{opacity:1;}
+        }
+
+        .toolbar-group.active {
+            display: flex;
+            background: white;
+            border-radius: 10px;
+            box-shadow: lightgrey 0px 0px 10px;
+    }
+}
+
+.toolbar-select {
+    position: relative;
+    display: flex;
+    border: 1px solid #ced4da;
+    border-radius: .25rem ;
+    text-transform: none;
+    word-wrap: normal;
+    .toolbar-select-input {
+        width: 90%;
+        padding: 0.25rem;
+        font-size: 12px;
+        font-weight: 400;
+        line-height: 1.25;
+        color: #212529;
+        background-color: #fff;
+        border: none;
+        border-radius: .25rem ;
+        outline: none;
+    }
+
+    .toolbar-select-icon {
+        position: relative; 
+        display: flex;
+        width: 10%;
+        align-items: center;
+        justify-content: center;
+    }
+    .toolbar-select-icon:hover {
+        background-color: rgb(231, 230, 230);
+    }
+}
+
+.toolbar-select:hover {
+    border-color: #ced4da;    
+    box-shadow: 0 0 0 0.1rem rgba(154, 154, 155, 0.25);
+}
+
+
+.toolbar-select-options {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    width: 100%;
+    max-height: 150px;
+    overflow-y: auto;
+    background-color: #fff;
+    border: 1px solid #ced4da;
+    border-radius: .25rem;
+    // box-shadow: 0 0 0 0.1rem rgba(154, 154, 155, 0.25);
+    z-index: 1000;
+    display: none;
+
+    .toolbar-select-option {
+        padding: 12px 15px;
+        cursor: pointer;
+        transition: background 0.2s;
+        display: flex;
+        align-items: center;
+        // justify-content: center;
+    }
+
+    .toolbar-select-option:hover {
+        background-color: rgb(231, 230, 230);
+    }
+}
+
+#fontSize {
+    .toolbar-select-input {
+        width: 24px
+    }
+    .toolbar-select-icon {
+        width: 16px;
+    }
+}
+
+
+

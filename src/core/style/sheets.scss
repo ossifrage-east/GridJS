@@ -1,0 +1,125 @@
+/*  # grid 模块主要是涉及到 canvas 中的组件的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+div {
+    margin: 0;
+    padding: 0;
+}
+
+// #container {
+//     width: 100%;
+//     height: 100%;
+// }
+
+
+.sheets {
+    canvas {
+        text-rendering: optimizeLegibility;
+        image-rendering: crisp-edges;
+    }
+    
+    canvas:focus {
+        outline: none;
+    }
+
+    #allSelect {
+        position: absolute;
+        top: 0;
+        left: 0;
+        z-index: 4;
+        box-sizing: border-box;
+        border: 1px solid #cccccc;
+        
+        &::after { // 右下角三角形
+            content: '';
+            position: absolute;
+            right: 0;
+            bottom: 0;
+            border-left: 5px solid transparent;
+            border-top: 5px solid transparent;
+            border-right: 5px solid #cccccc;
+            border-bottom: 5px solid #cccccc;
+        }
+    }
+
+    #colHeaderCanvas {
+        position: absolute;
+        border-bottom: 1px solid #cccccc;
+        z-index: 4;
+    }
+
+    #rowHeaderCanvas {
+        position: absolute;
+        border-right: 1px solid #cccccc;
+        z-index: 4;
+    }
+
+    #sheetCanvas {
+        position: absolute;
+        z-index: 2;
+    }
+
+    #editCanvas {
+        position: absolute;
+        display: none;
+        z-index: 3;
+    }
+
+    #editCursor {
+        position: absolute;
+        width: 2px;
+        background: #007acc;
+        pointer-events: none; /* 让鼠标事件穿透到canvas */
+        display: none; /* 默认隐藏，有焦点时显示 */
+        animation: cursorBlink 1s step-end infinite;
+        border-radius: 1px;
+        box-shadow: 0 0 3px #007acc80;
+        cursor: text;
+    }
+
+    @keyframes cursorBlink {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0; }
+    }
+
+    #hiddenTextarea {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        opacity: 0;
+        pointer-events: none;
+        resize: none;
+        border: none;
+        outline: none;
+        background: transparent;
+        pointer-events: none; /* 通常不可点击，但我们需要能够聚焦，所以单独处理聚焦时机 */
+        z-index: 0;
+    }
+
+    
+    #bottomTools {
+        width: 100%;
+        height: 26px;
+        background-color: rgb(236, 236, 236);
+        position: absolute;        
+        z-index: 4;
+        bottom: 0;
+    }
+
+    #rightTools {
+        width: 26px;
+        height: calc(100% - 26px);    
+        background-color: rgb(236, 236, 236);
+        position: absolute;
+        z-index: 4;
+        right: 0;
+        top: 0;
+        border-bottom: 1px solid #ccc;
+    }    
+}

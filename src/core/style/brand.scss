@@ -1,0 +1,42 @@
+/*  # nav 顶部图标的 LESS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+.brand {
+    position: relative;    
+    padding: 1px 6px;
+    display: flex;
+    /* z-index: 999; */
+}
+
+// .brand:hover {
+//     cursor: pointer;
+// }
+
+.brand img {
+    width: 22px;
+    height: 22px;
+}
+
+.brand::before {
+    content: "";
+    position: absolute;
+    top: 10px;
+    width: 100%;
+    height: 10%;
+    background-color: rgba(255, 255, 255, 0.4);
+    transform: rotate(45deg);
+    animation: scan-light 1s ease-in infinite;
+}
+
+@keyframes scan-light {
+    from {
+      right: -0.8vw;
+    }
+    to {
+      right: 4vw;
+    }
+}

@@ -1,0 +1,115 @@
+/*  # nav 导航模块的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+.nav-panel {
+    width: 100%;
+    height: 100%;
+    word-wrap: break-word;
+    word-break: normal;
+}
+
+/* 面板布局跟随导航项自身的方向类：
+   horizontal 项横向排列，vertical 项纵向排列 */
+.nav-panel:has(> .panel-item.horizontal) {
+    display: flex;
+    gap: 6px;
+    flex-direction: row;
+}
+
+.nav-panel:has(> .panel-item.vertical) {
+    display: flex;
+    flex-direction: column;
+}
+
+/* 方向类（horizontal/vertical）直接挂在导航项自身（见 Navigator.createPanelItem），
+   因此使用项级选择器，避免被外层同名类容器（如 split 分栏容器）污染导致
+   horizontal 与 vertical 两种样式同时命中同一导航项 */
+
+.panel-item.horizontal {
+    padding: 0px 6px;
+    text-align: center;
+    cursor: pointer;
+    /* 预留边框空间，避免 hover/checked 切换时布局抖动 */
+    border-bottom: 3px solid transparent;
+
+    /* hover 与 checked 互斥：已选中项不再叠加 hover 效果 */
+    &:not(.checked):hover {
+        border-bottom-color: #4CAF50;
+    }
+
+    &:not(.checked):active {
+        border-bottom-color: #4CAF50;
+        color: #4FA9FD;
+    }
+
+    &.checked {
+        border-bottom-color: #4CAF50;
+        background-color: white;
+    }
+}
+
+.panel-item.vertical {
+    padding: 6px 0px;
+    text-align: center;
+    cursor: pointer;
+    /* 预留边框空间，避免 hover/checked 切换时布局抖动 */
+    border-left: 3px solid transparent;
+
+    /* hover 与 checked 互斥：已选中项不再叠加 hover 效果 */
+    &:not(.checked):hover {
+        border-left-color: #4CAF50;
+    }
+
+    &:not(.checked):active {
+        border-left-color: #4CAF50;
+        color: #4FA9FD;
+    }
+
+    &.checked {
+        border-left-color: #4CAF50;
+        background-color: white;
+    }
+}
+
+/* 面板内只显示一种状态指示：悬停其它项时，暂时隐藏已选中项的指示条 */
+.nav-panel:has(.panel-item:not(.checked):hover) .panel-item.checked {
+    border-color: transparent;
+}
+
+.nav-content {
+    // position: absolute;
+    display: flex;
+    width: 100%;
+    height: 100%;
+
+    .content-item {
+        margin: 0px;
+        width: calc(100% - 1px);;
+        height: calc(100% - 1px);;
+        animation: 1s navContentOpacity;
+        -webkit-animation: 1s navContentOpacity;
+        -moz-animation: 1s navContentOpacity;
+    }
+
+    @keyframes navContentOpacity {
+        0%{opacity:0}
+        50%{opacity:.8;}
+        100%{opacity:1;}
+    }
+
+    @-webkit-keyframes navContentOpacity {
+        0%{opacity:0}
+        50%{opacity:.8;}
+        100%{opacity:1;}
+    }
+
+    @-moz-keyframes navContentOpacity {
+        0%{opacity:0}
+        50%{opacity:.8;}
+        100%{opacity:1;}
+    }
+}

@@ -1,0 +1,101 @@
+/*  # grid 模块主要是涉及到 menu 组件的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+.menu {
+    position: absolute;
+    display: none;
+    min-width: 50px;
+    max-height: 600px;
+    flex-direction: column;
+    top: 30%;
+    left: 50%;
+    // transform: translate(-70%, -50%);
+    // transform: translateY(5px);
+    background: white;
+    border-radius: 4px;
+    border: 1px solid #d1d1d1;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+    opacity: 0;
+    overflow-y: auto;
+    visibility: hidden;
+    transition: opacity 0.2s ease, visibility 0.2s ease, transform 0.2s ease;
+    z-index: 1000;
+}
+
+
+.menu.show {
+    display: flex;
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0);
+    cursor: default;
+}
+
+.menu-item {
+    padding: 6px 10px;
+    display: flex;
+    align-items: center;
+    color: #333;
+    font-size: 12px;
+    text-decoration: none;
+    transition: background-color 0.2s ease;
+    border-bottom: none;
+    gap: 8px;
+    
+    .highlight {
+        background-color: #ffeb3b;
+        font-weight: bold;
+    }
+}
+
+.menu-item:last-child {
+    border-bottom: none;
+}
+
+.menu-item:hover {
+    background-color: rgb(231, 230, 230);
+    color: #217346; /* Excel green color */
+}
+
+.menu-item i {
+    font-size: 14px;
+    width: 16px;
+    text-align: center;
+}
+
+.menu-line {
+    width: 100%;
+    margin: 4px 0;
+    height: 1px;
+    background-color: #ddd;
+}
+
+.menu-item .text {
+    white-space: nowrap;  /*强制span不换行*/
+    display: inline-block;  /*将span当做块级元素对待*/
+}
+
+/* 打印设置分区下拉菜单（.print-menu）：
+   每个菜单项文字前预留固定宽度「对号位」，未选中时留白、选中时显示 ✓，
+   保证选中状态切换时文字不发生水平位移 */
+.menu-content.print-menu .menu-item .text::before {
+    content: '';
+    display: inline-block;
+    width: 1.2em;          /* 预留位宽度 ≈ ✓ 加空格的宽度 */
+    text-align: center;
+}
+.menu-content.print-menu .menu-item.checked .text::before {
+    content: '✓';
+}
+
+.current-color {
+    width: 60%;
+    height: 5px;
+    border: 1px solid #ddd;
+    border-radius: 20%;
+    display: inline-block;
+}

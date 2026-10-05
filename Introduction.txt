@@ -1,0 +1,5 @@
+藕丝空间(lotus filament space)
+	——会道者，一缕藕丝牵大象。寡道者，千钧铁棒打苍蝇。
+	—— The wise, with a lotus filament, can lead an elephant. The unwise, with an iron club, can but beat flies.
+介绍
+GridJS是一个轻量级的JavaScript库，使用原生 JS  canvas 实现，尽量不使用第三方库，用于快速构建响应式、可定制的数据表格，支持多种数据源和交互功能。

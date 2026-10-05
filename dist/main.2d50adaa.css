@@ -1,0 +1,1185 @@
+/*!***************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[1].use[2]!./src/assets/icons/icon.css ***!
+  \***************************************************************************************************************************************************/
+/*  # icomoon 生成的图标 css 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+
+@font-face {
+  font-family: 'gridjs';
+  src:  url(assets/626041596f.eot?zbrbpb);
+  src:  url(assets/626041596f.eot?zbrbpb#iefix) format('embedded-opentype'),
+    url(assets/9db920c9a3.ttf?zbrbpb) format('truetype'),
+    url(assets/d1cb4d386b.woff?zbrbpb) format('woff'),
+    url(assets/459f15dab3.svg?zbrbpb#gridjs) format('svg');
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+}
+
+[class^="icon-"], [class*=" icon-"] {
+  /* use !important to prevent issues with browser extensions that change fonts */
+  font-family: 'gridjs' !important;
+  speak: never;
+  font-style: normal;
+  font-weight: normal;
+  font-variant: normal;
+  text-transform: none;
+  line-height: 1;
+
+  /* Better Font Rendering =========== */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.icon-border-none:before {
+  content: "\e903";
+}
+.icon-merge:before {
+  content: "\e913";
+}
+.icon-line-break:before {
+  content: "\e919";
+}
+.icon-printer-view:before {
+  content: "\e921";
+}
+.icon-brush:before {
+  content: "\e90a";
+}
+.icon-replace:before {
+  content: "\e931";
+  color: #2f5769;
+}
+.icon-search1:before {
+  content: "\e932";
+}
+.icon-count:before {
+  content: "\e92c";
+}
+.icon-frozen-row:before {
+  content: "\e92e";
+}
+.icon-frozen-grid:before {
+  content: "\e92d";
+}
+.icon-frozen-col:before {
+  content: "\e92f";
+}
+.icon-min:before {
+  content: "\e926";
+  color: #5d6d7e;
+}
+.icon-max:before {
+  content: "\e927";
+  color: #5d6d7e;
+}
+.icon-avg:before {
+  content: "\e928";
+  color: #444a5c;
+}
+.icon-funnel:before {
+  content: "\e929";
+}
+.icon-sort-down-alt:before {
+  content: "\e92a";
+}
+.icon-sort-down:before {
+  content: "\e92b";
+}
+.icon-align-middle:before {
+  content: "\e91f";
+}
+.icon-justify:before {
+  content: "\e902";
+}
+.icon-text-center:before {
+  content: "\e910";
+}
+.icon-text-indent-left:before {
+  content: "\e91a";
+}
+.icon-text-indent-right:before {
+  content: "\e91b";
+}
+.icon-text-left:before {
+  content: "\e91c";
+}
+.icon-text-right:before {
+  content: "\e91d";
+}
+.icon-align-bottom:before {
+  content: "\e91e";
+}
+.icon-align-top:before {
+  content: "\e920";
+}
+.icon-border-wide-outer:before {
+  content: "\e915";
+}
+.icon-paint-bucket:before {
+  content: "\e916";
+}
+.icon-arrow-90deg-left:before {
+  content: "\e900";
+}
+.icon-arrow-90deg-right:before {
+  content: "\e901";
+}
+.icon-border-all:before {
+  content: "\e904";
+}
+.icon-border-bottom:before {
+  content: "\e905";
+}
+.icon-border-left:before {
+  content: "\e906";
+}
+.icon-border-outer:before {
+  content: "\e907";
+}
+.icon-border-right:before {
+  content: "\e908";
+}
+.icon-border-top:before {
+  content: "\e909";
+}
+.icon-chevron-down:before {
+  content: "\e90e";
+}
+.icon-copy:before {
+  content: "\e90f";
+}
+.icon-paste:before {
+  content: "\e911";
+}
+.icon-printer:before {
+  content: "\e912";
+}
+.icon-scissors:before {
+  content: "\e914";
+}
+.icon-subscript:before {
+  content: "\e917";
+}
+.icon-superscript:before {
+  content: "\e918";
+}
+.icon-search:before {
+  content: "\e930";
+}
+.icon-undo:before {
+  content: "\e965";
+}
+.icon-redo:before {
+  content: "\e966";
+}
+.icon-user:before {
+  content: "\e971";
+}
+.icon-hammer:before {
+  content: "\e996";
+}
+.icon-bin:before {
+  content: "\e9ac";
+}
+.icon-eye:before {
+  content: "\e9ce";
+}
+.icon-eye-blocked:before {
+  content: "\e9d1";
+}
+.icon-plus:before {
+  content: "\ea0a";
+}
+.icon-minus:before {
+  content: "\ea0b";
+}
+.icon-cross:before {
+  content: "\ea0f";
+}
+.icon-checkmark:before {
+  content: "\ea10";
+}
+.icon-enter:before {
+  content: "\ea13";
+}
+.icon-exit:before {
+  content: "\ea14";
+}
+.icon-play3:before {
+  content: "\ea1c";
+}
+.icon-stop2:before {
+  content: "\ea1e";
+}
+.icon-backward2:before {
+  content: "\ea1f";
+}
+.icon-forward3:before {
+  content: "\ea20";
+}
+.icon-first:before {
+  content: "\ea21";
+}
+.icon-last:before {
+  content: "\ea22";
+}
+.icon-previous2:before {
+  content: "\ea23";
+}
+.icon-next2:before {
+  content: "\ea24";
+}
+.icon-eject:before {
+  content: "\ea25";
+}
+.icon-volume-high:before {
+  content: "\ea26";
+}
+.icon-volume-medium:before {
+  content: "\ea27";
+}
+.icon-volume-low:before {
+  content: "\ea28";
+}
+.icon-volume-mute:before {
+  content: "\ea29";
+}
+.icon-volume-mute2:before {
+  content: "\ea2a";
+}
+.icon-volume-increase:before {
+  content: "\ea2b";
+}
+.icon-volume-decrease:before {
+  content: "\ea2c";
+}
+.icon-loop:before {
+  content: "\ea2d";
+}
+.icon-infinite:before {
+  content: "\ea2f";
+}
+.icon-sort-amount-asc:before {
+  content: "\ea4c";
+}
+.icon-sort-amount-desc:before {
+  content: "\ea4d";
+}
+.icon-bold:before {
+  content: "\ea62";
+}
+.icon-underline:before {
+  content: "\ea63";
+}
+.icon-italic:before {
+  content: "\ea64";
+}
+.icon-strikethrough:before {
+  content: "\ea65";
+}
+.icon-text-color:before {
+  content: "\ea6d";
+}
+
+.icon-sum:before {
+  content: "\2211";
+}
+
+.font15 {  
+  font-size: 15px;
+}
+
+.font16 {  
+  font-size: 16px;
+}
+
+.font17 {  
+  font-size: 17px;
+}
+
+.font18 {  
+  font-size: 18px;
+}
+
+.font195 {  
+  font-size: 19px;
+}
+
+.font20 {  
+  font-size: 20px;
+}
+
+
+/*!*******************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/index.scss ***!
+  \*******************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # 展示页面的全局 CSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+@font-face {
+  font-family: "HarmonyOS Sans SC Regular";
+  src: url(assets/28c7a5780d.ttf) format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap; /* 优化加载显示 */
+}
+@font-face {
+  font-family: "HarmonyOS Sans SC Black";
+  src: url(assets/59544d252b.ttf) format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap; /* 优化加载显示 */
+}
+@font-face {
+  font-family: "HarmonyOS Sans SC Light";
+  src: url(assets/d74c47f6cd.ttf) format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap; /* 优化加载显示 */
+}
+html, body {
+  margin: 0px;
+  padding: 0px;
+  width: 100%;
+  height: 100%;
+  min-width: 400px;
+  font-family: "HarmonyOS Sans SC Regular", sans-serif;
+  overflow: hidden;
+  /* background-color: whitesmoke; */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none; /*webkit浏览器*/ /*火狐*/
+  -ms-user-select: none; /*IE10*/
+  user-select: none;
+}
+
+.container {
+  width: 100%;
+  height: 100%;
+  min-width: 800px;
+  min-height: 600px;
+}
+
+#worktop {
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+}
+/*!******************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/split.scss ***!
+  \******************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # split 模块的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+.horizontal .split {
+  position: absolute;
+  left: 50%;
+  border-radius: 3px;
+  cursor: col-resize;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 width=%276%27 height=%276%27 fill=%27currentColor%27 class=%27bi bi-three-dots-vertical%27 viewBox=%270 0 16 16%27%3E%3Cpath d=%27M9.5 13a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0m0-5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0m0-5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0%27/%3E%3C/svg%3E");
+  z-index: 8;
+  width: 6px;
+  height: 100%;
+}
+.horizontal .split-pre {
+  position: absolute;
+  width: 50%;
+  height: 100%;
+}
+.horizontal .split-next {
+  position: relative;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  margin-left: 50%;
+  width: 50%;
+  height: 100%;
+}
+
+.vertical .split {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  border-radius: 3px;
+  cursor: row-resize;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 width=%276%27 height=%276%27 fill=%27currentColor%27 class=%27bi bi-three-dots%27 viewBox=%270 0 16 16%27%3E%3Cpath d=%27M3 9.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3m5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3m5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3%27/%3E%3C/svg%3E");
+  z-index: 8;
+  width: 100%;
+  height: 6px;
+}
+.vertical .split-pre {
+  width: 100%;
+  height: 50%;
+}
+.vertical .split-next {
+  position: absolute;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  left: 0;
+  bottom: -10px;
+  margin-left: 0;
+  width: 100%;
+  height: 50%;
+}
+/*!****************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/nav.scss ***!
+  \****************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # nav 导航模块的 LESS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+.nav-panel {
+  width: 100%;
+  height: 100%;
+  word-wrap: break-word;
+  word-break: normal;
+}
+.nav-panel .panel-item {
+  padding: 6px 0px;
+  text-align: center;
+}
+.nav-panel .panel-item:hover {
+  border-left: 3px solid #4CAF50;
+  cursor: pointer;
+}
+.nav-panel .panel-item:active {
+  border-left: 3px solid #4CAF50;
+  color: #4FA9FD;
+}
+.nav-panel .checked {
+  border-left: 3px solid #4CAF50;
+  background-color: white;
+}
+
+.nav-content {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  width: 100%;
+  height: 100%;
+}
+.nav-content .content-item {
+  margin: 0px;
+  width: -webkit-calc(100% - 1px);
+  width: calc(100% - 1px);
+  height: -webkit-calc(100% - 1px);
+  height: calc(100% - 1px);
+  animation: 1s navContentOpacity;
+  -webkit-animation: 1s navContentOpacity;
+  -moz-animation: 1s navContentOpacity;
+}
+@keyframes navContentOpacity {
+  0% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 0.8;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+@-webkit-keyframes navContentOpacity {
+  0% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 0.8;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+/*!*******************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/sheets.scss ***!
+  \*******************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # grid 模块主要是涉及到 canvas 中的组件的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+div {
+  margin: 0;
+  padding: 0;
+}
+
+.sheets canvas {
+  text-rendering: optimizeLegibility;
+  image-rendering: crisp-edges;
+}
+.sheets canvas:focus {
+  outline: none;
+}
+.sheets #allSelect {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 4;
+  box-sizing: border-box;
+  border: 1px solid #cccccc;
+}
+.sheets #allSelect::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  border-left: 5px solid transparent;
+  border-top: 5px solid transparent;
+  border-right: 5px solid #cccccc;
+  border-bottom: 5px solid #cccccc;
+}
+.sheets #colHeaderCanvas {
+  position: absolute;
+  border-bottom: 1px solid #cccccc;
+  z-index: 4;
+}
+.sheets #rowHeaderCanvas {
+  position: absolute;
+  border-right: 1px solid #cccccc;
+  z-index: 4;
+}
+.sheets #sheetCanvas {
+  position: absolute;
+  z-index: 2;
+}
+.sheets #editCanvas {
+  position: absolute;
+  display: none;
+  z-index: 3;
+}
+.sheets #editCursor {
+  position: absolute;
+  width: 2px;
+  background: #007acc;
+  pointer-events: none; /* 让鼠标事件穿透到canvas */
+  display: none; /* 默认隐藏，有焦点时显示 */
+  -webkit-animation: cursorBlink 1s step-end infinite;
+          animation: cursorBlink 1s step-end infinite;
+  border-radius: 1px;
+  box-shadow: 0 0 3px rgba(0, 122, 204, 0.5019607843);
+  cursor: text;
+}
+@-webkit-keyframes cursorBlink {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+@keyframes cursorBlink {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+.sheets #hiddenTextarea {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+  resize: none;
+  border: none;
+  outline: none;
+  background: transparent;
+  pointer-events: none; /* 通常不可点击，但我们需要能够聚焦，所以单独处理聚焦时机 */
+  z-index: 0;
+}
+.sheets #bottomTools {
+  width: 100%;
+  height: 26px;
+  background-color: rgb(236, 236, 236);
+  position: absolute;
+  z-index: 4;
+  bottom: 0;
+}
+.sheets #rightTools {
+  width: 26px;
+  height: -webkit-calc(100% - 26px);
+  height: calc(100% - 26px);
+  background-color: rgb(236, 236, 236);
+  position: absolute;
+  z-index: 4;
+  right: 0;
+  top: 0;
+  border-bottom: 1px solid #ccc;
+}
+/*!*********************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/scroller.scss ***!
+  \*********************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # scroll 模块的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+.scroll-horizontal {
+  position: relative;
+  overflow: hidden;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  top: 0;
+  left: 10px;
+  width: -webkit-calc(100% - 36px);
+  width: calc(100% - 36px);
+  height: 100%;
+}
+.scroll-horizontal .scroll-track {
+  position: absolute;
+  left: 24px;
+  margin: 0 10px;
+  width: -webkit-calc(100% - 72px);
+  width: calc(100% - 72px);
+  height: 12px;
+  border-radius: 6px;
+}
+.scroll-horizontal .scroll-track .scroll-thumb {
+  position: absolute;
+  background: #888;
+  border-radius: 6px;
+  height: 100%;
+  min-width: 30px;
+}
+.scroll-horizontal .scroll-track .scroll-thumb:hover {
+  background: #666;
+}
+.scroll-horizontal .scroll-track .scroll-thumb:active {
+  background: #444;
+}
+.scroll-horizontal .scroll-back {
+  position: absolute;
+  left: 0;
+  width: 24px;
+  height: 100%;
+  background-color: rgb(236, 236, 236);
+  border-radius: 6px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Cpolygon points=%2712,2 12,14 4,8%27 fill=%27%23888%27/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+}
+.scroll-horizontal .scroll-back:hover {
+  background-color: #ccc;
+}
+.scroll-horizontal .scroll-back:active {
+  background-color: #aaa;
+}
+.scroll-horizontal .scroll-forward {
+  position: absolute;
+  right: 0;
+  width: 24px;
+  height: 100%;
+  background-color: rgb(236, 236, 236);
+  border-radius: 6px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Cpolygon points=%274,2 4,14 12,8%27 fill=%27%23888%27/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+}
+.scroll-horizontal .scroll-forward:hover {
+  background-color: #ccc;
+}
+.scroll-horizontal .scroll-forward:active {
+  background-color: #aaa;
+}
+
+.scroll-vertical {
+  position: relative;
+  overflow: hidden;
+  top: 10px;
+  right: 0;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  width: 100%;
+  height: -webkit-calc(100% - 24px);
+  height: calc(100% - 24px);
+}
+.scroll-vertical .scroll-track {
+  position: absolute;
+  top: 24px;
+  margin: 10px 0;
+  width: 12px;
+  height: -webkit-calc(100% - 72px);
+  height: calc(100% - 72px);
+  border-radius: 6px;
+}
+.scroll-vertical .scroll-track .scroll-thumb {
+  position: absolute;
+  background: #888;
+  border-radius: 6px;
+  width: 100%;
+  min-height: 30px;
+}
+.scroll-vertical .scroll-track .scroll-thumb:hover {
+  background: #666;
+}
+.scroll-vertical .scroll-track .scroll-thumb:active {
+  background: #444;
+}
+.scroll-vertical .scroll-back {
+  position: absolute;
+  top: 0;
+  width: 100%;
+  height: 24px;
+  background-color: rgb(236, 236, 236);
+  border-radius: 6px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Cpolygon points=%278,2 14,12 2,12%27 fill=%27%23888%27/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+}
+.scroll-vertical .scroll-back:hover {
+  background-color: #ccc;
+}
+.scroll-vertical .scroll-back:active {
+  background-color: #aaa;
+}
+.scroll-vertical .scroll-forward {
+  position: absolute;
+  bottom: 0;
+  width: 100%;
+  height: 24px;
+  background-color: rgb(236, 236, 236);
+  border-radius: 6px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Cpolygon points=%272,4 14,4 8,14%27 fill=%27%23888%27/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+}
+.scroll-vertical .scroll-forward:hover {
+  background-color: #ccc;
+}
+.scroll-vertical .scroll-forward:active {
+  background-color: #aaa;
+}
+/*!*****************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/menu.scss ***!
+  \*****************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # grid 模块主要是涉及到 menu 组件的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+.menu {
+  position: absolute;
+  display: none;
+  min-width: 50px;
+  max-height: 600px;
+  -webkit-box-orient: vertical;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: column;
+      -ms-flex-direction: column;
+          flex-direction: column;
+  top: 30%;
+  left: 50%;
+  background: white;
+  border-radius: 4px;
+  border: 1px solid #d1d1d1;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+  opacity: 0;
+  overflow-y: auto;
+  visibility: hidden;
+  -webkit-transition: opacity 0.2s ease, visibility 0.2s ease, -webkit-transform 0.2s ease;
+  transition: opacity 0.2s ease, visibility 0.2s ease, -webkit-transform 0.2s ease;
+  transition: opacity 0.2s ease, visibility 0.2s ease, transform 0.2s ease;
+  transition: opacity 0.2s ease, visibility 0.2s ease, transform 0.2s ease, -webkit-transform 0.2s ease;
+  z-index: 1000;
+}
+
+.menu.show {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  opacity: 1;
+  visibility: visible;
+  -webkit-transform: translateY(0);
+          transform: translateY(0);
+  cursor: default;
+}
+
+.menu-item {
+  padding: 6px 10px;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  color: #333;
+  font-size: 12px;
+  text-decoration: none;
+  -webkit-transition: background-color 0.2s ease;
+  transition: background-color 0.2s ease;
+  border-bottom: none;
+  gap: 8px;
+}
+.menu-item .highlight {
+  background-color: #ffeb3b;
+  font-weight: bold;
+}
+
+.menu-item:last-child {
+  border-bottom: none;
+}
+
+.menu-item:hover {
+  background-color: rgb(231, 230, 230);
+  color: #217346; /* Excel green color */
+}
+
+.menu-item i {
+  font-size: 14px;
+  width: 16px;
+  text-align: center;
+}
+
+.menu-line {
+  width: 100%;
+  margin: 4px 0;
+  height: 1px;
+  background-color: #ddd;
+}
+
+.menu-item .text {
+  white-space: nowrap; /*强制span不换行*/
+  display: inline-block; /*将span当做块级元素对待*/
+}
+
+.current-color {
+  width: 60%;
+  height: 5px;
+  border: 1px solid #ddd;
+  border-radius: 20%;
+  display: inline-block;
+}
+/*!********************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/toolbar.scss ***!
+  \********************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # grid 模块主要是涉及到 toolbar 中的组件的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+.toolbar-container {
+  width: 100%;
+  border-bottom: 1px solid #ddd;
+  background-color: #f3f3f3;
+}
+.toolbar-container .toolbar-quick-access {
+  position: fixed;
+  left: 0;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  gap: 6px;
+}
+.toolbar-container .toolbar-quick-access i {
+  font-size: 16px;
+}
+.toolbar-container .toolbar-category {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  width: 100%;
+  height: 25px;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+}
+.toolbar-container .toolbar-category .toolbar-tabs {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+}
+.toolbar-container .toolbar-category .toolbar-tabs .toolbar-tab {
+  width: 48px;
+  height: 100%;
+  text-align: center;
+  font-size: large;
+  padding: 0px 6px 0px 6px;
+}
+.toolbar-container .toolbar-category .toolbar-tabs .toolbar-tab:hover {
+  cursor: pointer;
+  border-radius: 4px;
+  background-color: lightgrey;
+}
+.toolbar-container .toolbar-category .toolbar-tabs .toolbar-tab.active {
+  border-radius: 4px;
+  background: white;
+}
+.toolbar-container .toolbar-content {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+}
+.toolbar-container .toolbar-content .toolbar-group {
+  display: none;
+  width: 100%;
+  margin: 6px 12px;
+  animation: 1s groupOpacity;
+  -webkit-animation: 1s groupOpacity;
+  -moz-animation: 1s groupOpacity;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+}
+.toolbar-container .toolbar-content .toolbar-group .toolbar-section {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  padding: 4px;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  text-align: center;
+  gap: 6px;
+}
+.toolbar-container .toolbar-content .toolbar-group .toolbar-section-line {
+  width: 1px;
+  height: 30px;
+  background-color: #ddd;
+}
+@keyframes groupOpacity {
+  0% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 0.8;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+@-webkit-keyframes groupOpacity {
+  0% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 0.8;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+.toolbar-container .toolbar-group.active {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  background: white;
+  border-radius: 10px;
+  box-shadow: lightgrey 0px 0px 10px;
+}
+
+.toolbar-select {
+  position: relative;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  border: 1px solid #ced4da;
+  border-radius: 0.25rem;
+  text-transform: none;
+  word-wrap: normal;
+}
+.toolbar-select .toolbar-select-input {
+  width: 90%;
+  padding: 0.25rem;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.25;
+  color: #212529;
+  background-color: #fff;
+  border: none;
+  border-radius: 0.25rem;
+  outline: none;
+}
+.toolbar-select .toolbar-select-icon {
+  position: relative;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  width: 10%;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+}
+.toolbar-select .toolbar-select-icon:hover {
+  background-color: rgb(231, 230, 230);
+}
+
+.toolbar-select:hover {
+  border-color: #ced4da;
+  box-shadow: 0 0 0 0.1rem rgba(154, 154, 155, 0.25);
+}
+
+.toolbar-select-options {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  width: 100%;
+  max-height: 150px;
+  overflow-y: auto;
+  background-color: #fff;
+  border: 1px solid #ced4da;
+  border-radius: 0.25rem;
+  z-index: 1000;
+  display: none;
+}
+.toolbar-select-options .toolbar-select-option {
+  padding: 12px 15px;
+  cursor: pointer;
+  -webkit-transition: background 0.2s;
+  transition: background 0.2s;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+}
+.toolbar-select-options .toolbar-select-option:hover {
+  background-color: rgb(231, 230, 230);
+}
+
+#fontSize .toolbar-select-input {
+  width: 24px;
+}
+#fontSize .toolbar-select-icon {
+  width: 16px;
+}
+/*!******************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/brand.scss ***!
+  \******************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # nav 顶部图标的 LESS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+.brand {
+  position: relative;
+  padding: 1px 6px;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  /* z-index: 999; */
+}
+
+.brand img {
+  width: 22px;
+  height: 22px;
+}
+
+.brand::before {
+  content: "";
+  position: absolute;
+  top: 10px;
+  width: 100%;
+  height: 10%;
+  background-color: rgba(255, 255, 255, 0.4);
+  -webkit-transform: rotate(45deg);
+          transform: rotate(45deg);
+  -webkit-animation: scan-light 1s ease-in infinite;
+          animation: scan-light 1s ease-in infinite;
+}
+
+@-webkit-keyframes scan-light {
+  from {
+    right: -0.8vw;
+  }
+  to {
+    right: 4vw;
+  }
+}
+
+@keyframes scan-light {
+  from {
+    right: -0.8vw;
+  }
+  to {
+    right: 4vw;
+  }
+}

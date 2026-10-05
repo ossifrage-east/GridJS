@@ -1,0 +1,72 @@
+/*  # split 模块的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+
+.horizontal {
+    // width: 100%;
+    // height: 100%;
+    .split { 
+        position: absolute;
+        left: 50%;
+        border-radius: 3px;
+        cursor: col-resize; 
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='6' height='6' fill='currentColor' class='bi bi-three-dots-vertical' viewBox='0 0 16 16'%3E%3Cpath d='M9.5 13a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0m0-5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0m0-5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0'/%3E%3C/svg%3E");
+        z-index: 8;
+        width: 6px;
+        height: 100%;
+    }
+
+    .split-pre {
+        position: absolute;
+        width: 50%;
+        height: 100%;
+        // background-color: whitesmoke;
+    }
+    
+    .split-next {
+        position: relative; 
+        display: flex;
+        margin-left: 50%;
+        width: 50%;
+        height: 100%;
+    }
+}
+
+.vertical {
+    // width: 100%;
+    // height: 100%;
+    .split { 
+        position: absolute;
+        left: 0;
+        top: 50%;
+        border-radius: 3px;
+        cursor: row-resize; 
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='6' height='6' fill='currentColor' class='bi bi-three-dots' viewBox='0 0 16 16'%3E%3Cpath d='M3 9.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3m5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3m5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3'/%3E%3C/svg%3E");
+        z-index: 8;
+        width: 100%;
+        height: 6px;
+    }
+    
+    .split-pre {
+        // position: absolute;
+        width: 100%;
+        height: 50%;
+        // background-color: whitesmoke;
+    }
+    
+    .split-next {
+        position: absolute;
+        display: flex;
+        left: 0; 
+        bottom: -10px;
+        margin-left: 0;
+        // margin-top: 50%;
+        width: 100%;
+        height: 50%;
+    }
+}
+

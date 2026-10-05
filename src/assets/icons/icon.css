@@ -1,0 +1,354 @@
+/*  # icomoon 生成的图标 css 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+
+@font-face {
+  font-family: 'gridjs';
+  src:  url('fonts/gridjs.eot?zbrbpb');
+  src:  url('fonts/gridjs.eot?zbrbpb#iefix') format('embedded-opentype'),
+    url('fonts/gridjs.ttf?zbrbpb') format('truetype'),
+    url('fonts/gridjs.woff?zbrbpb') format('woff'),
+    url('fonts/gridjs.svg?zbrbpb#gridjs') format('svg');
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+}
+
+[class^="icon-"], [class*=" icon-"] {
+  /* use !important to prevent issues with browser extensions that change fonts */
+  font-family: 'gridjs' !important;
+  speak: never;
+  font-style: normal;
+  font-weight: normal;
+  font-variant: normal;
+  text-transform: none;
+  line-height: 1;
+
+  /* Better Font Rendering =========== */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.icon-border-none:before {
+  content: "\e903";
+}
+.icon-merge:before {
+  content: "\e913";
+}
+.icon-line-break:before {
+  content: "\e919";
+}
+.icon-printer-view:before {
+  content: "\e921";
+}
+.icon-brush:before {
+  content: "\e90a";
+}
+.icon-replace:before {
+  content: "\e931";
+  color: #2f5769;
+}
+.icon-search1:before {
+  content: "\e932";
+}
+.icon-count:before {
+  content: "\e92c";
+}
+.icon-frozen-row:before {
+  content: "\e92e";
+}
+.icon-frozen-grid:before {
+  content: "\e92d";
+}
+.icon-frozen-col:before {
+  content: "\e92f";
+}
+.icon-min:before {
+  content: "\e926";
+  color: #5d6d7e;
+}
+.icon-max:before {
+  content: "\e927";
+  color: #5d6d7e;
+}
+.icon-avg:before {
+  content: "\e928";
+  color: #444a5c;
+}
+.icon-funnel:before {
+  content: "\e929";
+}
+.icon-sort-down-alt:before {
+  content: "\e92a";
+}
+.icon-sort-down:before {
+  content: "\e92b";
+}
+.icon-align-middle:before {
+  content: "\e91f";
+}
+.icon-justify:before {
+  content: "\e902";
+}
+.icon-text-center:before {
+  content: "\e910";
+}
+.icon-text-indent-left:before {
+  content: "\e91a";
+}
+.icon-text-indent-right:before {
+  content: "\e91b";
+}
+.icon-text-left:before {
+  content: "\e91c";
+}
+.icon-text-right:before {
+  content: "\e91d";
+}
+.icon-align-bottom:before {
+  content: "\e91e";
+}
+.icon-align-top:before {
+  content: "\e920";
+}
+.icon-border-wide-outer:before {
+  content: "\e915";
+}
+.icon-paint-bucket:before {
+  content: "\e916";
+}
+.icon-arrow-90deg-left:before {
+  content: "\e900";
+}
+.icon-arrow-90deg-right:before {
+  content: "\e901";
+}
+.icon-border-all:before {
+  content: "\e904";
+}
+.icon-border-bottom:before {
+  content: "\e905";
+}
+.icon-border-left:before {
+  content: "\e906";
+}
+.icon-border-outer:before {
+  content: "\e907";
+}
+.icon-border-right:before {
+  content: "\e908";
+}
+.icon-border-top:before {
+  content: "\e909";
+}
+.icon-chevron-down:before {
+  content: "\e90e";
+}
+.icon-copy:before {
+  content: "\e90f";
+}
+.icon-paste:before {
+  content: "\e911";
+}
+.icon-printer:before {
+  content: "\e912";
+}
+.icon-scissors:before {
+  content: "\e914";
+}
+.icon-subscript:before {
+  content: "\e917";
+}
+.icon-superscript:before {
+  content: "\e918";
+}
+.icon-search:before {
+  content: "\e930";
+}
+.icon-undo:before {
+  content: "\e965";
+}
+.icon-redo:before {
+  content: "\e966";
+}
+.icon-user:before {
+  content: "\e971";
+}
+.icon-hammer:before {
+  content: "\e996";
+}
+.icon-bin:before {
+  content: "\e9ac";
+}
+.icon-eye:before {
+  content: "\e9ce";
+}
+.icon-eye-blocked:before {
+  content: "\e9d1";
+}
+.icon-plus:before {
+  content: "\ea0a";
+}
+.icon-minus:before {
+  content: "\ea0b";
+}
+.icon-cross:before {
+  content: "\ea0f";
+}
+.icon-checkmark:before {
+  content: "\ea10";
+}
+.icon-enter:before {
+  content: "\ea13";
+}
+.icon-exit:before {
+  content: "\ea14";
+}
+.icon-play3:before {
+  content: "\ea1c";
+}
+.icon-stop2:before {
+  content: "\ea1e";
+}
+.icon-backward2:before {
+  content: "\ea1f";
+}
+.icon-forward3:before {
+  content: "\ea20";
+}
+.icon-first:before {
+  content: "\ea21";
+}
+.icon-last:before {
+  content: "\ea22";
+}
+.icon-previous2:before {
+  content: "\ea23";
+}
+.icon-next2:before {
+  content: "\ea24";
+}
+.icon-eject:before {
+  content: "\ea25";
+}
+.icon-volume-high:before {
+  content: "\ea26";
+}
+.icon-volume-medium:before {
+  content: "\ea27";
+}
+.icon-volume-low:before {
+  content: "\ea28";
+}
+.icon-volume-mute:before {
+  content: "\ea29";
+}
+.icon-volume-mute2:before {
+  content: "\ea2a";
+}
+.icon-volume-increase:before {
+  content: "\ea2b";
+}
+.icon-volume-decrease:before {
+  content: "\ea2c";
+}
+.icon-loop:before {
+  content: "\ea2d";
+}
+.icon-infinite:before {
+  content: "\ea2f";
+}
+.icon-sort-amount-asc:before {
+  content: "\ea4c";
+}
+.icon-sort-amount-desc:before {
+  content: "\ea4d";
+}
+.icon-bold:before {
+  content: "\ea62";
+}
+.icon-underline:before {
+  content: "\ea63";
+}
+.icon-italic:before {
+  content: "\ea64";
+}
+.icon-strikethrough:before {
+  content: "\ea65";
+}
+.icon-text-color:before {
+  content: "\ea6d";
+}
+
+.icon-sum:before {
+  content: "\2211";
+}
+
+.font15 {  
+  font-size: 15px;
+}
+
+.font16 {  
+  font-size: 16px;
+}
+
+.font17 {  
+  font-size: 17px;
+}
+
+.font18 {  
+  font-size: 18px;
+}
+
+.font19 {  
+  font-size: 19px;
+}
+
+.font20 {
+  font-size: 20px;
+}
+
+/* —— 打印设置分区（页面工具栏）新增 SVG 图标：icomoon 字体无对应字形，以内联 SVG 绘制 —— */
+.icon-page-margins:before,
+.icon-orientation:before,
+.icon-paper-size:before,
+.icon-print-area:before,
+.icon-print-zoom:before {
+  content: '';
+  display: block;
+  width: 15px;
+  height: 15px;
+  background-repeat: no-repeat;
+  background-position: center center;
+  background-size: contain;
+}
+
+/* 页边距：页面外框 + 内部虚线内容区 */
+.icon-page-margins:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 15'%3E%3Crect x='1.5' y='1.5' width='12' height='12' rx='1' fill='none' stroke='%23444444' stroke-width='1.2'/%3E%3Crect x='4.25' y='4.25' width='6.5' height='6.5' fill='none' stroke='%23444444' stroke-width='1' stroke-dasharray='2 1.4'/%3E%3C/svg%3E");
+}
+
+/* 纸张方向：纵向页面 + 横向页面 */
+.icon-orientation:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 15'%3E%3Crect x='2' y='2.5' width='4.5' height='10' rx='0.8' fill='none' stroke='%23444444' stroke-width='1.2'/%3E%3Crect x='8.5' y='4.75' width='6' height='5.5' rx='0.8' fill='none' stroke='%23444444' stroke-width='1.2'/%3E%3C/svg%3E");
+}
+
+/* 纸张大小：页面 + 纵向双向箭头 */
+.icon-paper-size:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 15'%3E%3Crect x='2.5' y='1.5' width='8' height='12' rx='0.8' fill='none' stroke='%23444444' stroke-width='1.2'/%3E%3Cpath d='M13 4 v7 M11.8 5.2 L13 3.8 L14.2 5.2 M11.8 9.8 L13 11.2 L14.2 9.8' fill='none' stroke='%23444444' stroke-width='1' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+/* 打印区域：虚线选框 + 实线内容块 */
+.icon-print-area:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 15'%3E%3Crect x='1.5' y='2' width='12' height='11' rx='1' fill='none' stroke='%23444444' stroke-width='1.2' stroke-dasharray='2.4 1.6'/%3E%3Crect x='5' y='5.5' width='5' height='4' fill='none' stroke='%23444444' stroke-width='1.2'/%3E%3C/svg%3E");
+}
+
+/* 打印缩放：放大镜 + 加号 */
+.icon-print-zoom:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 15'%3E%3Ccircle cx='6.5' cy='6.5' r='4.25' fill='none' stroke='%23444444' stroke-width='1.2'/%3E%3Cpath d='M9.8 9.8 L13.4 13.4 M6.5 4.5 v4 M4.5 6.5 h4' fill='none' stroke='%23444444' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+
