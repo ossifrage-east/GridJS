@@ -521,7 +521,7 @@ export class Printer {
                 .gs-print-title { font-size: 1rem; font-weight: bold; color: #212529; }
                 .gs-print-body { flex: 1; display: flex; overflow: hidden; min-height: 0; }
                 /* 主体列：预览滚动区 + 页脚（页脚仅覆盖预览区宽度）；右侧设置面板独占全高直达页面底部 */
-                .gs-print-main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+                .gs-print-main { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
                 .gs-print-scroll { flex: 1; overflow: auto; padding: 1.5rem; background: #6c757d; }
                 /* 预览页面：与实际纸张等比例（宽高与页边距 padding 由 _renderPagesInto 按当前设置内联指定），
                    整页以 zoom 等比缩放——高度填满滚动区可用高度，宽度与内容随同一系数缩放（见 _applyPreviewZoom）；
@@ -581,7 +581,9 @@ export class Printer {
                 .gs-print-indicator { font-size: 0.875rem; color: #212529; min-width: 110px; text-align: center; }
                 /* 预览缩放控件：固定于页脚右侧（页码居中不受影响），滑块 + 百分比输入框 */
                 .gs-print-footer-zoom { position: absolute; right: 1rem; top: 50%; transform: translateY(-50%); display: flex; align-items: center; gap: 0.5rem; }
-                .gs-print-zoom-slider { width: 120px; accent-color: #0d6efd; cursor: pointer; touch-action: none; }
+                .gs-print-zoom-slider { width: 120px; accent-color: #0d6efd; cursor: pointer; touch-action: none; outline: none; }
+                .gs-print-zoom-slider:focus,
+                .gs-print-zoom-slider:focus-visible { outline: none; box-shadow: none; }
                 .gs-print-zoom-input { width: 3.5rem; padding: 0.25rem 0.375rem; font-size: 0.8125rem; border: 1px solid #ced4da; border-radius: 0.375rem; background: #fff; color: #212529; text-align: right; outline: none; box-sizing: border-box; transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out; }
                 .gs-print-zoom-input:focus { outline: none; border-color: #86b7fe; box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25); }
                 .gs-print-zoom-input::-webkit-outer-spin-button,
