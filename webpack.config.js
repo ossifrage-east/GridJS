@@ -80,13 +80,18 @@ module.exports = {
         ]
       },
       {	// 图片文件
-        test: /\.(jpe?g|png|ico|gif|bmp|tiff|webp)$/i,
+        test: /\.(jpe?g|png|gif|bmp|tiff|webp)$/i,
         type: "asset", // 一般会转换为 "asset/resource"
         parser: {
           dataUrlCondition: {
             maxSize: 8 * 1024 // 8kb （低于8kb都会压缩成 base64）
           }
         }
+      },
+      // 图标文件
+      {
+        test: /\.(ico|icon)$/i,
+        type: "asset/resource", // 一般会转换为 "asset/resource"
       },
       // svg文件
       {
