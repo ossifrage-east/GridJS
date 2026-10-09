@@ -88,6 +88,7 @@ export class Menu extends EventEmitter {
             this.container.removeChild(this.container.firstChild);
         }
         this.container.classList.remove('show');
+        this.emit('close');
     }
 
     /**
@@ -139,9 +140,47 @@ export class Menu extends EventEmitter {
  */
 export interface MenuContentOptions {
     /** 菜单项数组或自定义元素生成函数 */
-    items: ({ todo?: string, icon?: string | null, text: string } | 'separator')[] | (() => HTMLElement);
+    items: ({ todo?: string, icon?: string | null, badge?: 'T' | 'brush', text?: string } | 'separator' | (() => HTMLElement))[] | (() => HTMLElement);
     /** 点击回调函数 */
     onClick?: (todo: string) => void;
+}
+
+/**
+ * 创建带右下角角标的复合图标（用于"只粘贴文本/格式"等需要区分粘贴变体的场景）
+ *
+ * 在 base 图标右下角叠加一个小角标（T 字 / 格式刷），视觉上保留"粘贴"语义同时标明变体。
+ * @param {string} base - 基础图标 className（如 'icon-paste'）
+ * @param {'T' | 'brush'} badge - 角标类型：'T' = 字母 T；'brush' = icon-brush 小格式刷
+ * @returns {HTMLElement} 复合图标元素（relative 包裹，内含 base + overlay）
+ */
+export function createCompositeIcon(base: string, badge: 'T' | 'brush'): HTMLElement {
+    const wrap = document.createElement('span');
+    wrap.style.position = 'relative';
+    wrap.style.display = 'inline-flex';
+    wrap.style.alignItems = 'center';
+
+    const baseEl = document.createElement('i');
+    baseEl.className = base;
+    wrap.appendChild(baseEl);
+
+    const overlay = document.createElement('span');
+    overlay.style.cssText = 'position:absolute;right:-3px;bottom:-2px;background:#fff;border:1px solid #888;border-radius:2px;font-size:8px;line-height:1;padding:0 1px;color:#333;box-shadow:0 0 0 1px #fff;';
+    if (badge === 'T') {
+        overlay.textContent = 'T';
+        overlay.style.fontWeight = 'bold';
+        overlay.style.fontFamily = 'Arial, sans-serif';
+    } else {
+        const brush = document.createElement('i');
+        brush.className = 'icon-brush';
+        brush.style.fontSize = '9px';
+        brush.style.lineHeight = '1';
+        overlay.appendChild(brush);
+        overlay.style.padding = '0';
+        overlay.style.minWidth = '9px';
+        overlay.style.textAlign = 'center';
+    }
+    wrap.appendChild(overlay);
+    return wrap;
 }
 
 /**
@@ -179,7 +218,7 @@ export class MenuContent extends EventEmitter {
      */
     private addMenuItem(): void {
         (Array.isArray(this.options.items) ? this.options.items : [this.options.items]).forEach(
-            (item: { todo?: string, icon?: string, text: string } | 'separator' | (() => HTMLElement)) => {
+            (item: { todo?: string, icon?: string, badge?: 'T' | 'brush', text: string } | 'separator' | (() => HTMLElement)) => {
                 const menuItem = document.createElement('div');
                 if (item === 'separator') {
                     menuItem.classList.add(MENU_CLASS_NAMES.LINE);
@@ -199,7 +238,10 @@ export class MenuContent extends EventEmitter {
                 text.classList.add('text');
                 text.textContent = `${item.text}`;
 
-                if (item.icon) {
+                // badge 优先：复合图标（base icon + 右下角角标）
+                if (item.badge && item.icon) {
+                    menuItem.appendChild(createCompositeIcon(item.icon, item.badge));
+                } else if (item.icon) {
                     const iconEl = document.createElement('i');
                     iconEl.className = `${item.icon}`;
                     menuItem.appendChild(iconEl);

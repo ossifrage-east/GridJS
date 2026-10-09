@@ -530,6 +530,31 @@ export class Cell extends EventEmitter {
     }
 
     /**
+     * 重置单元格的所有内容与格式（保留 cell 名称和功能性字段 colspan/rowspan/filter）
+     *
+     * 与 clearValue（只清 chars）不同，reset 会同时清除：
+     * - 字符级样式（每个 Char 的 fontFamily/fontSize/fontWeight/fontStyle/fontColor/underline/strikethrough）
+     * - 单元格级样式（textAlign/alignItems/wrap/letterSpacing/lineSpacing）
+     * - 边框（四边 borderWidth）
+     * - 背景色（backgroundColor）
+     *
+     * 功能性字段（cell/colspan/rowspan/filter/isEdit）保留，因为它们承载合并结构、筛选标记等非样式语义。
+     */
+    public reset(): void {
+        this._chars = [];
+        this._textAlign = undefined;
+        this._alignItems = undefined;
+        this._wrap = undefined;
+        this._letterSpacing = undefined;
+        this._lineSpacing = undefined;
+        this._borderTopWidth = undefined;
+        this._borderBottomWidth = undefined;
+        this._borderLeftWidth = undefined;
+        this._borderRightWidth = undefined;
+        this._backgroundColor = undefined;
+    }
+
+    /**
      * 判断是否为「空单元格」：不包含任何样式与内容信息
      * 「样式与内容信息」的定义（任一存在即非空）：
      * - 文字信息：chars 中存在非空字符；

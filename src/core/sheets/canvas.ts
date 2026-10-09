@@ -13,7 +13,7 @@ import { CellContent, LineText } from "../dataArchitecture/cellContent";
 import { EventEmitter } from "../../utils/eventEmitter";
 import { CELL_PADDING, DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE, GRID_LINE_COLOR, KEYWORDS, MouseLocation, TEXT_COLOR } from "../constant";
 import { DataCollection } from "../dataArchitecture/dataCollection";
-import { Menu, MenuContent } from "../common/menu";
+import { Menu, MenuContent, createCompositeIcon } from "../common/menu";
 import { Dialog } from "../common/dialog";
 import { createDiv, createInput, createButton } from "../../utils/dom";
 
@@ -572,33 +572,321 @@ export class Canvas extends EventEmitter {
      * @returns {void} - 无返回值，仅初始化属性 menuContent
      */
     private setupMenuContent(): void {
+        // 横向图标按钮行：复制 / 剪切 / 粘贴 / 只粘贴文本 / 只粘贴格式
+        const createClipboardRow = (): HTMLDivElement => {
+            const row = createDiv({
+                style: { display: 'flex', flexDirection: 'row', padding: '4px 2px', gap: '1px' }
+            });
+            const icons = [
+                { todo: 'copy', icon: 'icon-copy', title: '复制 (Ctrl+C)' },
+                { todo: 'cut', icon: 'icon-scissors', title: '剪切 (Ctrl+X)' },
+                { todo: 'paste', icon: 'icon-paste', title: '粘贴 (Ctrl+V)' },
+                { todo: 'pasteText', icon: 'icon-paste', badge: 'T' as const, title: '只粘贴文本' },
+                { todo: 'pasteFormat', icon: 'icon-paste', badge: 'brush' as const, title: '只粘贴格式' },
+            ];
+            for (const it of icons) {
+                const btn = createButton({
+                    attributes: { title: it.title },
+                    style: {
+                        width: '28px', height: '28px', padding: '0',
+                        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                        border: 'none', borderRadius: '3px', backgroundColor: 'transparent',
+                        cursor: 'pointer', fontSize: '14px', color: '#333',
+                        transition: 'background-color 0.15s',
+                    }
+                });
+                // 用 i 图标而非 emoji——icon css 已通过 @font-face 加载
+                if (it.badge) {
+                    btn.appendChild(createCompositeIcon(it.icon, it.badge));
+                } else {
+                    const iconEl = document.createElement('i');
+                    iconEl.className = it.icon;
+                    btn.appendChild(iconEl);
+                }
+                btn.addEventListener('mouseenter', () => { btn.style.backgroundColor = '#e9ecef'; });
+                btn.addEventListener('mouseleave', () => { btn.style.backgroundColor = 'transparent'; });
+                btn.addEventListener('click', (e) => {
+                    e.preventDefault(); e.stopPropagation();
+                    this.menu.closeMenu();
+                    this.handleContextMenuAction(it.todo);
+                });
+                row.appendChild(btn);
+            }
+            return row;
+        };
+
         this.menuContent = new MenuContent({
             items: [
-                { todo: 'undo', text: '撤销' },
-                { todo: 'redo', text: '重做' },
+                // 横向剪贴板按钮行（自定义元素，内联 5 个图标按钮）
+                createClipboardRow,
                 'separator',
-                { todo: 'delete', text: '删除' },
+                // 删除：hover 弹出二级子菜单（独立容器 append 到 body，避免主菜单 overflow 裁剪）
+                () => {
+                    const wrap = createDiv({
+                        className: 'menu-item menu-item-has-submenu',
+                        style: { position: 'relative' }
+                    });
+                    const iconEl = document.createElement('i');
+                    iconEl.className = 'icon-bin';
+                    const textSpan = document.createElement('span');
+                    textSpan.className = 'text';
+                    textSpan.textContent = '删除';
+                    const arrowSpan = document.createElement('span');
+                    arrowSpan.textContent = '▶';
+                    arrowSpan.style.cssText = 'margin-left:auto; font-size:10px; color:#999;';
+                    wrap.appendChild(iconEl);
+                    wrap.appendChild(textSpan);
+                    wrap.appendChild(arrowSpan);
+
+                    // 子菜单容器引用（用于 hover 关闭 + 主菜单关闭时清理）
+                    let submenuEl: HTMLElement | null = null;
+                    // mouseleave 延迟关闭定时器：给鼠标从「删除项」移动到子菜单（穿过 gap）留时间
+                    let closeTimer: ReturnType<typeof setTimeout> | null = null;
+                    const cancelPendingClose = (): void => {
+                        if (closeTimer !== null) {
+                            clearTimeout(closeTimer);
+                            closeTimer = null;
+                        }
+                    };
+
+                    // hover 展开：在 body 上创建独立 MenuContent，定位到 delete 项右侧
+                    wrap.addEventListener('mouseenter', () => {
+                        cancelPendingClose(); // 快速来回移动时取消未生效的关闭
+                        if (submenuEl) return; // 已展开则跳过
+                        // 构建子菜单内容（复用 MenuContent 统一渲染，样式一致）
+                        const subItems = [
+                            { todo: 'deleteShiftLeft', icon: 'icon-text-indent-right', text: '单元格左移' },
+                            { todo: 'deleteShiftUp', icon: 'icon-align-top', text: '单元格上移' },
+                            { todo: 'deleteRow', icon: 'icon-bin', text: '删除整行' },
+                            { todo: 'deleteCol', icon: 'icon-bin', text: '删除整列' },
+                        ];
+                        const subContent = new MenuContent({
+                            items: subItems,
+                            onClick: (todo: string) => {
+                                closeSubmenu();
+                                this.menu.closeMenu();
+                                this.handleContextMenuAction(todo);
+                            },
+                        });
+                        submenuEl = subContent.getElements().container;
+                        submenuEl.classList.add('menu');
+                        // 强制弹出样式：必须内联覆盖 .menu 类的 opacity:0 / visibility:hidden /
+                        // transition 0.2s（否则子菜单要等淡入动画、感知为延迟显示）
+                        submenuEl.style.cssText = 'position:absolute; display:flex; opacity:1; visibility:visible; transition:none; min-width:160px; box-shadow:0 4px 8px rgba(0,0,0,0.15); z-index:1002;';
+                        document.body.appendChild(submenuEl);
+                        // 定位：delete 项右边缘（重叠 1px 消除 hover gap，防止 mouseleave 误关）+ 顶部对齐
+                        const wrapRect = wrap.getBoundingClientRect();
+                        const subRect = submenuEl.getBoundingClientRect();
+                        let left = wrapRect.right - 1;
+                        let top = wrapRect.top;
+                        if (left + subRect.width > window.innerWidth) {
+                            // 右侧空间不足：改弹到左侧（同样重叠 1px）
+                            left = wrapRect.left - subRect.width + 1;
+                        }
+                        if (top + subRect.height > window.innerHeight) {
+                            top = window.innerHeight - subRect.height - 4;
+                        }
+                        if (top < 0) top = 4;
+                        submenuEl.style.left = `${left}px`;
+                        submenuEl.style.top = `${top}px`;
+                        // 鼠标移入子菜单时取消待执行的关闭
+                        submenuEl.addEventListener('mouseenter', cancelPendingClose);
+                    });
+
+                    // 关闭子菜单（从 body 移除 DOM）
+                    const closeSubmenu = (): void => {
+                        cancelPendingClose();
+                        if (submenuEl && submenuEl.isConnected) {
+                            submenuEl.remove();
+                        }
+                        submenuEl = null;
+                    };
+                    // 主菜单关闭时清理子菜单引用（兜底：防止 mouseleave 期间子菜单残留）
+                    this.menu.on('close', closeSubmenu);
+                    // mouseleave 延迟 120ms 关闭：鼠标穿过 wrap 与子菜单间的缝隙或子菜单内移动时不会误关
+                    wrap.addEventListener('mouseleave', () => {
+                        cancelPendingClose();
+                        closeTimer = setTimeout(closeSubmenu, 120);
+                    });
+                    return wrap;
+                },
+                // 插入：hover 弹出二级子菜单（与删除子菜单同构，独立容器 append 到 body）
+                () => {
+                    const wrap = createDiv({
+                        className: 'menu-item menu-item-has-submenu',
+                        style: { position: 'relative' }
+                    });
+                    const iconEl = document.createElement('i');
+                    iconEl.className = 'icon-plus';
+                    const textSpan = document.createElement('span');
+                    textSpan.className = 'text';
+                    textSpan.textContent = '插入';
+                    const arrowSpan = document.createElement('span');
+                    arrowSpan.textContent = '▶';
+                    arrowSpan.style.cssText = 'margin-left:auto; font-size:10px; color:#999;';
+                    wrap.appendChild(iconEl);
+                    wrap.appendChild(textSpan);
+                    wrap.appendChild(arrowSpan);
+
+                    let submenuEl: HTMLElement | null = null;
+                    let closeTimer: ReturnType<typeof setTimeout> | null = null;
+                    const cancelPendingClose = (): void => {
+                        if (closeTimer !== null) {
+                            clearTimeout(closeTimer);
+                            closeTimer = null;
+                        }
+                    };
+
+                    // 构建带「份数式」数字步进器的插入项（？处填入行数/列数；样式参照打印设置份数输入框，见 menu.scss）
+                    const buildCountItem = (label: string, icon: string, todo: string): HTMLElement => {
+                        const item = createDiv({ className: 'menu-item', style: { padding: '6px 10px', gap: '8px' } });
+                        const ic = document.createElement('i');
+                        ic.className = icon;
+                        const txt = document.createElement('span');
+                        txt.className = 'text';
+                        txt.textContent = label;
+                        // 输入框 + 右侧纵向 +/− 步进按钮（与打印设置份数输入框同构，不使用独立 ▲▼）
+                        const grp = document.createElement('span');
+                        grp.className = 'menu-count-stepper';
+                        grp.style.marginLeft = 'auto';
+                        const input = createInput({ type: 'number' });
+                        input.className = 'menu-count-input';
+                        input.value = '1';
+                        input.min = '1';
+                        input.max = '999';
+                        input.step = '1';
+                        const clampCount = (): void => {
+                            const v = parseInt(input.value);
+                            input.value = String(Number.isNaN(v) ? 1 : Math.min(999, Math.max(1, v)));
+                        };
+                        const btns = document.createElement('span');
+                        btns.className = 'menu-count-btns';
+                        // 步进：单击 ±1；按住持续 ±1（初始延迟 400ms，之后每 80ms 重复），抬起/移出即停止
+                        const applyStep = (delta: number): void => {
+                            const v = parseInt(input.value);
+                            const base = Number.isNaN(v) ? 1 : v;
+                            input.value = String(Math.min(999, Math.max(1, base + delta)));
+                        };
+                        const startRepeat = (delta: number): void => {
+                            applyStep(delta);
+                            let timer: ReturnType<typeof setTimeout> | null = null;
+                            const tick = () => {
+                                applyStep(delta);
+                                timer = setTimeout(tick, 80);
+                            };
+                            timer = setTimeout(tick, 400);
+                            // 在 window 上监听抬起/取消：即使指针移出按钮也能停止连发
+                            const stop = () => {
+                                if (timer !== null) {
+                                    clearTimeout(timer);
+                                    timer = null;
+                                }
+                                window.removeEventListener('pointerup', stop);
+                                window.removeEventListener('pointercancel', stop);
+                            };
+                            window.addEventListener('pointerup', stop);
+                            window.addEventListener('pointercancel', stop);
+                        };
+                        const bindStepButton = (button: HTMLButtonElement, delta: number): void => {
+                            button.addEventListener('pointerdown', (e) => {
+                                if (e.button !== 0) return;
+                                e.preventDefault(); // 阻止焦点转移与文本选择，保证按住期间连发不被打断
+                                e.stopPropagation();
+                                startRepeat(delta);
+                            });
+                            // click 仅拦截冒泡：防止行体 click 触发插入动作（步进逻辑全部走 pointerdown）
+                            button.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); });
+                        };
+                        const incBtn = createButton({ textContent: '+' });
+                        const decBtn = createButton({ textContent: '−' });
+                        bindStepButton(incBtn, 1);
+                        bindStepButton(decBtn, -1);
+                        input.addEventListener('click', (e) => { e.stopPropagation(); });
+                        input.addEventListener('change', clampCount);
+                        btns.appendChild(incBtn);
+                        btns.appendChild(decBtn);
+                        grp.appendChild(input);
+                        grp.appendChild(btns);
+                        item.appendChild(ic);
+                        item.appendChild(txt);
+                        item.appendChild(grp);
+                        // 点击行体（按钮/输入框已 stopPropagation）触发插入
+                        item.addEventListener('click', (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const count = Math.max(1, parseInt(input.value) || 1);
+                            closeSubmenu();
+                            this.menu.closeMenu();
+                            this.doInsertCountAction(todo, count);
+                        });
+                        return item;
+                    };
+
+                    wrap.addEventListener('mouseenter', () => {
+                        cancelPendingClose();
+                        if (submenuEl) return;
+                        const subItems: ({ todo?: string, icon?: string | null, text?: string } | 'separator' | (() => HTMLElement))[] = [
+                            { todo: 'insertShiftRight', icon: 'icon-text-indent-left', text: '插入单元格，活动单元格右移' },
+                            { todo: 'insertShiftDown', icon: 'icon-align-bottom', text: '插入单元格，活动单元格下移' },
+                            'separator',
+                            () => buildCountItem('在上方插入行', 'icon-align-top', 'insertRowsAbove'),
+                            () => buildCountItem('在下方插入行', 'icon-align-bottom', 'insertRowsBelow'),
+                            () => buildCountItem('在左侧插入列', 'icon-text-indent-left', 'insertColsLeft'),
+                            () => buildCountItem('在右侧插入列', 'icon-text-indent-right', 'insertColsRight'),
+                        ];
+                        const subContent = new MenuContent({
+                            items: subItems,
+                            onClick: (todo: string) => {
+                                closeSubmenu();
+                                this.menu.closeMenu();
+                                this.handleContextMenuAction(todo);
+                            },
+                        });
+                        submenuEl = subContent.getElements().container;
+                        submenuEl.classList.add('menu');
+                        submenuEl.style.cssText = 'position:absolute; display:flex; opacity:1; visibility:visible; transition:none; min-width:220px; box-shadow:0 4px 8px rgba(0,0,0,0.15); z-index:1002;';
+                        document.body.appendChild(submenuEl);
+                        const wrapRect = wrap.getBoundingClientRect();
+                        const subRect = submenuEl.getBoundingClientRect();
+                        let left = wrapRect.right - 1;
+                        let top = wrapRect.top;
+                        if (left + subRect.width > window.innerWidth) {
+                            left = wrapRect.left - subRect.width + 1;
+                        }
+                        if (top + subRect.height > window.innerHeight) {
+                            top = window.innerHeight - subRect.height - 4;
+                        }
+                        if (top < 0) top = 4;
+                        submenuEl.style.left = `${left}px`;
+                        submenuEl.style.top = `${top}px`;
+                        submenuEl.addEventListener('mouseenter', cancelPendingClose);
+                    });
+
+                    const closeSubmenu = (): void => {
+                        cancelPendingClose();
+                        if (submenuEl && submenuEl.isConnected) {
+                            submenuEl.remove();
+                        }
+                        submenuEl = null;
+                    };
+                    this.menu.on('close', closeSubmenu);
+                    wrap.addEventListener('mouseleave', () => {
+                        cancelPendingClose();
+                        closeTimer = setTimeout(closeSubmenu, 120);
+                    });
+                    return wrap;
+                },
                 'separator',
-                { todo: 'hide', text: '隐藏' },
-                { todo: 'unhide', text: '取消隐藏' },
-                { todo: 'rowHeight', text: '行高' },
+                { todo: 'hide', icon: 'icon-eye-blocked', text: '隐藏' },
+                { todo: 'unhide', icon: 'icon-eye', text: '取消隐藏' },
+                { todo: 'rowHeight', icon: 'icon-align-middle', text: '行高' },
+                { todo: 'colWidth', icon: 'icon-justify', text: '列宽' },
                 'separator',
-                { todo: 'clearContent', text: '清除内容' },
-                { todo: 'format', text: '设置单元格格式' },
+                { todo: 'clearContent', icon: 'icon-cross', text: '清除内容' },
+                { todo: 'format', icon: 'icon-hammer', text: '设置单元格格式' },
             ],
             onClick: (todo: string) => {
                 this.menu.closeMenu();
-                // 撤销/重做：恢复由 DataCollection._undoRestoreCallback 完成，
-                // 恢复期间广播的 VALUES_CHANGED/SELECTION_CHANGED 等事件会联动重绘主画布，
-                // 此处再经 refreshAfterContextMenu 重绘当前画布（行头/列头）。
-                if (todo === 'undo' || todo === 'redo') {
-                    const canApply = todo === 'undo' ? this.data.undoManager.canUndo() : this.data.undoManager.canRedo();
-                    if (canApply) {
-                        todo === 'undo' ? this.data.undo() : this.data.redo();
-                        this.refreshAfterContextMenu();
-                    }
-                    return;
-                }
                 this.handleContextMenuAction(todo);
             },
         });
@@ -640,6 +928,35 @@ export class Canvas extends EventEmitter {
         const data = this.data;
         const { startCol, endCol, startRow, endRow } = this.getSelectedColsAndRows();
         switch (todo) {
+            case 'copy':
+                data.copySelection();
+                break;
+            case 'cut':
+                data.runWithFullStateUndo('剪切', () => data.cutSelection());
+                break;
+            case 'paste':
+                data.runWithFullStateUndo('粘贴', () => data.pasteSelection());
+                break;
+            case 'pasteText':
+                data.runWithFullStateUndo('只粘贴文本', () => data.pasteTextOnly());
+                break;
+            case 'pasteFormat':
+                data.runWithFullStateUndo('只粘贴格式', () => data.pasteFormatOnly());
+                break;
+            case 'deleteShiftLeft': {
+                // 清除选区内容 + 右侧可见单元格向左紧凑补位（单元格级，非整列）
+                data.runWithFullStateUndo('删除并左移', () => {
+                    data.shiftCellsLeft(startCol, endCol, startRow, endRow);
+                });
+                break;
+            }
+            case 'deleteShiftUp': {
+                // 清除选区内容 + 下方可见单元格向上紧凑补位（单元格级，非整行）
+                data.runWithFullStateUndo('删除并上移', () => {
+                    data.shiftCellsUp(startCol, endCol, startRow, endRow);
+                });
+                break;
+            }
             case 'delete': {
                 if (this._contextTarget === 'row') {
                     data.runWithFullStateUndo('删除行', () => {
@@ -663,6 +980,42 @@ export class Canvas extends EventEmitter {
                         data.clearContents(startCol, endCol, startRow, endRow);
                     });
                 }
+                break;
+            }
+            case 'deleteRow': {
+                // 二级菜单「删除整行」：不依赖右键目标（行头/单元格均可），删除选区覆盖的整行
+                data.runWithFullStateUndo('删除行', () => {
+                    data.deleteRows(startRow, endRow);
+                    // 删除后选区保持原位置（下方行上移补位），越界部分收缩到有效范围
+                    const newEndRow = Math.min(endRow, data.rowHeaders.length);
+                    const newStartRow = Math.min(startRow, newEndRow);
+                    data.selection = `A${newStartRow}:${data.getColName(data.colHeaders.length)}${newEndRow}`;
+                });
+                break;
+            }
+            case 'deleteCol': {
+                // 二级菜单「删除整列」：不依赖右键目标（列头/单元格均可），删除选区覆盖的整列
+                data.runWithFullStateUndo('删除列', () => {
+                    data.deleteCols(startCol, endCol);
+                    // 删除后选区保持原位置（右侧列左移补位），越界部分收缩到有效范围
+                    const newEndCol = Math.min(endCol, data.colHeaders.length);
+                    const newStartCol = Math.min(startCol, newEndCol);
+                    data.selection = `${data.getColName(newStartCol)}1:${data.getColName(newEndCol)}${data.rowHeaders.length}`;
+                });
+                break;
+            }
+            case 'insertShiftRight': {
+                // 选区位置插入空白单元格 + 右侧可见单元格右移让位（单元格级）
+                data.runWithFullStateUndo('插入并右移', () => {
+                    data.insertCellsRight(startCol, endCol, startRow, endRow);
+                });
+                break;
+            }
+            case 'insertShiftDown': {
+                // 选区位置插入空白单元格 + 下方可见单元格下移让位（单元格级）
+                data.runWithFullStateUndo('插入并下移', () => {
+                    data.insertCellsDown(startCol, endCol, startRow, endRow);
+                });
                 break;
             }
             case 'hide':
@@ -689,6 +1042,10 @@ export class Canvas extends EventEmitter {
                 // 弹出行高对话框：确认后经 runWithFullStateUndo 应用并重绘（见 openRowHeightDialog）
                 this.openRowHeightDialog(startRow, endRow);
                 return;
+            case 'colWidth':
+                // 弹出列宽对话框：镜像 openRowHeightDialog，经 runWithFullStateUndo 应用并重绘
+                this.openColWidthDialog(startCol, endCol);
+                return;
             case 'gridLines':
                 data.runWithFullStateUndo('切换分割线', () => {
                     data.showGridLines = !data.showGridLines;
@@ -714,23 +1071,86 @@ export class Canvas extends EventEmitter {
     }
 
     /**
-     * 弹出行高设置对话框（Bootstrap 风格，替代原 window.prompt 交互）
+     * 处理带数量参数的插入动作（上方/下方插入行、左侧/右侧插入列）。
      *
-     * 确认后把输入高度应用到选区内所有行，并经 runWithFullStateUndo 包裹以支持整体撤销/重做；
-     * 取消、ESC、点击遮罩或非法输入（空/非数字/小于最小行高 24）不产生任何变更，非法输入时对话框保持打开。
-     * 对话框关闭后自毁（destroy），避免 DOM 与事件监听累积。
-     * @param {number} startRow - 选区起始行（1-based）
-     * @param {number} endRow - 选区结束行（1-based）
+     * 数量来自二级菜单中各输入框的当前值；操作经 runWithFullStateUndo 包裹（选区变更一并进入快照），
+     * 操作后将选区重置为新插入的行/列范围（Excel 习惯：选中刚插入的部分以便后续操作）。
+     * @param {string} todo - 动作名称（insertRowsAbove/insertRowsBelow/insertColsLeft/insertColsRight）
+     * @param {number} count - 插入数量（调用前已确保 >= 1，此处再次钳制兜底）
      * @private
      */
-    private openRowHeightDialog(startRow: number, endRow: number): void {
+    private doInsertCountAction(todo: string, count: number): void {
         const data = this.data;
-        const MIN_ROW_HEIGHT = 24; // 最小行高，与 DataCollection.adjustRowHeight 的钳制及行表头拖拽调高保持一致
-        const current = data.rowHeaders.getAt(startRow - 1)?.height || MIN_ROW_HEIGHT;
+        const { startCol, endCol, startRow, endRow } = this.getSelectedColsAndRows();
+        const safeCount = Math.max(1, Math.floor(count));
+        switch (todo) {
+            case 'insertRowsAbove':
+                data.runWithFullStateUndo('上方插入行', () => {
+                    data.insertRows(startRow, safeCount);
+                    data.selection = `A${startRow}:${data.getColName(data.colHeaders.length)}${startRow + safeCount - 1}`;
+                });
+                break;
+            case 'insertRowsBelow':
+                data.runWithFullStateUndo('下方插入行', () => {
+                    data.insertRows(endRow + 1, safeCount);
+                    data.selection = `A${endRow + 1}:${data.getColName(data.colHeaders.length)}${endRow + safeCount}`;
+                });
+                break;
+            case 'insertColsLeft':
+                data.runWithFullStateUndo('左侧插入列', () => {
+                    data.insertCols(startCol, safeCount);
+                    data.selection = `${data.getColName(startCol)}1:${data.getColName(startCol + safeCount - 1)}${data.rowHeaders.length}`;
+                });
+                break;
+            case 'insertColsRight':
+                data.runWithFullStateUndo('右侧插入列', () => {
+                    data.insertCols(endCol + 1, safeCount);
+                    data.selection = `${data.getColName(endCol + 1)}1:${data.getColName(endCol + safeCount)}${data.rowHeaders.length}`;
+                });
+                break;
+            default:
+                return;
+        }
+        this.refreshAfterContextMenu();
+    }
+
+    /**
+     * 维度设置对话框（行高/列宽共用）
+     *
+     * Bootstrap input-group 风格：左侧标签 + 右侧输入框 + ▲▼ 步进按钮 + 取消/确定。
+     * 校验逻辑：空/非数字/小于 minValue 视为非法，点确定时对话框保持打开不产生任何变更。
+     * 交互特性：
+     * - type=text + inputmode=numeric + input 事件过滤非数字字符（含全角数字），
+     *   规避 type=number 不支持选区 API（selectionStart 恒 null、setSelectionRange 抛错）；
+     * - ▲▼ 单击 ±1，按住 400ms 后每 80ms 重复，window pointerup/cancel 停止连发；
+     * - 鼠标点击定位光标 + 拖拽选区：Chromium 怪癖守卫（非折叠选区时 preventDefault +
+     *   手动定位），无选区时走原生行为；双击全选；
+     * - Enter 确认，ESC 由 Dialog 文档级监听处理；
+     * - 对话框关闭后自毁（destroy），避免 DOM 与事件监听累积。
+     * @param opts - 配置选项
+     * @private
+     */
+    private openDimensionDialog(opts: {
+        /** 对话框标题（如「行高」「列宽」） */
+        title: string;
+        /** 输入框前标签文字（如「行高（像素）」） */
+        labelText: string;
+        /** 最小允许值，与数据层 adjust* 方法的钳制保持一致（行高/列宽均为 24） */
+        minValue: number;
+        /** 打开对话框时输入框的初始值 */
+        currentValue: number;
+        /**
+         * 确认时应用输入值到选区内所有行/列。
+         * 调用方内部应包 runWithFullStateUndo + 循环 adjust* + refreshAfterContextMenu。
+         * @param value - 校验通过的数值（已 ≥ minValue）
+         */
+        applyValue: (value: number) => void;
+    }): void {
+        const { title, labelText, minValue, currentValue, applyValue } = opts;
 
         // 内容区：标签 + 数字输入框（Bootstrap form-control 视觉）
         const label = createDiv({
-            textContent: '行高（像素）',
+            textContent: labelText,
             style: { fontSize: '0.875rem', color: '#212529' }
         });
         // 输入框：自身无边框透明底，边框/圆角/聚焦高亮由外层 group 统一提供；
@@ -753,7 +1173,7 @@ export class Canvas extends EventEmitter {
                 outline: 'none',
             }
         });
-        input.value = String(Math.round(current));
+        input.value = String(Math.round(currentValue));
         // 数字过滤：剥离非数字字符（含中文输入法产生的全角数字），保持等价于 type=number 的输入约束
         input.addEventListener('input', () => {
             const cleaned = input.value.replace(/\D/g, '');
@@ -766,7 +1186,7 @@ export class Canvas extends EventEmitter {
         const applyStep = (delta: number): void => {
             const value = Number(input.value);
             const base = Number.isFinite(value) ? value : 0;
-            input.value = String(Math.max(MIN_ROW_HEIGHT, base + delta));
+            input.value = String(Math.max(minValue, base + delta));
         };
         const startRepeat = (delta: number): void => {
             applyStep(delta);
@@ -904,22 +1324,17 @@ export class Canvas extends EventEmitter {
             style: { display: 'flex', flexDirection: 'column', gap: '0.5rem' }
         });
 
-        // 应用输入高度到选区内所有行；非法输入返回 false（由调用方决定是否保持对话框打开）
+        // 校验并应用输入值；非法输入返回 false（由调用方决定是否保持对话框打开）
         const apply = (): boolean => {
             const value = input.value.trim();
-            const height = Number(value);
-            if (value === '' || !Number.isFinite(height) || height < MIN_ROW_HEIGHT) return false;
-            data.runWithFullStateUndo('调整行高', () => {
-                for (let r = startRow; r <= endRow; r++) {
-                    data.adjustRowHeight(r, height);
-                }
-            });
-            this.refreshAfterContextMenu();
+            const num = Number(value);
+            if (value === '' || !Number.isFinite(num) || num < minValue) return false;
+            applyValue(num);
             return true;
         };
 
         const dialog = new Dialog({
-            title: '行高',
+            title,
             content: wrapper,
             size: 'sm',
             buttons: [
@@ -943,6 +1358,56 @@ export class Canvas extends EventEmitter {
             if (e.key === 'Enter') {
                 e.preventDefault();
                 if (apply()) dialog.hide();
+            }
+        });
+    }
+
+    /**
+     * 弹出行高设置对话框（委托 openDimensionDialog）
+     * @param {number} startRow - 选区起始行（1-based）
+     * @param {number} endRow - 选区结束行（1-based）
+     * @private
+     */
+    private openRowHeightDialog(startRow: number, endRow: number): void {
+        const data = this.data;
+        const MIN_ROW_HEIGHT = 24; // 最小行高，与 DataCollection.adjustRowHeight 的钳制及行表头拖拽调高保持一致
+        this.openDimensionDialog({
+            title: '行高',
+            labelText: '行高（像素）',
+            minValue: MIN_ROW_HEIGHT,
+            currentValue: data.rowHeaders.getAt(startRow - 1)?.height || MIN_ROW_HEIGHT,
+            applyValue: (height) => {
+                data.runWithFullStateUndo('调整行高', () => {
+                    for (let r = startRow; r <= endRow; r++) {
+                        data.adjustRowHeight(r, height);
+                    }
+                });
+                this.refreshAfterContextMenu();
+            }
+        });
+    }
+
+    /**
+     * 弹出列宽设置对话框（委托 openDimensionDialog）
+     * @param {number} startCol - 选区起始列（1-based）
+     * @param {number} endCol - 选区结束列（1-based）
+     * @private
+     */
+    private openColWidthDialog(startCol: number, endCol: number): void {
+        const data = this.data;
+        const MIN_COL_WIDTH = 24; // 最小列宽，与 DataCollection.adjustColumnWidth 的钳制及列表头拖拽调高保持一致
+        this.openDimensionDialog({
+            title: '列宽',
+            labelText: '列宽（像素）',
+            minValue: MIN_COL_WIDTH,
+            currentValue: data.colHeaders.getAt(startCol - 1)?.width || MIN_COL_WIDTH,
+            applyValue: (width) => {
+                data.runWithFullStateUndo('调整列宽', () => {
+                    for (let c = startCol; c <= endCol; c++) {
+                        data.adjustColumnWidth(c, width);
+                    }
+                });
+                this.refreshAfterContextMenu();
             }
         });
     }

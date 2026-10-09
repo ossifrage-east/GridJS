@@ -2199,6 +2199,60 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 只粘贴文本（值），不粘贴任何格式（样式/边框/对齐/合并等）。
+     * 与 pasteSelection 的目标配对逻辑完全一致，但目标单元格只更新 chars 里的 char 字符，
+     * 所有样式字段保留原值不变；剪贴板为 char 类型时同理。
+     * 忽略隐藏的行/列并紧凑排列（与 pasteSelection 相同）。
+     */
+    public pasteTextOnly(): void {
+        const clipboard = this.clipboardManager.getClipboard();
+        if (clipboard && clipboard.type === 'cell' && clipboard.cells) {
+            const [start, end] = clipboard.sourceRange.split(':');
+            const { col: startCol, row: startRow } = this.getCellColAndRow(start);
+            const { col: endCol, row: endRow } = this.getCellColAndRow(end);
+            const { col: activedCol, row: activedRow } = this.getCellColAndRow(this.activedCell);
+            const colOffsets = clipboard.visibleColOffsets ?? Array.from({ length: endCol - startCol + 1 }, (_, i) => i);
+            const rowOffsets = clipboard.visibleRowOffsets ?? Array.from({ length: endRow - startRow + 1 }, (_, i) => i);
+            const targetColOffsets = this._collectVisibleOffsets(activedCol, Infinity, colOffsets.length, true);
+            const targetRowOffsets = this._collectVisibleOffsets(activedRow, Infinity, rowOffsets.length, false);
+            for (let i = 0; i < colOffsets.length && i < targetColOffsets.length; i++) {
+                for (let j = 0; j < rowOffsets.length && j < targetRowOffsets.length; j++) {
+                    const tgtCol = activedCol + targetColOffsets[i];
+                    const tgtRow = activedRow + targetRowOffsets[j];
+                    const cell = this.values.find(c => c.cell === `${this.getColName(tgtCol)}${tgtRow}`);
+                    const item = clipboard.cells.find(c => c.cell === `${this.getColName(startCol + colOffsets[i])}${startRow + rowOffsets[j]}`);
+                    if (item) {
+                        // 只拷贝字符内容，保留目标原有格式
+                        const newChars = item.chars.map(c => {
+                            const _char = new Char();
+                            _char.char = c.char;
+                            return _char;
+                        });
+                        if (cell) {
+                            cell.chars = newChars;
+                        } else {
+                            const _cell = new Cell();
+                            _cell.cell = `${this.getColName(tgtCol)}${tgtRow}`;
+                            _cell.chars = newChars;
+                            this.values.push(_cell);
+                        }
+                    }
+                }
+            }
+        } else if (clipboard && clipboard.type === 'char' && clipboard.chars) {
+            const cell = this.values.find(c => c.cell === this.activedCell);
+            if (cell) {
+                cell.chars = clipboard.chars.map(c => {
+                    const _char = new Char();
+                    _char.char = c.char;
+                    return _char;
+                });
+            }
+        }
+        this.commitValues();
+    }
+
+    /**
      * 粘贴格式仅
      *
      * 忽略隐藏的行/列并紧凑排列：源可见位置与目标可见位置按顺序一一配对，
@@ -3077,6 +3131,185 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 在指定位置插入若干整行（结构性插入，区别于 insertCellsRight 的单元格级右移）。
+     *
+     * - 行表头在 atRow 处插入 count 个默认高度的新行，其后各行 top 依次后移；
+     * - values 中行号 >= atRow 的单元格整体下移 count（cell 名称重映射，内容与样式随对象保留）；
+     * - 跨越插入位置的合并锚点 rowspan 扩展 count（合并随新行一起撑开）；
+     * - 隐藏行同样下移（整行结构操作，隐藏行参与重映射，与 deleteRows 对称）。
+     * @param {number} atRow - 插入位置（1-based，新行将占据 atRow..atRow+count-1）
+     * @param {number} count - 插入行数
+     */
+    public insertRows(atRow: number, count: number): void {
+        if (atRow < 1 || count < 1) return;
+        // 1. 行表头插入新行（默认高度），重算 top
+        const newHeaders: RowHeader[] = [];
+        for (let i = 0; i < count; i++) newHeaders.push({ top: 0, height: DEFAULT_CELL_HEIGHT });
+        this.rowHeaders.rowHeaders.splice(atRow - 1, 0, ...newHeaders);
+        this.rowHeaders.recalcRowPositions();
+
+        // 2. values 重映射：行号 >= atRow 的单元格下移 count；跨越插入点的合并扩展 rowspan
+        for (const cell of this.values) {
+            const { col, row } = this.getCellColAndRow(cell.cell);
+            if (row >= atRow) {
+                cell.cell = `${this.getColName(col)}${row + count}`;
+            }
+            if (cell.rowspan && cell.rowspan > 1 && row < atRow) {
+                const spanEnd = row + cell.rowspan - 1;
+                if (spanEnd >= atRow) cell.rowspan = cell.rowspan + count;
+            }
+        }
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
+    }
+
+    /**
+     * 在指定位置插入若干整列（结构性插入）。
+     *
+     * - 列表头在 atCol 处插入 count 个默认宽度的新列，其后各列 left 依次后移；
+     * - values 中列号 >= atCol 的单元格整体右移 count（cell 名称重映射）；
+     * - 跨越插入位置的合并锚点 colspan 扩展 count；
+     * - 隐藏列同样右移（与 deleteCols 对称）。
+     * @param {number} atCol - 插入位置（1-based，新列将占据 atCol..atCol+count-1）
+     * @param {number} count - 插入列数
+     */
+    public insertCols(atCol: number, count: number): void {
+        if (atCol < 1 || count < 1) return;
+        const newHeaders: ColHeader[] = [];
+        for (let i = 0; i < count; i++) newHeaders.push({ left: 0, width: DEFAULT_CELL_WIDTH });
+        this.colHeaders.colHeaders.splice(atCol - 1, 0, ...newHeaders);
+        this.colHeaders.recalcColPositions();
+
+        for (const cell of this.values) {
+            const { col, row } = this.getCellColAndRow(cell.cell);
+            if (col >= atCol) {
+                cell.cell = `${this.getColName(col + count)}${row}`;
+            }
+            if (cell.colspan && cell.colspan > 1 && col < atCol) {
+                const spanEnd = col + cell.colspan - 1;
+                if (spanEnd >= atCol) cell.colspan = cell.colspan + count;
+            }
+        }
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
+    }
+
+    /**
+     * 在选区位置插入空白单元格 + 右侧可见单元格向右让位（单元格级，非整列插入）。
+     *
+     * 对每一可见行 r in [startRow..endRow]：
+     * 1. 选区内可见列的原有内容随该行可见单元格整体右移 k 个可见位（k = 选区内可见列数）；
+     * 2. 选区内可见列位置变为空白（新插入的空单元格）；
+     * 3. 被推出最右可见列之外的内容丢弃（与 Excel「活动单元格右移」一致，对称于 shiftCellsLeft 的右端清空）。
+     *
+     * 隐藏行/列的单元格内容与格式始终固定原位、不参与移动：
+     * 可见单元格仅在可见位置之间右移让位（可跨越隐藏列），隐藏列既不搬出也不作为搬入目标。
+     * 合并单元格不做特殊处理（暂由上层在调用前确保选区不含合并单元格）。
+     * @param {number} startCol - 选区起始列（1-based，含）
+     * @param {number} endCol - 选区结束列（1-based，含）
+     * @param {number} startRow - 选区起始行（1-based，含）
+     * @param {number} endRow - 选区结束行（1-based，含）
+     */
+    public insertCellsRight(startCol: number, endCol: number, startRow: number, endRow: number): void {
+        const totalCols = this.colHeaders.length;
+        // 可见列索引列表（隐藏列固定原位，既不搬出也不作为搬入目标）
+        const visCols: number[] = [];
+        for (let c = 1; c <= totalCols; c++) if (!this.colHeaders.getAt(c - 1)?.isHidden) visCols.push(c);
+        const m = visCols.length;
+        if (m === 0) return;
+        // si = 选区起第一个可见列在 visCols 中的序号；k = 选区内可见列数（需让位的可见位数）
+        let si = visCols.findIndex(c => c >= startCol);
+        if (si < 0) si = m; // 选区完全在最后一个可见列之后：无可让位
+        const k = visCols.filter(c => c >= startCol && c <= endCol).length;
+        if (k === 0) return; // 选区内无可见列：无可插入空位
+        for (let r = startRow; r <= endRow; r++) {
+            if (this.rowHeaders.getAt(r - 1)?.isHidden) continue;
+            // 自右向左搬运：保证目标列（序号更大）已先被清空，避免覆盖未搬的源
+            for (let j = m - 1; j >= si; j--) {
+                const srcCol = visCols[j];
+                const tgtRank = j + k;
+                if (tgtRank >= m) {
+                    // 被推出最右可见列之外：内容丢弃（清空源）
+                    const srcCell = this.values.find(v => v.cell === this.getCellName(srcCol, r));
+                    if (srcCell) srcCell.reset();
+                    continue;
+                }
+                const tgtCol = visCols[tgtRank];
+                const srcName = this.getCellName(srcCol, r);
+                const tgtName = this.getCellName(tgtCol, r);
+                const srcCell = this.values.find(v => v.cell === srcName);
+                const tgtCell = this.values.find(v => v.cell === tgtName);
+                if (srcCell) {
+                    const charsCopy = srcCell.chars.map(ch => Object.assign(new Char(), ch));
+                    if (tgtCell) {
+                        Object.assign(tgtCell, srcCell, { cell: tgtName, chars: charsCopy });
+                    } else {
+                        const cloned = new Cell();
+                        Object.assign(cloned, srcCell, { cell: tgtName, chars: charsCopy });
+                        this.values.push(cloned);
+                    }
+                    srcCell.reset();
+                } else if (tgtCell) {
+                    // 源为空：空位同样右移，目标清空
+                    tgtCell.reset();
+                }
+            }
+        }
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
+    }
+
+    /**
+     * 在选区位置插入空白单元格 + 下方可见单元格向下让位（单元格级，非整行插入）。
+     *
+     * 与 insertCellsRight 对称，仅方向不同；隐藏行/列的单元格内容与格式始终固定原位、不参与移动。
+     * @param {number} startCol - 选区起始列（1-based，含）
+     * @param {number} endCol - 选区结束列（1-based，含）
+     * @param {number} startRow - 选区起始行（1-based，含）
+     * @param {number} endRow - 选区结束行（1-based，含）
+     */
+    public insertCellsDown(startCol: number, endCol: number, startRow: number, endRow: number): void {
+        const totalRows = this.rowHeaders.length;
+        const visRows: number[] = [];
+        for (let r = 1; r <= totalRows; r++) if (!this.rowHeaders.getAt(r - 1)?.isHidden) visRows.push(r);
+        const m = visRows.length;
+        if (m === 0) return;
+        let si = visRows.findIndex(r => r >= startRow);
+        if (si < 0) si = m;
+        const k = visRows.filter(r => r >= startRow && r <= endRow).length;
+        if (k === 0) return;
+        for (let c = startCol; c <= endCol; c++) {
+            if (this.colHeaders.getAt(c - 1)?.isHidden) continue;
+            // 自下向上搬运：保证目标行（序号更大）已先被清空，避免覆盖未搬的源
+            for (let j = m - 1; j >= si; j--) {
+                const srcRow = visRows[j];
+                const tgtRank = j + k;
+                if (tgtRank >= m) {
+                    const srcCell = this.values.find(v => v.cell === this.getCellName(c, srcRow));
+                    if (srcCell) srcCell.reset();
+                    continue;
+                }
+                const tgtRow = visRows[tgtRank];
+                const srcName = this.getCellName(c, srcRow);
+                const tgtName = this.getCellName(c, tgtRow);
+                const srcCell = this.values.find(v => v.cell === srcName);
+                const tgtCell = this.values.find(v => v.cell === tgtName);
+                if (srcCell) {
+                    const charsCopy = srcCell.chars.map(ch => Object.assign(new Char(), ch));
+                    if (tgtCell) {
+                        Object.assign(tgtCell, srcCell, { cell: tgtName, chars: charsCopy });
+                    } else {
+                        const cloned = new Cell();
+                        Object.assign(cloned, srcCell, { cell: tgtName, chars: charsCopy });
+                        this.values.push(cloned);
+                    }
+                    srcCell.reset();
+                } else if (tgtCell) {
+                    tgtCell.reset();
+                }
+            }
+        }
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
+    }
+
+    /**
      * 设置指定范围行的隐藏状态
      * @param {number} startRow - 起始行号（1-based，含）
      * @param {number} endRow - 结束行号（1-based，含）
@@ -3260,9 +3493,132 @@ export class DataCollection extends EventEmitter {
         for (let r = startRow; r <= endRow; r++) {
             for (let c = startCol; c <= endCol; c++) {
                 const cell = this.values.find(v => v.cell === this.getCellName(c, r));
-                if (cell) cell.chars = [];
+                if (cell) cell.reset();  // 清空所有内容+格式（保留功能性字段 colspan/rowspan/filter）
             }
         }
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
+    }
+
+    /**
+     * 清除选区内容 + 右侧可见单元格向左紧凑补位（单元格级，非整列删除）。
+     * 对每一可见行 r in [startRow..endRow]：
+     * 1. 清空该行 [startCol..endCol] 范围内可见列的 chars（隐藏列内容与格式保留原样）；
+     * 2. 从 endCol+1 向右遍历可见列 c'，将其单元格内容（chars + 样式 + 合并属性）
+     *    依次搬到写入指针位置；写入指针从选区起第一个可见列开始，每搬一格前进到下一个可见列；
+     * 3. 原位置（c'）的 Cell 内容清空。
+     *
+     * 隐藏行/列的单元格内容与格式始终固定原位、不参与移动：
+     * 可见单元格仅在可见位置之间紧凑补位（可跨越隐藏列），隐藏列既不搬出也不作为搬入目标。
+     * 合并单元格不做特殊处理（暂由上层在调用前确保选区不含合并单元格）。
+     * 操作后不自动 commitValues/emit——调用方应包在 runWithFullStateUndo 内。
+     * @param {number} startCol - 选区起始列（1-based，含）
+     * @param {number} endCol - 选区结束列（1-based，含）
+     * @param {number} startRow - 选区起始行（1-based，含）
+     * @param {number} endRow - 选区结束行（1-based，含）
+     */
+    public shiftCellsLeft(startCol: number, endCol: number, startRow: number, endRow: number): void {
+        const totalCols = this.colHeaders.length;
+        for (let r = startRow; r <= endRow; r++) {
+            // 跳过隐藏行：该行所有单元格（内容与格式）保持原位，不参与移动
+            if (this.rowHeaders.getAt(r - 1)?.isHidden) continue;
+            // 1. 清空选区内可见列的内容（隐藏列内容与格式保留原位不动）
+            for (let c = startCol; c <= endCol; c++) {
+                if (this.colHeaders.getAt(c - 1)?.isHidden) continue;
+                const cell = this.values.find(v => v.cell === this.getCellName(c, r));
+                if (cell) cell.reset();
+            }
+            // 2. 可见单元格向左紧凑补位：写入指针从选区起第一个可见列开始，逐格接收右侧可见列的内容；
+            //    隐藏列固定原位——既不搬出、也不作为搬入目标，可见内容可跨越隐藏列补位
+            let writeCol = startCol;
+            while (writeCol <= totalCols && this.colHeaders.getAt(writeCol - 1)?.isHidden) writeCol++;
+            for (let c = endCol + 1; c <= totalCols; c++) {
+                // 隐藏源列：内容与格式保持原位，不参与移动，也不消耗写入位置
+                if (this.colHeaders.getAt(c - 1)?.isHidden) continue;
+                // 写入指针追上源列：选区内已无可填充的可见空位，剩余单元格无需移动
+                if (writeCol >= c) break;
+                const srcName = this.getCellName(c, r);
+                const tgtName = this.getCellName(writeCol, r);
+                const srcCell = this.values.find(v => v.cell === srcName);
+                const tgtCell = this.values.find(v => v.cell === tgtName);
+                if (srcCell) {
+                    const charsCopy = srcCell.chars.map(ch => Object.assign(new Char(), ch));
+                    if (tgtCell) {
+                        Object.assign(tgtCell, srcCell, { cell: tgtName, chars: charsCopy });
+                    } else {
+                        const cloned = new Cell();
+                        Object.assign(cloned, srcCell, { cell: tgtName, chars: charsCopy });
+                        this.values.push(cloned);
+                    }
+                    srcCell.reset();
+                } else if (tgtCell) {
+                    tgtCell.reset();
+                }
+                // 写入指针前进到下一个可见列（跳过隐藏列）
+                do {
+                    writeCol++;
+                } while (writeCol <= totalCols && this.colHeaders.getAt(writeCol - 1)?.isHidden);
+            }
+        }
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
+    }
+
+    /**
+     * 清除选区内容 + 下方可见单元格向上紧凑补位（单元格级，非整行删除）。
+     * 对每一可见列 c in [startCol..endCol]：
+     * 1. 清空该列 [startRow..endRow] 范围内可见行的 chars（隐藏行内容与格式保留原样）；
+     * 2. 从 endRow+1 向下遍历可见行 r'，将其单元格内容依次搬到写入指针位置；
+     * 3. 原位置（r'）的 Cell 内容清空。
+     *
+     * 与 shiftCellsLeft 对称，仅方向不同；隐藏行/列的单元格内容与格式始终固定原位、不参与移动。
+     * @param {number} startCol - 选区起始列（1-based，含）
+     * @param {number} endCol - 选区结束列（1-based，含）
+     * @param {number} startRow - 选区起始行（1-based，含）
+     * @param {number} endRow - 选区结束行（1-based，含）
+     */
+    public shiftCellsUp(startCol: number, endCol: number, startRow: number, endRow: number): void {
+        const totalRows = this.rowHeaders.length;
+        for (let c = startCol; c <= endCol; c++) {
+            // 跳过隐藏列：该列所有单元格（内容与格式）保持原位，不参与移动
+            if (this.colHeaders.getAt(c - 1)?.isHidden) continue;
+            // 1. 清空选区内可见行的内容（隐藏行内容与格式保留原位不动）
+            for (let r = startRow; r <= endRow; r++) {
+                if (this.rowHeaders.getAt(r - 1)?.isHidden) continue;
+                const cell = this.values.find(v => v.cell === this.getCellName(c, r));
+                if (cell) cell.reset();
+            }
+            // 2. 可见单元格向上紧凑补位：写入指针从选区起第一个可见行开始，逐格接收下方可见行的内容；
+            //    隐藏行固定原位——既不搬出、也不作为搬入目标，可见内容可跨越隐藏行补位
+            let writeRow = startRow;
+            while (writeRow <= totalRows && this.rowHeaders.getAt(writeRow - 1)?.isHidden) writeRow++;
+            for (let r = endRow + 1; r <= totalRows; r++) {
+                // 隐藏源行：内容与格式保持原位，不参与移动，也不消耗写入位置
+                if (this.rowHeaders.getAt(r - 1)?.isHidden) continue;
+                // 写入指针追上源行：选区内已无可填充的可见空位，剩余单元格无需移动
+                if (writeRow >= r) break;
+                const srcName = this.getCellName(c, r);
+                const tgtName = this.getCellName(c, writeRow);
+                const srcCell = this.values.find(v => v.cell === srcName);
+                const tgtCell = this.values.find(v => v.cell === tgtName);
+                if (srcCell) {
+                    const charsCopy = srcCell.chars.map(ch => Object.assign(new Char(), ch));
+                    if (tgtCell) {
+                        Object.assign(tgtCell, srcCell, { cell: tgtName, chars: charsCopy });
+                    } else {
+                        const cloned = new Cell();
+                        Object.assign(cloned, srcCell, { cell: tgtName, chars: charsCopy });
+                        this.values.push(cloned);
+                    }
+                    srcCell.reset();
+                } else if (tgtCell) {
+                    tgtCell.reset();
+                }
+                // 写入指针前进到下一个可见行（跳过隐藏行）
+                do {
+                    writeRow++;
+                } while (writeRow <= totalRows && this.rowHeaders.getAt(writeRow - 1)?.isHidden);
+            }
+        }
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
     }
 
     /**

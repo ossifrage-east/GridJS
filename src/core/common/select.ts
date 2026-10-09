@@ -119,7 +119,7 @@ export class Select extends EventEmitter {
     public setText(todo: string) {  // 点击菜单后，用于设置文字
         const items = this.options.menuContent?.items;
         if (Array.isArray(items)) {
-            const found = items.find((item): item is { todo?: string; icon?: string; text: string } => typeof item !== 'string' && item.todo === todo);
+            const found = items.find((item): item is { todo?: string; icon?: string; text?: string } => typeof item !== 'string' && typeof item !== 'function' && item.todo === todo);
             this.input.value = found?.text || todo;
         } else {
             this.input.value = todo;
@@ -140,8 +140,8 @@ export class Select extends EventEmitter {
             if (item === 'separator') {
                 continue;
             }
-            if (typeof item !== 'string') {
-                this.input.value = item.text;
+            if (typeof item !== 'string' && typeof item !== 'function') {
+                this.input.value = item.text || '';
                 break;
             }
         }

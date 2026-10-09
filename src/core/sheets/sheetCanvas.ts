@@ -14,7 +14,7 @@ import { Canvas, CanvasOptions } from "./canvas";
 import { Filter } from "../assistant/filter";
 
 export class SheetCanvas extends Canvas {
-    private filters: {cellName: string, filter: Filter}[] = []; 
+    private filters: {cellName: string, filter: Filter}[] = [];
     constructor(options: CanvasOptions) {
         super(options);
         this.parentElement = options.parentElement;
@@ -22,6 +22,17 @@ export class SheetCanvas extends Canvas {
         this.menu = options.menu;
         this.setupContextMenu();
         this.init();
+    }
+
+    /**
+     * 右键菜单动作执行后的刷新钩子（重写）
+     *
+     * 基类默认空操作；主数据画布需在复制/剪切/粘贴/清除内容/删除等动作后立即重绘，
+     * 否则用户看到的是旧画面（数据已改但画布未刷新）。
+     * 与 ColHeaderCanvas / RowHeaderCanvas 的重写保持一致。
+     */
+    protected refreshAfterContextMenu(): void {
+        this.draw();
     }    
 
     /**
@@ -115,7 +126,16 @@ export class SheetCanvas extends Canvas {
             this.filters.forEach(filter => filter.filter.destroy());
             this.filters = [];
             return;
-        } 
+        }
+        // 反向清理：cell 已被删除（如删除行/列）的 filter 实例需销毁，
+        // 否则按钮 DOM 拖留、停留在旧位置显示
+        this.filters = this.filters.filter(f => {
+            if (!dataFilters.find(c => c.cell === f.cellName)) {
+                f.filter.destroy();
+                return false;
+            }
+            return true;
+        });
 
         for (const cell of dataFilters) {
             const filter = this.filters.find(f => f.cellName === cell.cell);

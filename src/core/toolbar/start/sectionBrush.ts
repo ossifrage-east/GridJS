@@ -159,8 +159,8 @@ export class SectionBrush {
                 items: [
                     { todo: 'paste', icon: 'icon-paste', text: '粘贴'},
                     'separator',
-                    { todo: 'paste-value', icon: 'icon-paste', text: '值'},
-                    { todo: 'paste-style', icon: 'icon-paste', text: '格式'}
+                    { todo: 'paste-value', icon: 'icon-paste', badge: 'T' as const, text: '值'},
+                    { todo: 'paste-style', icon: 'icon-paste', badge: 'brush' as const, text: '格式'}
                 ]
             },
             onClick: (todo: string) => {

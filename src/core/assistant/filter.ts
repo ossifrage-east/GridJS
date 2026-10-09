@@ -84,6 +84,12 @@ export class Filter {
         // 列内容变化：同步按钮显隐（该列无内容时不显示筛选按钮）
         this.updateFilterVisibility();
         if (!this.currentCol) return;
+        // 取消隐藏后行/列位置变化，按钮需重新定位到当前单元格的新坐标；
+        // 仅在按钮可见时重算（隐藏态下 setPosition 会因 isHidden 早退，徒增开销）
+        if (this.filter.style.display !== 'none' && this.currentCellName) {
+            const cell = this.data.values.find(c => c.cell === this.currentCellName) || { cell: this.currentCellName } as Cell;
+            this.setPosition(cell);
+        }
         const col = this.currentCol;
         const cond = this.data.getFilterCondition(col);
         // 回写期间：条件随快照恢复，仅按条件存在与否同步按钮外观
@@ -221,6 +227,20 @@ export class Filter {
      */
     private updateFilterVisibility(): void {
         if (!this.currentCol) return;
+        // 列被隐藏时筛选按钮一并隐藏（隐藏列不可交互）；
+        // setColsHidden 末尾必发 VALUES_CHANGED，本方法会被调用，无需额外监听
+        if (this.data.colHeaders.getAt(this.currentCol - 1)?.isHidden) {
+            this.filter.style.display = 'none';
+            if (this.menu.hasMenu === this.filter) this.menu.closeMenu();
+            return;
+        }
+        // 行被隐藏时筛选按钮一并隐藏（隐藏行不可交互）；
+        // setRowsHidden 末尾必发 VALUES_CHANGED，本方法同样会被调用
+        if (this.data.rowHeaders.getAt(this.currentRow - 1)?.isHidden) {
+            this.filter.style.display = 'none';
+            if (this.menu.hasMenu === this.filter) this.menu.closeMenu();
+            return;
+        }
         for (const cell of this.data.values) {
             const { col, row } = this.data.getCellColAndRow(cell.cell);
             const colspan = cell.colspan ?? 1;
