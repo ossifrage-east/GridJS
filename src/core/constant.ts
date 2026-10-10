@@ -199,6 +199,8 @@ enum CellProperty {
     TEXT_ALIGN_CHANGED = 'cell:textAlign:changed',
     ALIGN_ITEMS_CHANGED = 'cell:alignItems:changed',
     BACKGROUND_COLOR_CHANGED = 'cell:backgroundColor:changed',
+    NUMBER_FORMAT_CHANGED = 'cell:numberFormat:changed',
+    BORDER_COLOR_CHANGED = 'cell:borderColor:changed',
     FILTER_CHANGED = 'cell:filter:changed',
     WRAP_CHANGED = 'cell:wrap:changed',
     LETTER_SPACING_CHANGED = 'cell:letterSpacing:changed',

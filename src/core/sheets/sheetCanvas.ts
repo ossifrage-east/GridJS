@@ -314,7 +314,7 @@ export class SheetCanvas extends Canvas {
             const cellHeight = rect.height * this.data.zoom;
 
             this.ctx.save();
-            this.ctx.strokeStyle = 'black';
+            this.ctx.strokeStyle = cell.borderColor || 'black';
             if (cell.borderTopWidth) {
                 this.drawLine(cellLeft, cellTop, cellLeft + cellWidth, cellTop, cell.borderTopWidth);
             }

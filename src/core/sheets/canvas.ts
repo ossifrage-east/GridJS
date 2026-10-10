@@ -9,13 +9,14 @@ import downFill from '../../assets/images/cursor/down-fill.svg';
 import forwardFill from '../../assets/images/cursor/forward-fill.svg';
 import crossEmpty from '../../assets/images/cursor/cross-empty.svg'
 import crosshair from '../../assets/images/cursor/plus-lg.svg'
-import { CellContent, LineText } from "../dataArchitecture/cellContent";
+import { CellContent, LineText, CellBorderStyle } from "../dataArchitecture/cellContent";
 import { EventEmitter } from "../../utils/eventEmitter";
 import { CELL_PADDING, DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE, GRID_LINE_COLOR, KEYWORDS, MouseLocation, TEXT_COLOR } from "../constant";
 import { DataCollection } from "../dataArchitecture/dataCollection";
 import { Menu, MenuContent, createCompositeIcon } from "../common/menu";
 import { Dialog } from "../common/dialog";
 import { createDiv, createInput, createButton } from "../../utils/dom";
+import { getCellDisplayText, formatNumberValue, isDateTimeCode, formatDateTimeValue } from "../../utils/numberFormat";
 
 
 /**
@@ -180,13 +181,15 @@ export class Canvas extends EventEmitter {
         }
         
         const value = this.data.getCellValue(cell);
+        const cellObj = this.data.values[index];
+        const displayValue = getCellDisplayText(value, cellObj?.numberFormat);
         const fontSize = Math.round((this.data.values[index].fontSize || DEFAULT_FONT_SIZE) 
             * this.data.zoom);
         const letterSpacing = this.data.values[index].letterSpacing || 0;
         const wrap = this.data.values[index].wrap || false;
         const lineSpacing = this.data.values[index].lineSpacing || 0;
         
-        const paragraphs = value.split('\n');
+        const paragraphs = displayValue.split('\n');
         let cellValueWidth = 0, cellValueHeight = 0, charStartIndex = 0;
         const lines = [] as LineText[];
         
@@ -360,7 +363,14 @@ export class Canvas extends EventEmitter {
         const fontSize = Math.round(pick(charObj?.fontSize, DEFAULT_FONT_SIZE) * this.data.zoom);
 
         // 从 chars 数组读取字符内容，索引越界或换行等关键字不占宽度
-        const char = charObj?.char;
+        // 若单元格设置了数字格式，则从格式化后的显示文本中取字符进行测量
+        let char = charObj?.char;
+        const numberFormat = cellObj?.numberFormat;
+        if (numberFormat && numberFormat !== 'General' && numberFormat !== '@') {
+            const rawText = this.data.getCellValue(cell);
+            const displayText = getCellDisplayText(rawText, numberFormat);
+            char = displayText[charIndex];
+        }
         const isMeasurable = typeof char === 'string' && char.length > 0 && !KEYWORDS.includes(char);
 
         this.ctx.save();
@@ -1057,14 +1067,9 @@ export class Canvas extends EventEmitter {
                 });
                 break;
             case 'format': {
-                const anchorCell = this.data.getCellName(startCol, startRow);
-                const current = data.values.find(v => v.cell === anchorCell)?.backgroundColor || '#ffffff';
-                const color = window.prompt('请输入背景颜色（如 #ff0000）：', current);
-                if (color === null || color.trim() === '') return;
-                data.runWithFullStateUndo('设置单元格格式', () => {
-                    data.setCellsBackgroundColor(startCol, endCol, startRow, endRow, color.trim());
-                });
-                break;
+                // 弹出 Excel 风格的「设置单元格格式」对话框（数字 / 边框两个 Tab）
+                this.openFormatCellsDialog(startCol, endCol, startRow, endRow);
+                return;
             }
         }
         this.refreshAfterContextMenu();
@@ -1410,6 +1415,805 @@ export class Canvas extends EventEmitter {
                 this.refreshAfterContextMenu();
             }
         });
+    }
+
+    /**
+     * 设置单元格格式对话框（数字 / 边框两个 Tab）
+     *
+     * 参照 Excel 的「设置单元格格式」对话框，顶部两个导航 Tab：
+     * - 数字：分类列表（常规/数值/货币/会计专用/百分比/科学记数/文本，日期/时间/分数列出但简化）+
+     *   对应控件（小数位数/千分位/负数样式/货币符号）+ 示例预览
+     * - 边框：预设按钮 + 线条样式 + 颜色 + 位置按钮
+     * 确定后经 runWithFullStateUndo 写入选区，可撤销/重做。
+     *
+     * @param {number} startCol - 选区起始列（1-based，含）
+     * @param {number} endCol - 选区结束列（1-based，含）
+     * @param {number} startRow - 选区起始行（1-based，含）
+     * @param {number} endRow - 选区结束行（1-based，含）
+     * @private
+     */
+    private openFormatCellsDialog(startCol: number, endCol: number, startRow: number, endRow: number): void {
+        const data = this.data;
+        const anchorCellName = data.getCellName(startCol, startRow);
+        const anchorCell = data.values.find(v => v.cell === anchorCellName);
+        const currentFormat = anchorCell?.numberFormat;
+        const currentBorderColor = anchorCell?.borderColor || '#000000';
+
+        // —— 对话框状态（闭包变量）——
+        let numberCategory = 'general';
+        let decimalPlaces = 2;
+        let useThousands = false;
+        let negativeStyle = 0; // 0:-1234.10  1:(1234.10)  2:-1234.10红  3:(1234.10)红
+        let currencySymbol = '¥';
+        let lineStyle = 1;   // 1: 细实线  2: 粗实线
+        let borderColor = currentBorderColor;
+        let borderAction = '';  // '', 'none', 'outer', 'all', 'top', 'bottom', 'left', 'right'
+        let dateFormatCode = 'yyyy/m/d';  // 日期分类当前选中的格式码
+        let timeFormatCode = 'h:mm';      // 时间分类当前选中的格式码
+
+        // 日期/时间预设格式码列表（格式码 + 示例预览标签）
+        const datePresets: { code: string; label: string }[] = [
+            { code: 'yyyy/m/d', label: '2026/10/10' },
+            { code: 'yyyy-mm-dd', label: '2026-10-10' },
+            { code: 'yyyy"年"m"月"d"日"', label: '2026年10月10日' },
+            { code: 'm/d/yyyy', label: '10/10/2026' },
+            { code: 'dddd, yyyy"年"m"月"d"日"', label: '星期六, 2026年10月10日' },
+        ];
+        const timePresets: { code: string; label: string }[] = [
+            { code: 'h:mm', label: '14:30' },
+            { code: 'h:mm:ss', label: '14:30:45' },
+            { code: 'h:mm AM/PM', label: '2:30 PM' },
+            { code: 'mm:ss', label: '30:45' },
+            { code: 'yyyy-mm-dd h:mm:ss', label: '2026-10-10 14:30:45' },
+        ];
+        // 示例日期（预览用固定值）
+        const exampleDate = new Date(2026, 9, 10, 14, 30, 45);
+
+        // 从当前格式码推断初始状态
+        if (currentFormat && currentFormat !== 'General') {
+            if (currentFormat === '@') {
+                numberCategory = 'text';
+            } else if (currentFormat.includes('%')) {
+                numberCategory = 'percentage';
+                const m = currentFormat.match(/\.(0+)/);
+                if (m) decimalPlaces = m[1].length;
+            } else if (/E/i.test(currentFormat)) {
+                numberCategory = 'scientific';
+                const m = currentFormat.match(/\.(0+)/);
+                if (m) decimalPlaces = m[1].length;
+            } else if (/^[¥$€£]/.test(currentFormat)) {
+                numberCategory = 'currency';
+                currencySymbol = currentFormat[0];
+                useThousands = true;
+                const m = currentFormat.match(/\.(0+)/);
+                if (m) decimalPlaces = m[1].length;
+            } else if (isDateTimeCode(currentFormat)) {
+                // 日期/时间格式码：含 h/s/AM-PM → 时间分类，否则 → 日期分类
+                if (/[hs]/i.test(currentFormat) || /AM\/PM/i.test(currentFormat)) {
+                    numberCategory = 'time';
+                    timeFormatCode = currentFormat;
+                } else {
+                    numberCategory = 'date';
+                    dateFormatCode = currentFormat;
+                }
+            } else {
+                numberCategory = 'number';
+                useThousands = currentFormat.includes('#,##');
+                if (currentFormat.includes(';(')) negativeStyle = 1;
+                const m = currentFormat.match(/\.(0+)/);
+                if (m) decimalPlaces = m[1].length;
+            }
+        }
+
+        // —— 合成格式码 ——
+        const buildFormatCode = (): string => {
+            switch (numberCategory) {
+                case 'general': return 'General';
+                case 'text': return '@';
+                case 'number': {
+                    const intPart = useThousands ? '#,##0' : '0';
+                    const dec = decimalPlaces > 0 ? '.' + '0'.repeat(decimalPlaces) : '';
+                    const fmt = intPart + dec;
+                    if (negativeStyle === 1 || negativeStyle === 3) {
+                        return fmt + ';(' + fmt + ')';
+                    }
+                    return fmt;
+                }
+                case 'currency':
+                case 'accounting': {
+                    const dec = decimalPlaces > 0 ? '.' + '0'.repeat(decimalPlaces) : '';
+                    return currencySymbol + '#,##0' + dec;
+                }
+                case 'percentage': {
+                    const dec = decimalPlaces > 0 ? '.' + '0'.repeat(decimalPlaces) : '';
+                    return '0' + dec + '%';
+                }
+                case 'scientific': {
+                    const dec = decimalPlaces > 0 ? '.' + '0'.repeat(decimalPlaces) : '';
+                    return '0' + dec + 'E+00';
+                }
+                case 'date': return dateFormatCode;
+                case 'time': return timeFormatCode;
+                default: return 'General';
+            }
+        };
+
+        // —— 示例预览 ——
+        const previewPos = createDiv({ style: { fontSize: '0.9rem', fontFamily: 'monospace', color: '#212529' } });
+        const previewNeg = createDiv({ style: { fontSize: '0.9rem', fontFamily: 'monospace', color: '#212529' } });
+        const updatePreview = (): void => {
+            const code = buildFormatCode();
+            if (code === 'General' || code === '@') {
+                previewPos.textContent = '1234.561';
+                previewNeg.textContent = '-1234.561';
+                previewNeg.style.display = '';
+            } else if (isDateTimeCode(code)) {
+                // 日期/时间格式码：用固定示例日期预览，隐藏负数预览
+                previewPos.textContent = formatDateTimeValue(exampleDate, code);
+                previewNeg.style.display = 'none';
+            } else {
+                previewPos.textContent = formatNumberValue(1234.561, code);
+                previewNeg.textContent = formatNumberValue(-1234.561, code);
+                previewNeg.style.display = '';
+            }
+            previewNeg.style.color = (negativeStyle === 2 || negativeStyle === 3) ? '#ff0000' : '#212529';
+        };
+
+        /**
+         * 构建带步进按钮的数字输入组
+         *
+         * 参照行高对话框（openDimensionDialog）的 Bootstrap input-group 风格：
+         * 透明底输入框 + 右侧纵向 ▲/▼ 步进按钮，共用边框/圆角/聚焦高亮。
+         * 交互：单击 ±1，按住 400ms 后每 80ms 重复，抬起即停止。
+         *
+         * @param opts.value    - 初始值
+         * @param opts.min      - 最小值
+         * @param opts.max      - 最大值
+         * @param opts.onChange - 值变更回调（已钳制到 min..max）
+         * @returns 组合容器 HTMLElement
+         */
+        const buildStepperInput = (opts: {
+            value: number; min: number; max: number; onChange: (v: number) => void;
+        }): HTMLElement => {
+            const { min, max, onChange } = opts;
+            // type=text + inputmode=numeric：规避 type=number 不支持选区 API
+            const input = createInput({
+                type: 'text',
+                attributes: { inputmode: 'numeric', autocomplete: 'off', spellcheck: 'false' },
+                style: {
+                    flex: '1', minWidth: '0', boxSizing: 'border-box',
+                    padding: '0.125rem 0.5rem', fontSize: '0.8rem', lineHeight: '1.5',
+                    color: '#212529', backgroundColor: 'transparent',
+                    border: 'none', outline: 'none', textAlign: 'center',
+                }
+            });
+            input.value = String(opts.value);
+            // 数字过滤（含全角数字）
+            input.addEventListener('input', () => {
+                const cleaned = input.value.replace(/\D/g, '');
+                if (cleaned !== input.value) input.value = cleaned;
+            });
+            // 失焦/回车时钳制并回调
+            const applyValue = (): void => {
+                const v = parseInt(input.value, 10);
+                const clamped = Number.isNaN(v) ? min : Math.min(max, Math.max(min, v));
+                input.value = String(clamped);
+                onChange(clamped);
+            };
+            input.addEventListener('change', applyValue);
+            input.addEventListener('blur', applyValue);
+
+            // 步进：单击 ±1；按住持续 ±1（初始延迟 400ms，之后每 80ms 重复），抬起即停止
+            const applyStep = (delta: number): void => {
+                const v = parseInt(input.value, 10);
+                const base = Number.isNaN(v) ? min : v;
+                const clamped = Math.min(max, Math.max(min, base + delta));
+                input.value = String(clamped);
+                onChange(clamped);
+            };
+            const startRepeat = (delta: number): void => {
+                applyStep(delta);
+                let timer: ReturnType<typeof setTimeout> | null = null;
+                const tick = (): void => { applyStep(delta); timer = setTimeout(tick, 80); };
+                timer = setTimeout(tick, 400);
+                const stop = (): void => {
+                    if (timer !== null) { clearTimeout(timer); timer = null; }
+                    window.removeEventListener('pointerup', stop);
+                    window.removeEventListener('pointercancel', stop);
+                };
+                window.addEventListener('pointerup', stop);
+                window.addEventListener('pointercancel', stop);
+            };
+            const createSpinnerButton = (glyph: string, withDivider: boolean): HTMLButtonElement => createButton({
+                textContent: glyph,
+                style: {
+                    flex: '1 1 0', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    width: '1.2rem', padding: '0', fontSize: '0.5rem', lineHeight: '1',
+                    color: '#6c757d', backgroundColor: 'transparent', border: 'none',
+                    borderTop: withDivider ? '1px solid #dee2e6' : 'none',
+                    cursor: 'pointer', userSelect: 'none',
+                }
+            });
+            const bindSpinner = (button: HTMLButtonElement, delta: number): void => {
+                button.addEventListener('pointerdown', (e) => {
+                    if (e.button !== 0) return;
+                    e.preventDefault(); // 阻止焦点转移，保证连发不被打断
+                    e.stopPropagation();
+                    startRepeat(delta);
+                });
+                button.addEventListener('mouseenter', () => { button.style.backgroundColor = '#e9ecef'; });
+                button.addEventListener('mouseleave', () => { button.style.backgroundColor = 'transparent'; });
+            };
+            const upButton = createSpinnerButton('▲', false);
+            const downButton = createSpinnerButton('▼', true);
+            bindSpinner(upButton, 1);
+            bindSpinner(downButton, -1);
+            const spinnerColumn = createDiv({
+                children: [upButton, downButton],
+                style: { display: 'flex', flexDirection: 'column', borderLeft: '1px solid #dee2e6' }
+            });
+            const group = createDiv({
+                children: [input, spinnerColumn],
+                style: {
+                    display: 'flex', alignItems: 'stretch', backgroundColor: '#fff',
+                    border: '1px solid #ced4da', borderRadius: '0.25rem', overflow: 'hidden',
+                    width: '5rem',
+                    transition: 'border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out',
+                }
+            });
+            input.addEventListener('focus', () => {
+                group.style.borderColor = '#86b7fe';
+                group.style.boxShadow = '0 0 0 0.2rem rgba(13, 110, 253, 0.25)';
+            });
+            input.addEventListener('blur', () => {
+                group.style.borderColor = '#ced4da';
+                group.style.boxShadow = 'none';
+            });
+            return group;
+        };
+
+        // —— 数字面板 ——
+        const categories: { key: string; label: string }[] = [
+            { key: 'general', label: '常规' },
+            { key: 'number', label: '数值' },
+            { key: 'currency', label: '货币' },
+            { key: 'accounting', label: '会计专用' },
+            { key: 'percentage', label: '百分比' },
+            { key: 'scientific', label: '科学记数' },
+            { key: 'text', label: '文本' },
+            { key: 'date', label: '日期' },
+            { key: 'time', label: '时间' },
+            { key: 'fraction', label: '分数' },
+        ];
+        const categoryList = createDiv({
+            style: {
+                width: '10rem', flexShrink: '0',
+                borderRight: '1px solid #dee2e6',
+                overflowY: 'auto', maxHeight: '16rem',
+            }
+        });
+        const categoryButtons: HTMLButtonElement[] = [];
+        for (const cat of categories) {
+            const btn = createButton({
+                textContent: cat.label,
+                style: {
+                    display: 'block', width: '100%',
+                    padding: '0.25rem 0.5rem', fontSize: '0.8rem',
+                    textAlign: 'left', cursor: 'pointer',
+                    border: 'none', borderRadius: '0',
+                    backgroundColor: 'transparent', color: '#212529',
+                }
+            });
+            btn.addEventListener('click', () => {
+                numberCategory = cat.key;
+                categoryButtons.forEach(b => {
+                    b.style.backgroundColor = 'transparent';
+                    b.style.color = '#212529';
+                });
+                btn.style.backgroundColor = '#0d6efd';
+                btn.style.color = '#fff';
+                rebuildControls();
+                updatePreview();
+            });
+            categoryButtons.push(btn);
+            categoryList.appendChild(btn);
+        }
+        // 初始分类高亮
+        {
+            const idx = categories.findIndex(c => c.key === numberCategory);
+            if (idx >= 0) {
+                categoryButtons[idx].style.backgroundColor = '#0d6efd';
+                categoryButtons[idx].style.color = '#fff';
+            }
+        }
+
+        // 控件区（随分类变化重建）
+        const controlsContainer = createDiv({
+            style: { flex: '1', padding: '0 0.75rem', minWidth: '0' }
+        });
+
+        /** 重建右侧控件区，根据当前分类显示对应的设置项 */
+        const rebuildControls = (): void => {
+            controlsContainer.innerHTML = '';
+            const cat = numberCategory;
+            if (cat === 'general') {
+                controlsContainer.appendChild(createDiv({
+                    textContent: '常规格式：不应用特定的数字格式。',
+                    style: { fontSize: '0.8rem', color: '#6c757d', padding: '0.5rem 0' }
+                }));
+                return;
+            }
+            if (cat === 'text') {
+                controlsContainer.appendChild(createDiv({
+                    textContent: '文本格式：单元格内容作为文本处理，输入内容原样显示。',
+                    style: { fontSize: '0.8rem', color: '#6c757d', padding: '0.5rem 0' }
+                }));
+                return;
+            }
+            if (cat === 'date' || cat === 'time') {
+                // 日期/时间分类：渲染预设格式码列表（单选，每项展示格式码 + 预览）
+                const presets = cat === 'date' ? datePresets : timePresets;
+                const currentCode = cat === 'date' ? dateFormatCode : timeFormatCode;
+                const presetButtons: HTMLButtonElement[] = [];
+                for (const preset of presets) {
+                    const isSel = preset.code === currentCode;
+                    const btn = createButton({
+                        textContent: `${preset.label}`,
+                        attributes: { title: preset.code },
+                        style: {
+                            display: 'block', width: '100%',
+                            padding: '0.25rem 0.5rem', fontSize: '0.8rem',
+                            textAlign: 'left', cursor: 'pointer',
+                            border: '1px solid ' + (isSel ? '#0d6efd' : '#ced4da'),
+                            borderRadius: '0.25rem', marginBottom: '0.25rem',
+                            backgroundColor: isSel ? '#0d6efd' : 'transparent',
+                            color: isSel ? '#fff' : '#212529',
+                        }
+                    });
+                    btn.addEventListener('click', () => {
+                        if (cat === 'date') dateFormatCode = preset.code;
+                        else timeFormatCode = preset.code;
+                        presetButtons.forEach(b => {
+                            b.style.backgroundColor = 'transparent';
+                            b.style.color = '#212529';
+                            b.style.borderColor = '#ced4da';
+                        });
+                        btn.style.backgroundColor = '#0d6efd';
+                        btn.style.color = '#fff';
+                        btn.style.borderColor = '#0d6efd';
+                        updatePreview();
+                    });
+                    presetButtons.push(btn);
+                    controlsContainer.appendChild(btn);
+                }
+                return;
+            }
+            if (cat === 'fraction') {
+                controlsContainer.appendChild(createDiv({
+                    textContent: '此分类暂不支持自定义格式，确定后将使用常规格式。',
+                    style: { fontSize: '0.8rem', color: '#6c757d', padding: '0.5rem 0' }
+                }));
+                return;
+            }
+
+            // 小数位数（步进输入组，参照行高对话框的 Bootstrap input-group 风格）
+            const decLabel = createDiv({ textContent: '小数位数：', style: { fontSize: '0.8rem', flexShrink: '0', paddingTop: '0.125rem' } });
+            const decStepper = buildStepperInput({
+                value: decimalPlaces, min: 0, max: 30,
+                onChange: (v: number) => { decimalPlaces = v; updatePreview(); }
+            });
+            controlsContainer.appendChild(createDiv({
+                children: [decLabel, decStepper],
+                style: { display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }
+            }));
+
+            // 使用千位分隔符（仅数值）
+            if (cat === 'number') {
+                const thousandsCheck = createInput({ type: 'checkbox' });
+                thousandsCheck.checked = useThousands;
+                thousandsCheck.addEventListener('change', () => {
+                    useThousands = thousandsCheck.checked;
+                    updatePreview();
+                });
+                controlsContainer.appendChild(createDiv({
+                    children: [thousandsCheck, createDiv({
+                        textContent: '使用千位分隔符 (,)', style: { fontSize: '0.8rem' }
+                    })],
+                    style: { display: 'flex', alignItems: 'center', gap: '0.25rem', marginBottom: '0.5rem' }
+                }));
+            }
+
+            // 负数样式（数值/百分比/科学记数）
+            if (cat === 'number' || cat === 'percentage' || cat === 'scientific') {
+                controlsContainer.appendChild(createDiv({
+                    textContent: '负数样式：', style: { fontSize: '0.8rem', marginBottom: '0.25rem' }
+                }));
+                const negOptions = [
+                    { label: '-1234.10', value: 0 },
+                    { label: '(1234.10)', value: 1 },
+                    { label: '-1234.10 红', value: 2 },
+                    { label: '(1234.10) 红', value: 3 },
+                ];
+                const negButtons: HTMLButtonElement[] = [];
+                const negContainer = createDiv({
+                    style: { display: 'flex', flexWrap: 'wrap', gap: '0.25rem', marginBottom: '0.5rem' }
+                });
+                for (const opt of negOptions) {
+                    const btn = createButton({
+                        textContent: opt.label,
+                        style: {
+                            padding: '0.125rem 0.5rem', fontSize: '0.75rem',
+                            border: '1px solid #ced4da', borderRadius: '0.25rem',
+                            cursor: 'pointer', backgroundColor: 'transparent', color: '#212529',
+                        }
+                    });
+                    btn.addEventListener('click', () => {
+                        negativeStyle = opt.value;
+                        negButtons.forEach(b => {
+                            b.style.backgroundColor = 'transparent';
+                            b.style.color = '#212529';
+                            b.style.borderColor = '#ced4da';
+                        });
+                        btn.style.backgroundColor = '#0d6efd';
+                        btn.style.color = '#fff';
+                        btn.style.borderColor = '#0d6efd';
+                        updatePreview();
+                    });
+                    if (opt.value === negativeStyle) {
+                        btn.style.backgroundColor = '#0d6efd';
+                        btn.style.color = '#fff';
+                        btn.style.borderColor = '#0d6efd';
+                    }
+                    negButtons.push(btn);
+                    negContainer.appendChild(btn);
+                }
+                controlsContainer.appendChild(negContainer);
+            }
+
+            // 货币符号（货币/会计专用）
+            if (cat === 'currency' || cat === 'accounting') {
+                controlsContainer.appendChild(createDiv({
+                    textContent: '货币符号：', style: { fontSize: '0.8rem', marginBottom: '0.25rem' }
+                }));
+                const symbols = ['¥', '$', '€', '£'];
+                const curButtons: HTMLButtonElement[] = [];
+                const curContainer = createDiv({
+                    style: { display: 'flex', gap: '0.25rem', marginBottom: '0.5rem' }
+                });
+                for (const sym of symbols) {
+                    const btn = createButton({
+                        textContent: sym,
+                        style: {
+                            padding: '0.125rem 0.5rem', fontSize: '0.9rem',
+                            border: '1px solid #ced4da', borderRadius: '0.25rem',
+                            cursor: 'pointer', backgroundColor: 'transparent', color: '#212529',
+                        }
+                    });
+                    btn.addEventListener('click', () => {
+                        currencySymbol = sym;
+                        curButtons.forEach(b => {
+                            b.style.backgroundColor = 'transparent';
+                            b.style.color = '#212529';
+                            b.style.borderColor = '#ced4da';
+                        });
+                        btn.style.backgroundColor = '#0d6efd';
+                        btn.style.color = '#fff';
+                        btn.style.borderColor = '#0d6efd';
+                        updatePreview();
+                    });
+                    if (sym === currencySymbol) {
+                        btn.style.backgroundColor = '#0d6efd';
+                        btn.style.color = '#fff';
+                        btn.style.borderColor = '#0d6efd';
+                    }
+                    curButtons.push(btn);
+                    curContainer.appendChild(btn);
+                }
+                controlsContainer.appendChild(curContainer);
+            }
+        };
+        rebuildControls();
+
+        // 预览区
+        const previewBox = createDiv({
+            children: [
+                createDiv({ textContent: '示例', style: { fontSize: '0.8rem', color: '#6c757d', marginBottom: '0.25rem' } }),
+                previewPos,
+                previewNeg,
+            ],
+            style: {
+                marginTop: '0.5rem', padding: '0.5rem',
+                border: '1px solid #dee2e6', borderRadius: '0.25rem',
+                backgroundColor: '#f8f9fa',
+            }
+        });
+        updatePreview();
+
+        const numberPanel = createDiv({
+            children: [
+                createDiv({
+                    children: [categoryList, controlsContainer],
+                    style: { display: 'flex', minHeight: '10rem' }
+                }),
+                previewBox,
+            ],
+            style: { padding: '0.5rem 0' }
+        });
+
+        // —— 边框面板 ——
+        // 辅助：创建一组互斥的可选按钮
+        const createButtonRow = (
+            items: { label: string; value: string }[],
+            getValue: () => string,
+            setValue: (v: string) => void
+        ): HTMLElement => {
+            const buttons: HTMLButtonElement[] = [];
+            const container = createDiv({
+                style: { display: 'flex', flexWrap: 'wrap', gap: '0.25rem', marginBottom: '0.5rem' }
+            });
+            for (const item of items) {
+                const btn = createButton({
+                    textContent: item.label,
+                    style: {
+                        padding: '0.125rem 0.5rem', fontSize: '0.8rem',
+                        border: '1px solid #ced4da', borderRadius: '0.25rem',
+                        cursor: 'pointer', backgroundColor: 'transparent', color: '#212529',
+                    }
+                });
+                btn.addEventListener('click', () => {
+                    setValue(item.value);
+                    buttons.forEach(b => {
+                        b.style.backgroundColor = 'transparent';
+                        b.style.color = '#212529';
+                        b.style.borderColor = '#ced4da';
+                    });
+                    btn.style.backgroundColor = '#0d6efd';
+                    btn.style.color = '#fff';
+                    btn.style.borderColor = '#0d6efd';
+                });
+                if (item.value === getValue()) {
+                    btn.style.backgroundColor = '#0d6efd';
+                    btn.style.color = '#fff';
+                    btn.style.borderColor = '#0d6efd';
+                }
+                buttons.push(btn);
+                container.appendChild(btn);
+            }
+            return container;
+        };
+
+        // 预设按钮
+        const presetRow = createDiv({
+            children: [
+                createDiv({ textContent: '预设：', style: { fontSize: '0.8rem', width: '4.5rem', flexShrink: '0', paddingTop: '0.125rem' } }),
+                createButtonRow(
+                    [
+                        { label: '无', value: 'none' },
+                        { label: '外边框', value: 'outer' },
+                        { label: '内边框', value: 'all' },
+                    ],
+                    () => borderAction,
+                    (v) => { borderAction = v; }
+                ),
+            ],
+            style: { display: 'flex', alignItems: 'flex-start' }
+        });
+
+        // 线条样式
+        const lineStyleRow = createDiv({
+            children: [
+                createDiv({ textContent: '线条样式：', style: { fontSize: '0.8rem', width: '4.5rem', flexShrink: '0', paddingTop: '0.125rem' } }),
+                createDiv({
+                    children: [
+                        createButton({
+                            textContent: '│ 细实线',
+                            style: {
+                                padding: '0.125rem 0.5rem', fontSize: '0.8rem',
+                                border: '1px solid #ced4da', borderRadius: '0.25rem',
+                                cursor: 'pointer',
+                                backgroundColor: lineStyle === 1 ? '#0d6efd' : 'transparent',
+                                color: lineStyle === 1 ? '#fff' : '#212529',
+                                borderColor: lineStyle === 1 ? '#0d6efd' : '#ced4da',
+                            }
+                        }),
+                        createButton({
+                            textContent: '┃ 粗实线',
+                            style: {
+                                padding: '0.125rem 0.5rem', fontSize: '0.8rem',
+                                border: '1px solid #ced4da', borderRadius: '0.25rem',
+                                cursor: 'pointer',
+                                backgroundColor: lineStyle === 2 ? '#0d6efd' : 'transparent',
+                                color: lineStyle === 2 ? '#fff' : '#212529',
+                                borderColor: lineStyle === 2 ? '#0d6efd' : '#ced4da',
+                            }
+                        }),
+                    ],
+                    style: { display: 'flex', gap: '0.25rem' }
+                }),
+            ],
+            style: { display: 'flex', alignItems: 'flex-start', marginBottom: '0.5rem' }
+        });
+        // 线条样式按钮事件
+        {
+            const btns = lineStyleRow.querySelectorAll('button');
+            btns[0].addEventListener('click', () => {
+                lineStyle = 1;
+                btns.forEach((b, i) => {
+                    (b as HTMLButtonElement).style.backgroundColor = (i === 0) ? '#0d6efd' : 'transparent';
+                    (b as HTMLButtonElement).style.color = (i === 0) ? '#fff' : '#212529';
+                    (b as HTMLButtonElement).style.borderColor = (i === 0) ? '#0d6efd' : '#ced4da';
+                });
+            });
+            btns[1].addEventListener('click', () => {
+                lineStyle = 2;
+                btns.forEach((b, i) => {
+                    (b as HTMLButtonElement).style.backgroundColor = (i === 1) ? '#0d6efd' : 'transparent';
+                    (b as HTMLButtonElement).style.color = (i === 1) ? '#fff' : '#212529';
+                    (b as HTMLButtonElement).style.borderColor = (i === 1) ? '#0d6efd' : '#ced4da';
+                });
+            });
+        }
+
+        // 颜色选择
+        const colorInput = createInput({
+            type: 'color',
+            style: { width: '2rem', height: '1.5rem', padding: '0', border: '1px solid #ced4da', borderRadius: '0.25rem', cursor: 'pointer' }
+        });
+        colorInput.value = borderColor;
+        colorInput.addEventListener('input', () => { borderColor = colorInput.value; });
+        const swatchColors = ['#000000', '#ff0000', '#008000', '#0000ff', '#ffc000', '#ff00ff', '#00ffff', '#ffffff'];
+        const swatchContainer = createDiv({ style: { display: 'flex', gap: '0.25rem', flexWrap: 'wrap' } });
+        for (const sc of swatchColors) {
+            const sw = createButton({
+                style: {
+                    width: '1.2rem', height: '1.2rem', padding: '0',
+                    border: '1px solid #ced4da', borderRadius: '0.2rem',
+                    cursor: 'pointer', backgroundColor: sc,
+                }
+            });
+            sw.addEventListener('click', () => {
+                borderColor = sc;
+                colorInput.value = sc;
+            });
+            swatchContainer.appendChild(sw);
+        }
+        const colorRow = createDiv({
+            children: [
+                createDiv({ textContent: '颜色：', style: { fontSize: '0.8rem', width: '4.5rem', flexShrink: '0', paddingTop: '0.125rem' } }),
+                colorInput,
+                swatchContainer,
+            ],
+            style: { display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }
+        });
+
+        // 位置按钮
+        const positionRow = createDiv({
+            children: [
+                createDiv({ textContent: '位置：', style: { fontSize: '0.8rem', width: '4.5rem', flexShrink: '0', paddingTop: '0.125rem' } }),
+                createButtonRow(
+                    [
+                        { label: '上', value: 'top' },
+                        { label: '下', value: 'bottom' },
+                        { label: '左', value: 'left' },
+                        { label: '右', value: 'right' },
+                        { label: '外边框', value: 'outer' },
+                        { label: '内边框', value: 'all' },
+                        { label: '无', value: 'none' },
+                    ],
+                    () => borderAction,
+                    (v) => { borderAction = v; }
+                ),
+            ],
+            style: { display: 'flex', alignItems: 'flex-start' }
+        });
+
+        const borderPanel = createDiv({
+            children: [presetRow, lineStyleRow, colorRow, positionRow],
+            style: { padding: '0.5rem 0' }
+        });
+
+        // —— Tab 栏 ——
+        const tabNumber = createButton({
+            textContent: '数字',
+            style: {
+                padding: '0.375rem 1rem', fontSize: '0.875rem',
+                border: '1px solid #dee2e6', borderBottom: 'none',
+                borderRadius: '0.25rem 0.25rem 0 0',
+                cursor: 'pointer', position: 'relative',
+                top: '1px', marginBottom: '-1px',
+            }
+        });
+        const tabBorder = createButton({
+            textContent: '边框',
+            style: {
+                padding: '0.375rem 1rem', fontSize: '0.875rem',
+                border: '1px solid #dee2e6', borderBottom: 'none',
+                borderRadius: '0.25rem 0.25rem 0 0',
+                cursor: 'pointer', position: 'relative',
+                top: '1px', marginBottom: '-1px',
+            }
+        });
+        const tabBar = createDiv({
+            children: [tabNumber, tabBorder],
+            style: { display: 'flex', borderBottom: '1px solid #dee2e6' }
+        });
+
+        // Tab 切换
+        const showTab = (tab: 'number' | 'border'): void => {
+            const isActive = (t: 'number' | 'border') => t === tab;
+            const updateTabStyle = (btn: HTMLButtonElement, active: boolean): void => {
+                btn.style.backgroundColor = active ? '#fff' : '#f8f9fa';
+                btn.style.color = active ? '#0d6efd' : '#212529';
+                btn.style.borderBottom = active ? '1px solid #fff' : '1px solid #dee2e6';
+            };
+            updateTabStyle(tabNumber, isActive('number'));
+            updateTabStyle(tabBorder, isActive('border'));
+            numberPanel.style.display = tab === 'number' ? '' : 'none';
+            borderPanel.style.display = tab === 'border' ? '' : 'none';
+        };
+        tabNumber.addEventListener('click', () => showTab('number'));
+        tabBorder.addEventListener('click', () => showTab('border'));
+        showTab('number');
+
+        // —— 根容器 ——
+        const root = createDiv({
+            children: [tabBar, numberPanel, borderPanel],
+            style: { display: 'flex', flexDirection: 'column' }
+        });
+
+        // —— 确定时应用变更 ——
+        const applyChanges = (): void => {
+            data.runWithFullStateUndo('设置单元格格式', () => {
+                // 数字格式（分数分类仍 fallback 到常规，日期/时间存储实际格式码）
+                let formatCode = buildFormatCode();
+                if (numberCategory === 'fraction') {
+                    formatCode = 'General';
+                }
+                data.setCellsNumberFormat(startCol, endCol, startRow, endRow, formatCode);
+
+                // 边框：按选中的预设/位置调 setSelectedCellsBorder 设宽度，setCellsBorderColor 设颜色
+                if (borderAction) {
+                    let style: CellBorderStyle | undefined;
+                    switch (borderAction) {
+                        case 'none': style = CellBorderStyle.BorderNone; break;
+                        case 'outer': style = lineStyle === 2 ? CellBorderStyle.BorderWideOuter : CellBorderStyle.BorderOuter; break;
+                        case 'all': style = CellBorderStyle.BorderAll; break;
+                        case 'top': style = CellBorderStyle.BorderTop; break;
+                        case 'bottom': style = CellBorderStyle.BorderBottom; break;
+                        case 'left': style = CellBorderStyle.BorderLeft; break;
+                        case 'right': style = CellBorderStyle.BorderRight; break;
+                    }
+                    if (style !== undefined) {
+                        data.setSelectedCellsBorder(style);
+                    }
+                    if (borderAction !== 'none') {
+                        data.setCellsBorderColor(startCol, endCol, startRow, endRow, borderColor);
+                    }
+                }
+            });
+            this.refreshAfterContextMenu();
+        };
+
+        // —— 对话框 ——
+        const dialog = new Dialog({
+            title: '设置单元格格式',
+            content: root,
+            size: 'lg',
+            buttons: [
+                { text: '取消', variant: 'secondary' },
+                {
+                    text: '确定',
+                    variant: 'primary',
+                    close: false,
+                    onClick: (d) => {
+                        applyChanges();
+                        d.hide();
+                    }
+                },
+            ],
+            onClose: () => dialog.destroy()
+        });
+        dialog.show();
     }
 
     /**

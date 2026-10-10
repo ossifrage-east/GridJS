@@ -81,6 +81,10 @@ export class Sheets extends EventEmitter {
     private loadingAnimationId: number | null = null;
     /** 加载动画 Promise（守卫变量，防止并发调用 startLoadingAnimation） */
     private loadingPromise: Promise<void> | null = null;
+    /** 合帧周期内的 draw() Promise（非 null 表示已排入 rAF，同帧多次调用共享同一绘制） */
+    private _drawPromise: Promise<void> | null = null;
+    /** draw() 排入的 rAF 回调 ID（用于销毁/重建时取消挂起重绘） */
+    private _drawRafId: number | null = null;
 
     /**
      * 构造函数
@@ -248,22 +252,44 @@ export class Sheets extends EventEmitter {
     }
 
     /**
-     * 绘制所有画布内容
-     * 首次调用时会等待 CSS 自定义字体加载完成后再绘制
+     * 绘制所有画布内容（rAF 合帧）
+     *
+     * 同一帧/同一宏任务内多次调用 draw() 只真正绘制一次——多次请求合并到单个
+     * requestAnimationFrame 回调中执行。事件链（VALUES_CHANGED / SELECTION_CHANGED /
+     * ALL_*_CHANGED 等）与右键菜单钩子 refreshAfterContextMenu 常在一次动作中并发触发
+     * draw，合帧后避免重复全量重绘（主画布全量重绘成本高）与重复 syncValuesToDB。
+     * 首次调用仍会等待 CSS 自定义字体加载完成后再绘制。
+     *
+     * 实现要点：
+     * - _drawPromise 非 null 即代表本帧已排入绘制，新调用直接复用该 Promise，不再排 rAF；
+     * - rAF 回调内执行真实绘制，finally 中清空 _drawPromise（释放合帧锁）并 resolve，
+     *   保证异常路径也不会卡死后续 draw()；
+     * - canvas 未创建时（DB 加载阶段 OFFSETX/Y_CHANGED 同步回调）走守卫 return，
+     *   首次正式绘制由 setupResizeObserver 的 ResizeObserver 首次回调兜底。
+     * @returns {Promise<void>} 共享的绘制 Promise（合帧周期内所有调用方拿到同一个）
      */
-    public async draw(): Promise<void> {
-        // canvas 在 createCanvas() 中创建，而该方法在 syncValuesFromDB 之后的异步链里执行。
-        // DB 加载阶段设置 offsetWidth/offsetHeight 会同步触发 OFFSETX/Y_CHANGED 事件，
-        // app.ts 的监听会立即回调 draw —— 此时 canvas 尚未创建，直接 return 忽略本次绘制。
-        // 首次正式绘制由 setupResizeObserver 的 ResizeObserver 首次回调兜底（observe 后下一帧触发，canvas 已就绪）。
-        if (!this.sheetCanvas) return;
-        if(!this.fontsLoaded) await this.startLoadingAnimation();
-        this.rowHeaderCanvas.draw();
-        this.colHeaderCanvas.draw();
-        this.sheetCanvas.draw();
-        this.editCanvas.draw();
-        
-        this.data.syncValuesToDB();
+    public draw(): Promise<void> {
+        // 已有挂起的合帧绘制：直接复用，不再排入新 rAF
+        if (this._drawPromise) return this._drawPromise;
+        this._drawPromise = new Promise<void>((resolve) => {
+            this._drawRafId = requestAnimationFrame(async () => {
+                this._drawRafId = null;
+                try {
+                    if (!this.sheetCanvas) return;
+                    if (!this.fontsLoaded) await this.startLoadingAnimation();
+                    this.rowHeaderCanvas.draw();
+                    this.colHeaderCanvas.draw();
+                    this.sheetCanvas.draw();
+                    this.editCanvas.draw();
+                    this.data.syncValuesToDB();
+                } finally {
+                    // 释放合帧锁：本帧绘制结束（或被守卫跳过）后，后续 draw() 可排入新帧
+                    this._drawPromise = null;
+                    resolve();
+                }
+            });
+        });
+        return this._drawPromise;
     }
 
     /**

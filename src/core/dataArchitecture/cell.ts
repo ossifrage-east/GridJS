@@ -75,6 +75,10 @@ export class Cell extends EventEmitter {
     private _alignItems?: VerticalAlign;
     /** 背景颜色 */
     private _backgroundColor?: string;
+    /** 数字格式码（如 'General'/'0.00'/'#,##0.00'/'0.00%'/'¥#,##0.00'/'0.00E+00'/'@'） */
+    private _numberFormat?: string;
+    /** 边框颜色，默认 '#000000' */
+    private _borderColor?: string;
     /** 单元格值 */
     private _chars?: Char[] = new Array<Char>();
     /** 过滤 */
@@ -427,6 +431,38 @@ export class Cell extends EventEmitter {
     set backgroundColor(backgroundColor: string) {
         this.updateProperty(DataEvents.BACKGROUND_COLOR_CHANGED, '_backgroundColor', backgroundColor);
     }
+
+    /**
+     * 获取数字格式码
+     * @returns {string | undefined} 数字格式码
+     */
+    get numberFormat(): string | undefined {
+        return this._numberFormat;
+    }
+
+    /**
+     * 设置数字格式码
+     * @param {string} numberFormat - 数字格式码
+     */
+    set numberFormat(numberFormat: string) {
+        this.updateProperty(DataEvents.NUMBER_FORMAT_CHANGED, '_numberFormat', numberFormat);
+    }
+
+    /**
+     * 获取边框颜色
+     * @returns {string | undefined} 边框颜色
+     */
+    get borderColor(): string | undefined {
+        return this._borderColor;
+    }
+
+    /**
+     * 设置边框颜色
+     * @param {string} borderColor - 边框颜色
+     */
+    set borderColor(borderColor: string) {
+        this.updateProperty(DataEvents.BORDER_COLOR_CHANGED, '_borderColor', borderColor);
+    }
     
     /**
      * 获取单元格值内容
@@ -535,10 +571,11 @@ export class Cell extends EventEmitter {
      * 与 clearValue（只清 chars）不同，reset 会同时清除：
      * - 字符级样式（每个 Char 的 fontFamily/fontSize/fontWeight/fontStyle/fontColor/underline/strikethrough）
      * - 单元格级样式（textAlign/alignItems/wrap/letterSpacing/lineSpacing）
-     * - 边框（四边 borderWidth）
+     * - 边框（四边 borderWidth + 边框颜色 borderColor）
      * - 背景色（backgroundColor）
      *
      * 功能性字段（cell/colspan/rowspan/filter/isEdit）保留，因为它们承载合并结构、筛选标记等非样式语义。
+     * 数字格式码（numberFormat）同样保留——它属于格式配置而非即用样式，reset 只清内容与即用样式。
      */
     public reset(): void {
         this._chars = [];
@@ -551,6 +588,7 @@ export class Cell extends EventEmitter {
         this._borderBottomWidth = undefined;
         this._borderLeftWidth = undefined;
         this._borderRightWidth = undefined;
+        this._borderColor = undefined;
         this._backgroundColor = undefined;
     }
 
@@ -646,6 +684,8 @@ export class Cell extends EventEmitter {
         cell._textAlign = this._textAlign;
         cell._alignItems = this._alignItems;
         cell._backgroundColor = this._backgroundColor;
+        cell._numberFormat = this._numberFormat;
+        cell._borderColor = this._borderColor;
         cell._filter = this._filter;
         cell._wrap = this._wrap;
         cell._letterSpacing = this._letterSpacing;
@@ -692,6 +732,8 @@ export class Cell extends EventEmitter {
             textAlign: this._textAlign,
             alignItems: this._alignItems,
             backgroundColor: this._backgroundColor,
+            numberFormat: this._numberFormat,
+            borderColor: this._borderColor,
             chars: this.toCharsJSON(),
             filter: this._filter,
             wrap: this._wrap,
@@ -720,6 +762,8 @@ export class Cell extends EventEmitter {
             cell._textAlign = item.textAlign;
             cell._alignItems = item.alignItems;
             cell._backgroundColor = item.backgroundColor;
+            cell._numberFormat = item.numberFormat;
+            cell._borderColor = item.borderColor;
             cell._filter = item.filter;
             cell._wrap = item.wrap;
             cell._letterSpacing = item.letterSpacing;

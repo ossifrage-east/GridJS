@@ -3639,6 +3639,48 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 设置指定范围内单元格的数字格式码（设置单元格格式）
+     * @param {number} startCol - 起始列号（1-based，含）
+     * @param {number} endCol - 结束列号（1-based，含）
+     * @param {number} startRow - 起始行号（1-based，含）
+     * @param {number} endRow - 结束行号（1-based，含）
+     * @param {string} format - 数字格式码（如 '0.00'/'#,##0.00'/'0.00%'/'¥#,##0.00'/'0.00E+00'/'@'/'General'）
+     */
+    public setCellsNumberFormat(startCol: number, endCol: number, startRow: number, endRow: number, format: string): void {
+        for (let r = startRow; r <= endRow; r++) {
+            for (let c = startCol; c <= endCol; c++) {
+                const cellName = this.getCellName(c, r);
+                let cell = this.values.find(v => v.cell === cellName);
+                if (cell) {
+                    cell.numberFormat = format;
+                } else {
+                    cell = new Cell();
+                    cell.cell = cellName;
+                    cell.numberFormat = format;
+                    this.values.push(cell);
+                }
+            }
+        }
+    }
+
+    /**
+     * 设置指定范围内单元格的边框颜色（设置单元格格式）
+     * @param {number} startCol - 起始列号（1-based，含）
+     * @param {number} endCol - 结束列号（1-based，含）
+     * @param {number} startRow - 起始行号（1-based，含）
+     * @param {number} endRow - 结束行号（1-based，含）
+     * @param {string} color - 边框颜色值（如 '#000000'）
+     */
+    public setCellsBorderColor(startCol: number, endCol: number, startRow: number, endRow: number, color: string): void {
+        for (let r = startRow; r <= endRow; r++) {
+            for (let c = startCol; c <= endCol; c++) {
+                const cell = this.values.find(v => v.cell === this.getCellName(c, r));
+                if (cell) cell.borderColor = color;
+            }
+        }
+    }
+
+    /**
      * 将数据集合转换为JSON表示
      * @returns {string} 数据集合的JSON表示
      */
