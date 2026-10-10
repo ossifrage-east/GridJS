@@ -98,6 +98,26 @@ export const NAV = {
     CONTENT_ITEM: 'content-item',
 }
 
+export const FILE_TREE_CLASS_NAMES = {   // 定义文件树（「文件」导航页）类名
+    CONTAINER: 'file-tree',
+    TOOLBAR: 'file-tree-toolbar',
+    SEARCH: 'file-tree-search',
+    SEARCH_INPUT: 'file-tree-search-input',
+    ACTIONS: 'file-tree-actions',
+    BUTTON: 'file-tree-button',
+    BODY: 'file-tree-body',
+    EMPTY: 'file-tree-empty',
+    NODE: 'file-tree-node',
+    ROW: 'file-tree-row',
+    TOGGLE: 'file-tree-toggle',
+    ICON: 'file-tree-icon',
+    LABEL: 'file-tree-label',
+    CHILDREN: 'file-tree-children',
+    OPEN: 'is-open',
+    SELECTED: 'is-selected',
+    LOCATED: 'is-located',
+}
+
 export const MENU_CLASS_NAMES = {
     ID: 'theMenu',
     CONTAINER: 'menu',

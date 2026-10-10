@@ -1,0 +1,222 @@
+/*  # 文件树（「文件」导航页）的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+
+.file-tree {
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+    width: 100%;
+    height: 100%;
+    padding: 8px;
+    overflow: hidden;
+    background-color: #fff;
+    font-size: 14px;
+    color: #212529;
+}
+
+/* —— 顶部一行：搜索栏 + 展开 / 收缩 / 定位 按钮 —— */
+
+.file-tree-toolbar {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex: none;
+    gap: 6px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #e9ecef;
+}
+
+.file-tree-search {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 26px;
+    box-sizing: border-box;
+    padding: 0 6px;
+    border: 1px solid #ced4da;
+    border-radius: 4px;
+    background-color: #fff;
+    transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+
+    &:hover {
+        border-color: #adb5bd;
+    }
+
+    &:focus-within {
+        border-color: #4CAF50;
+        box-shadow: 0 0 0 0.15rem rgba(76, 170, 80, 0.25);
+    }
+
+    /* 放大镜：沿用 icon.css 中已定义的字体图标 */
+    i.icon-search {
+        flex: none;
+        margin-right: 4px;
+        color: #adb5bd;
+        font-size: 14px;
+    }
+}
+
+.file-tree-search-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 100%;
+    padding: 0;
+    border: none;
+    outline: none;
+    background: transparent;
+    font-family: inherit;
+    font-size: 14px;
+    color: #212529;
+
+    &::placeholder {
+        color: #adb5bd;
+    }
+}
+
+.file-tree-actions {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex: none;
+    gap: 2px;
+}
+
+/* 按钮内只放图标：图标来自 icon.css（字体图标 + 内联 SVG） */
+.file-tree-button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    cursor: pointer;
+    outline: none;
+
+    i {
+        display: block;
+        width: 15px;
+        height: 15px;
+    }
+
+    &:hover {
+        border-color: rgba(0, 0, 0, 0.06);
+        background-color: rgba(0, 0, 0, 0.08);
+    }
+
+    &:active {
+        background-color: rgba(0, 0, 0, 0.16);
+    }
+}
+
+/* —— 树主体 —— */
+
+.file-tree-body {
+    flex: 1 1 auto;
+    overflow: auto;
+    padding-top: 6px;
+}
+
+.file-tree-empty {
+    padding: 12px 4px;
+    color: #adb5bd;
+    font-size: 12px;
+    text-align: center;
+}
+
+.file-tree-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    height: 24px;
+    border-radius: 3px;
+    cursor: pointer;
+    color: #212529;
+
+    &:hover {
+        background-color: rgba(0, 0, 0, 0.05);
+    }
+
+    &.is-selected {
+        background-color: rgba(76, 170, 80, 0.16);
+    }
+
+    &.is-located {
+        animation: fileTreeLocate 0.9s ease-out 1;
+    }
+}
+
+@keyframes fileTreeLocate {
+    0% {
+        box-shadow: inset 0 0 0 1px #4CAF50;
+        background-color: rgba(76, 170, 80, 0.35);
+    }
+
+    100% {
+        box-shadow: inset 0 0 0 1px transparent;
+        background-color: transparent;
+    }
+}
+
+/* 展开箭头：收起时旋转 -90°，文件用等宽占位保证同层图标对齐 */
+.file-tree-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 14px;
+    height: 14px;
+    color: #6c757d;
+    font-size: 12px;
+
+    i {
+        display: block;
+        transform: rotate(-90deg);
+        transition: transform 0.15s ease;
+    }
+}
+
+.file-tree-row.is-open .file-tree-toggle i {
+    transform: rotate(0deg);
+}
+
+.file-tree-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 16px;
+    height: 16px;
+    margin: 0 4px 0 2px;
+
+    i {
+        display: block;
+        width: 15px;
+        height: 15px;
+    }
+}
+
+.file-tree-label {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* 以 hidden 属性控制显隐的元素显式隐藏：
+   避免被组件内其它 display 规则覆盖（如 flex 布局） */
+.file-tree-node[hidden],
+.file-tree-children[hidden],
+.file-tree-empty[hidden] {
+    display: none;
+}

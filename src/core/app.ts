@@ -28,6 +28,7 @@ import { TOOLS_CLASS_NAMES, DEFAULT_CELL_HEIGHT, ROW_HEADER_PADDING,
 } from "./constant"; 
 import { Split } from "./common/split";
 import { Navigator } from "./common/navigator";
+import { FileTree } from "./common/fileTree";
 import { Sheets } from "./sheets/sheets";
 import { DataCollection } from "./dataArchitecture/dataCollection";
 import { Scroller } from "./common/scroller";
@@ -48,6 +49,8 @@ export class App {
     private vScroller!: Scroller;
     private toolbar!: Toolbar;
     private menu!: Menu;
+    private navigator!: Navigator;
+    private fileTree!: FileTree;
 
     /**
      * 初始化工具栏
@@ -127,13 +130,30 @@ export class App {
     /**
      * 初始化导航器
      */
-    private initNavigator() {
+    private async initNavigator() {
         const navigator = new Navigator(false);
+        this.navigator = navigator;
         const { panel, content } = navigator.getElements();
         const { splitNext } = this.containerSplit.getElements();
         splitNext.appendChild(content);
-        navigator.navItemMount(...NAV_PANEL);
         this.rightToolsSplit.getElements().splitPrev.appendChild(panel);
+        // navItemMount 内部读取 IndexDB（异步）：必须等待页签与内容项创建完成，
+        // 否则 navContentItemMount 会因找不到目标内容项而挂载失败
+        try {
+            await navigator.navItemMount(...NAV_PANEL);
+        } catch {
+            // IndexDB 不可用时仅跳过状态恢复，页签元素已创建，继续挂载各页签内容
+        }
+        this.initFileTree(navigator);
+    }
+
+    /**
+     * 初始化「文件」页签：树形文件页面
+     * 顶部为搜索栏（同行右侧为展开 / 收缩 / 定位按钮），下方为树形文件列表
+     */
+    private initFileTree(navigator: Navigator) {
+        this.fileTree = new FileTree();
+        navigator.navContentItemMount(NAV_PANEL[0], this.fileTree.getElements().container);   // NAV_PANEL[0] 即「文件」
     }
 
     /**

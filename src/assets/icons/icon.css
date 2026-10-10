@@ -352,3 +352,51 @@
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 15'%3E%3Ccircle cx='6.5' cy='6.5' r='4.25' fill='none' stroke='%23444444' stroke-width='1.2'/%3E%3Cpath d='M9.8 9.8 L13.4 13.4 M6.5 4.5 v4 M4.5 6.5 h4' fill='none' stroke='%23444444' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
 }
 
+/* —— 文件树（「文件」导航页）新增 SVG 图标：icomoon 字体无对应字形，以内联 SVG 绘制 —— */
+
+/* 统一容器：15×15 的画布，背景居中且自适应 */
+.icon-expand-all:before,
+.icon-collapse-all:before,
+.icon-locate:before,
+.icon-folder:before,
+.icon-folder-open:before,
+.icon-file:before {
+  content: '';
+  display: block;
+  width: 15px;
+  height: 15px;
+  background-repeat: no-repeat;
+  background-position: center center;
+  background-size: contain;
+}
+
+/* 展开：上下双向箭头，箭头朝外（全部展开） */
+.icon-expand-all:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 15'%3E%3Cpath d='M4.3 5.5 L7.5 2.6 L10.7 5.5 M4.3 9.5 L7.5 12.4 L10.7 9.5' fill='none' stroke='%23444444' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+/* 收缩：上下双向箭头，箭头朝内（全部收缩） */
+.icon-collapse-all:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 15'%3E%3Cpath d='M4.3 2.6 L7.5 5.5 L10.7 2.6 M4.3 12.4 L7.5 9.5 L10.7 12.4' fill='none' stroke='%23444444' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+/* 定位：十字准星 + 中心点（把当前项定位到视图中） */
+.icon-locate:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 15'%3E%3Ccircle cx='7.5' cy='7.5' r='3.5' fill='none' stroke='%23444444' stroke-width='1.2'/%3E%3Ccircle cx='7.5' cy='7.5' r='1' fill='%23444444'/%3E%3Cpath d='M7.5 1.1 V3.2 M7.5 11.8 V13.9 M1.1 7.5 H3.2 M11.8 7.5 H13.9' fill='none' stroke='%23444444' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+
+/* 文件夹（收起）：合口文件夹 */
+.icon-folder:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 15'%3E%3Cpath d='M1.9 12.1 V3.5 h3.4 l1.2 1.3 h6.6 V12.1 Z' fill='none' stroke='%23444444' stroke-width='1.2' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+/* 文件夹（展开）：开口文件夹 */
+.icon-folder-open:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 15'%3E%3Cpath d='M1.9 12.1 V3.5 h3.4 l1.2 1.3 h6.6 V6.6' fill='none' stroke='%23444444' stroke-width='1.2' stroke-linejoin='round'/%3E%3Cpath d='M3.1 6.6 h10.2 l-1.3 5.5 H1.8 Z' fill='none' stroke='%23444444' stroke-width='1.2' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+/* 文件：带折角的纸张 */
+.icon-file:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 15 15'%3E%3Cpath d='M3.5 1.8 h5.1 l3 3 V13.2 H3.5 Z' fill='none' stroke='%23444444' stroke-width='1.2' stroke-linejoin='round'/%3E%3Cpath d='M8.6 1.8 V4.8 H11.6' fill='none' stroke='%23444444' stroke-width='1.2' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
