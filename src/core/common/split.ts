@@ -47,6 +47,12 @@ interface SplitOptions {
     minSize?: number | MinSize;
     /** 最大面板尺寸，默认值为 Infinity */
     maxSize?: number;
+    /**
+     * 后侧（右侧 / 下侧）面板的默认尺寸（像素）
+     * 设置后，无历史记录时按该尺寸分配后侧面板，前侧面板自动占据剩余空间；
+     * 未设置（默认 0）时前后两侧平分容器
+     */
+    nextSize?: number;
     /** 存储键名，用于记忆面板位置 */
     storageKey?: string;
     /** 是否记住面板大小，默认值为 true */
@@ -121,6 +127,7 @@ export class Split {
         horizontal: true,
         minSize: { prev: 300, next: 300 },
         maxSize: Infinity,
+        nextSize: 0,
         storageKey: 'split-position',
         rememberSize: true
     };
@@ -185,8 +192,8 @@ export class Split {
             return;
         }
 
-        // 1. 同步应用中间布局，确保 currentPosition 与面板尺寸立即可用
-        this.updateLayout(this.calculateMiddlePosition());
+        // 1. 同步应用默认布局，确保 currentPosition 与面板尺寸立即可用
+        this.updateLayout(this.calculateDefaultPosition());
         this.layoutInitialized = true;
 
         // 2. 异步加载 IndexDB 中的保存位置并覆盖
@@ -195,7 +202,7 @@ export class Split {
                 this.updateLayout(savedPosition);
             }
         }).catch(() => {
-            // 加载失败则保持中间位置不变
+            // 加载失败则保持默认位置不变
         }).finally(() => {
             this._positionLoadedResolve();
         });
@@ -231,17 +238,22 @@ export class Split {
     }
 
     /**
-     * 计算中间位置
+     * 计算默认位置
+     * - 未设置 nextSize（0）时：前后两侧平分容器（中间位置）
+     * - 设置了 nextSize 时：后侧（右侧 / 下侧）面板取该默认尺寸，前侧占据剩余空间
+     * 结果均受最小 / 最大尺寸约束
      * @private
-     * @returns {number} 中间位置（满足最小尺寸限制）
+     * @returns {number} 默认位置（满足最小尺寸限制）
      */
-    private calculateMiddlePosition(): number {
-        const { minSize } = this.options;
+    private calculateDefaultPosition(): number {
+        const { minSize, nextSize } = this.options;
         const containerSize = getContainerSize(this.elements.container, this.options.horizontal);
+
+        const preferredPosition = nextSize > 0 ? containerSize - nextSize : containerSize / 2;
 
         return Math.max(
             (minSize as MinSize).prev,
-            Math.min(containerSize - (minSize as MinSize).next, containerSize / 2)
+            Math.min(containerSize - (minSize as MinSize).next, preferredPosition)
         );
     }
 
@@ -441,7 +453,7 @@ export class Split {
         if (prevVisible && nextVisible) {
             split.hidden = false;
             const dimension = horizontal ? 'width' : 'height';
-            splitPrev.style[dimension] = `${this.layoutInitialized ? this.currentPosition : this.calculateMiddlePosition()}px`;
+            splitPrev.style[dimension] = `${this.layoutInitialized ? this.currentPosition : this.calculateDefaultPosition()}px`;
         } else {
             split.hidden = true;
             if (!nextVisible) {

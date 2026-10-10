@@ -87,7 +87,8 @@ export class App {
         this.containerSplit = new Split({
             parentElement: this.worktop, 
             id: TOOLS_CLASS_NAMES.CONTAINER, 
-            storageKey: TOOLS_CLASS_NAMES.CONTAINER
+            storageKey: TOOLS_CLASS_NAMES.CONTAINER,
+            nextSize: 360   // 左右分栏不默认平分：右侧面板（导航内容区）默认宽度 360px
         });
         this.containerSplit.handleVisibility();   // 元素是否可见监控 
     }
