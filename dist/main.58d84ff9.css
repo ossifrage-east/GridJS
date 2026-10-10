@@ -355,6 +355,54 @@
   background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 15 15%27%3E%3Ccircle cx=%276.5%27 cy=%276.5%27 r=%274.25%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27/%3E%3Cpath d=%27M9.8 9.8 L13.4 13.4 M6.5 4.5 v4 M4.5 6.5 h4%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linecap=%27round%27/%3E%3C/svg%3E");
 }
 
+/* —— 文件树（「文件」导航页）新增 SVG 图标：icomoon 字体无对应字形，以内联 SVG 绘制 —— */
+
+/* 统一容器：15×15 的画布，背景居中且自适应 */
+.icon-expand-all:before,
+.icon-collapse-all:before,
+.icon-locate:before,
+.icon-folder:before,
+.icon-folder-open:before,
+.icon-file:before {
+  content: '';
+  display: block;
+  width: 15px;
+  height: 15px;
+  background-repeat: no-repeat;
+  background-position: center center;
+  background-size: contain;
+}
+
+/* 展开：上下双向箭头，箭头朝外（全部展开） */
+.icon-expand-all:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 15 15%27%3E%3Cpath d=%27M4.3 5.5 L7.5 2.6 L10.7 5.5 M4.3 9.5 L7.5 12.4 L10.7 9.5%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27/%3E%3C/svg%3E");
+}
+
+/* 收缩：上下双向箭头，箭头朝内（全部收缩） */
+.icon-collapse-all:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 15 15%27%3E%3Cpath d=%27M4.3 2.6 L7.5 5.5 L10.7 2.6 M4.3 12.4 L7.5 9.5 L10.7 12.4%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27/%3E%3C/svg%3E");
+}
+
+/* 定位：十字准星 + 中心点（把当前项定位到视图中） */
+.icon-locate:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 15 15%27%3E%3Ccircle cx=%277.5%27 cy=%277.5%27 r=%273.5%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27/%3E%3Ccircle cx=%277.5%27 cy=%277.5%27 r=%271%27 fill=%27%23444444%27/%3E%3Cpath d=%27M7.5 1.1 V3.2 M7.5 11.8 V13.9 M1.1 7.5 H3.2 M11.8 7.5 H13.9%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linecap=%27round%27/%3E%3C/svg%3E");
+}
+
+/* 文件夹（收起）：合口文件夹 */
+.icon-folder:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 15 15%27%3E%3Cpath d=%27M1.9 12.1 V3.5 h3.4 l1.2 1.3 h6.6 V12.1 Z%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linejoin=%27round%27/%3E%3C/svg%3E");
+}
+
+/* 文件夹（展开）：开口文件夹 */
+.icon-folder-open:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 15 15%27%3E%3Cpath d=%27M1.9 12.1 V3.5 h3.4 l1.2 1.3 h6.6 V6.6%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linejoin=%27round%27/%3E%3Cpath d=%27M3.1 6.6 h10.2 l-1.3 5.5 H1.8 Z%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linejoin=%27round%27/%3E%3C/svg%3E");
+}
+
+/* 文件：带折角的纸张 */
+.icon-file:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 15 15%27%3E%3Cpath d=%27M3.5 1.8 h5.1 l3 3 V13.2 H3.5 Z%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linejoin=%27round%27/%3E%3Cpath d=%27M8.6 1.8 V4.8 H11.6%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linejoin=%27round%27/%3E%3C/svg%3E");
+}
+
 
 /*!*******************************************************************************************************************************************************************************!*\
   !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/index.scss ***!
@@ -608,6 +656,341 @@ html, body {
   100% {
     opacity: 1;
   }
+}
+/*!*********************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/fileTree.scss ***!
+  \*********************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # 文件树（「文件」导航页）的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+.file-tree {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: vertical;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: column;
+      -ms-flex-direction: column;
+          flex-direction: column;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  padding: 8px;
+  overflow: hidden;
+  background-color: #fff;
+  font-size: 14px;
+  color: #212529;
+}
+
+/* —— 顶部一行：搜索栏 + 展开 / 收缩 / 定位 按钮 —— */
+.file-tree-toolbar {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: horizontal;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: row;
+      -ms-flex-direction: row;
+          flex-direction: row;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  gap: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #e9ecef;
+}
+
+.file-tree-search {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: horizontal;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: row;
+      -ms-flex-direction: row;
+          flex-direction: row;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  min-width: 0;
+  height: 26px;
+  box-sizing: border-box;
+  padding: 0 6px;
+  border: 1px solid #ced4da;
+  border-radius: 4px;
+  background-color: #fff;
+  -webkit-transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+  transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+}
+.file-tree-search:hover {
+  border-color: #adb5bd;
+}
+.file-tree-search:focus-within {
+  border-color: #4CAF50;
+  box-shadow: 0 0 0 0.15rem rgba(76, 170, 80, 0.25);
+}
+.file-tree-search {
+  /* 放大镜：沿用 icon.css 中已定义的字体图标 */
+}
+.file-tree-search i.icon-search {
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  margin-right: 4px;
+  color: #adb5bd;
+  font-size: 14px;
+}
+
+.file-tree-search-input {
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-family: inherit;
+  font-size: 14px;
+  color: #212529;
+}
+.file-tree-search-input::-webkit-input-placeholder {
+  color: #adb5bd;
+}
+.file-tree-search-input:-ms-input-placeholder {
+  color: #adb5bd;
+}
+.file-tree-search-input::placeholder {
+  color: #adb5bd;
+}
+
+.file-tree-actions {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: horizontal;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: row;
+      -ms-flex-direction: row;
+          flex-direction: row;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  gap: 2px;
+}
+
+/* 按钮内只放图标：图标来自 icon.css（字体图标 + 内联 SVG） */
+.file-tree-button {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  outline: none;
+}
+.file-tree-button i {
+  display: block;
+  width: 15px;
+  height: 15px;
+}
+.file-tree-button:hover {
+  border-color: rgba(0, 0, 0, 0.06);
+  background-color: rgba(0, 0, 0, 0.08);
+}
+.file-tree-button:active {
+  background-color: rgba(0, 0, 0, 0.16);
+}
+
+/* —— 树主体 —— */
+.file-tree-body {
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  overflow: auto;
+  padding-top: 6px;
+}
+
+.file-tree-empty {
+  padding: 12px 4px;
+  color: #adb5bd;
+  font-size: 12px;
+  text-align: center;
+}
+
+.file-tree-row {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: horizontal;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: row;
+      -ms-flex-direction: row;
+          flex-direction: row;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  height: 24px;
+  border-radius: 3px;
+  cursor: pointer;
+  color: #212529;
+}
+.file-tree-row:hover {
+  background-color: rgba(0, 0, 0, 0.05);
+}
+.file-tree-row.is-selected {
+  background-color: rgba(76, 170, 80, 0.16);
+}
+.file-tree-row.is-located {
+  -webkit-animation: fileTreeLocate 0.9s ease-out 1;
+          animation: fileTreeLocate 0.9s ease-out 1;
+}
+
+@-webkit-keyframes fileTreeLocate {
+  0% {
+    box-shadow: inset 0 0 0 1px #4CAF50;
+    background-color: rgba(76, 170, 80, 0.35);
+  }
+  100% {
+    box-shadow: inset 0 0 0 1px transparent;
+    background-color: transparent;
+  }
+}
+
+@keyframes fileTreeLocate {
+  0% {
+    box-shadow: inset 0 0 0 1px #4CAF50;
+    background-color: rgba(76, 170, 80, 0.35);
+  }
+  100% {
+    box-shadow: inset 0 0 0 1px transparent;
+    background-color: transparent;
+  }
+}
+/* 展开箭头：收起时旋转 -90°，文件用等宽占位保证同层图标对齐 */
+.file-tree-toggle {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  width: 14px;
+  height: 14px;
+  color: #6c757d;
+  font-size: 12px;
+}
+.file-tree-toggle i {
+  display: block;
+  -webkit-transform: rotate(-90deg);
+          transform: rotate(-90deg);
+  -webkit-transition: -webkit-transform 0.15s ease;
+  transition: -webkit-transform 0.15s ease;
+  transition: transform 0.15s ease;
+  transition: transform 0.15s ease, -webkit-transform 0.15s ease;
+}
+
+.file-tree-row.is-open .file-tree-toggle i {
+  -webkit-transform: rotate(0deg);
+          transform: rotate(0deg);
+}
+
+.file-tree-icon {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 0 4px 0 2px;
+}
+.file-tree-icon i {
+  display: block;
+  width: 15px;
+  height: 15px;
+}
+
+.file-tree-label {
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 以 hidden 属性控制显隐的元素显式隐藏：
+   避免被组件内其它 display 规则覆盖（如 flex 布局） */
+.file-tree-node[hidden],
+.file-tree-children[hidden],
+.file-tree-empty[hidden] {
+  display: none;
 }
 /*!*****************************************************************************************************************************************************************************************!*\
   !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/menu.scss ***!
