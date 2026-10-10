@@ -1,47 +1,34 @@
 # GridJS Code Wiki
 
-> 藕丝空间 (SilkSpaces) — GridJS 基于 HTML5 Canvas 的 Web 电子表格组件\
+> 藕丝空间 (SilkSpaces) — GridJS 基于 HTML5 Canvas 的 Web 电子表格组件  
 > 会道者，一缕藕丝牵大象。寡道者，千钧铁棒打苍蝇。
 
-***
+---
 
 ## 目录
 
 - [1. 项目概述](#1-项目概述)
-
 - [2. 技术栈与构建工具](#2-技术栈与构建工具)
-
 - [3. 项目目录结构](#3-项目目录结构)
-
 - [4. 整体架构](#4-整体架构)
-
 - [5. 核心模块详解](#5-核心模块详解)
-
   - [5.1 数据架构层 (dataArchitecture)](#51-数据架构层-dataarchitecture)
-
   - [5.2 Canvas 渲染层 (sheets)](#52-canvas-渲染层-sheets)
-
+    - [5.2.1.1 右键菜单体系（Canvas 基类）](#5211-右键菜单体系canvas-基类)
   - [5.3 UI 组件层 (common)](#53-ui-组件层-common)
-
   - [5.4 工具栏层 (toolbar)](#54-工具栏层-toolbar)
-
   - [5.5 工具模块 (utils)](#55-工具模块-utils)
-
+    - [5.5.8 numberFormat](#558-numberformat)
+    - [5.5.9 SheetParser](#559-sheetparser)
   - [5.6 常量与事件 (constant)](#56-常量与事件-constant)
-
   - [5.7 助手模块 (assistant)](#57-助手模块-assistant)
-
 - [6. 类继承关系图](#6-类继承关系图)
-
 - [7. 数据流与事件驱动](#7-数据流与事件驱动)
-
 - [8. 数据持久化 (IndexedDB)](#8-数据持久化-indexeddb)
-
 - [9. 依赖关系](#9-依赖关系)
-
 - [10. 项目运行方式](#10-项目运行方式)
 
-***
+---
 
 ## 1. 项目概述
 
@@ -50,43 +37,39 @@ SilkSpaces（藕丝空间）是一个轻量级的 Web 电子表格组件，使�
 **核心特性：**
 
 - 基于 Canvas 的高性能表格渲染
-
 - 单元格级别的样式和字符级格式控制
-
 - 响应式布局，支持面板拖拽调整
-
 - IndexedDB 本地数据持久化
-
 - 事件驱动的数据变更通知机制
-
 - 支持缩放、选区、编辑等交互
-
 - 数据筛选（按内容/按颜色）与隐藏行列（含悬停指示按钮）
-
 - 混合类型分级排序（时间 → 数字 → 英文 → 中文 → 其它外语）
-
 - 全量状态快照撤销/重做（结构操作折叠为一步）
-
 - 打印预览与直接打印（纸张/页边距/缩放/打印区域可配置，分页不拆分行列）
+- 右键菜单体系（剪贴板图标行 / 插入 / 删除二级子菜单 / 设置单元格格式对话框）
+- Excel 风格数字格式（数值、货币、百分比、科学记数、日期时间，含中文日期）
+- xls / xlsx 文件解析（三步架构：decode → extract → generate）
 
-***
+---
 
 ## 2. 技术栈与构建工具
 
-| 分类     | 技术                            |
-| ------ | ----------------------------- |
-| 语言     | TypeScript (ES6 模块, 输出目标 ES5) |
-| 构建     | Webpack 5 + ts-loader         |
-| 样式     | SCSS + PostCSS + Autoprefixer |
-| 数据存储   | 浏览器原生 IndexedDB API           |
-| 渲染     | HTML5 Canvas 2D API           |
-| 包管理    | npm                           |
-| 开发服务器  | webpack-dev-server            |
-| CSS 提取 | mini-css-extract-plugin       |
-| SVG 处理 | mini-svg-data-uri             |
-| 哈希     | murmurhash-js（工具栏标签 ID 生成）    |
+| 分类     | 技术                                         |
+| ------ | ------------------------------------------ |
+| 语言     | TypeScript (ES6 模块, 输出目标 ES5)              |
+| 构建     | Webpack 5 + ts-loader                      |
+| 样式     | SCSS + PostCSS + Autoprefixer              |
+| 数据存储   | 浏览器原生 IndexedDB API                        |
+| 渲染     | HTML5 Canvas 2D API                        |
+| 包管理    | npm                                        |
+| 开发服务器  | webpack-dev-server                         |
+| CSS 提取 | mini-css-extract-plugin                    |
+| SVG 处理 | mini-svg-data-uri                          |
+| 哈希     | murmurhash-js（工具栏标签 ID 生成）                 |
+| 文件解析   | JSZip（xlsx 解包）+ xlsx-js-style（xls BIFF 解析） |
+| 图标     | Popper.js（菜单/弹层定位）                         |
 
-***
+---
 
 ## 3. 项目目录结构
 
@@ -137,7 +120,7 @@ silkspaces/
 │   │   │   ├── brand.scss         # 品牌样式
 │   │   │   ├── filter.scss        # 筛选组件样式
 │   │   │   ├── hidden.scss        # 隐藏指示组件样式
-│   │   │   ├── menu.scss          # 菜单样式
+│   │   │   ├── menu.scss          # 菜单样式（含二级子菜单、份数步进器）
 │   │   │   ├── nav.scss           # 导航样式
 │   │   │   ├── scroller.scss      # 滚动条样式
 │   │   │   ├── sheets.scss        # 工作表样式
@@ -161,6 +144,9 @@ silkspaces/
 │   │   ├── dom.ts                 # DOM 操作工具
 │   │   ├── eventEmitter.ts        # 事件发射器
 │   │   ├── fontsLoader.ts         # 字体检测与加载
+│   │   ├── numberFormat.ts        # Excel 风格数字/日期格式化
+│   │   ├── parser/
+│   │   │   └── sheetParser.ts     # xls/xlsx 解析器（三步架构）
 │   │   ├── printer.ts             # 打印组件（预览/打印/分页/字体注入）
 │   │   └── undoManager.ts         # 撤销/恢复管理器
 │   ├── declareModule.d.ts         # 模块类型声明
@@ -177,7 +163,7 @@ silkspaces/
 └── webpack.config.js              # Webpack 配置
 ```
 
-***
+---
 
 ## 4. 整体架构
 
@@ -193,13 +179,15 @@ silkspaces/
 │  SectionAlign / SectionProcess / SectionPrint     │
 ├──────────────────────────────────────────────────┤
 │         UI 组件层 (common) + 助手层 (assistant)    │
-│  Split / Menu / Navigator / Scroller / Button      │
-│  / Select / Message / Dialog / ColorPicker         │
-│  + Filter / Hidden（与 Canvas 渲染层联动）         │
+│  Split / Menu / MenuContent / Navigator / Scroller│
+│  / Select / Message / Dialog / ColorPicker       │
+│  / BtnBase + Filter / Hidden                      │
+│  （Canvas 基类通过 Menu 挂载右键菜单与格式对话框）      │
 ├──────────────────────────────────────────────────┤
 │              Canvas 渲染层 (sheets)               │
 │  Sheets → SheetCanvas / RowHeaderCanvas            │
 │         / ColHeaderCanvas / EditCanvas / AllSelect │
+│         （Canvas 基类承载右键菜单 / 插入删除 / 格式）    │
 ├──────────────────────────────────────────────────┤
 │             数据架构层 (dataArchitecture)          │
 │  DataCollection → Cell / Char / Header             │
@@ -208,24 +196,24 @@ silkspaces/
 │              工具模块 (utils)                      │
 │  EventEmitter / UndoManager / ClipboardManager     │
 │  / dom / debounce / fontsLoader / Printer          │
+│  / numberFormat / parser.SheetParser              │
 └──────────────────────────────────────────────────┘
 ```
 
 **核心设计理念：**
 
 - **事件驱动**：所有数据变更通过 EventEmitter 发布事件，UI 层订阅响应
-
 - **数据与渲染分离**：DataCollection 管理数据状态，Canvas 层负责绘制
-
 - **Canvas 高性能渲染**：表格内容完全通过 Canvas 2D 绘制，避免 DOM 节点过多
-
-- **全量状态快照撤销**：复杂结构操作（筛选/隐藏/排序/插入行列）通过 `runWithFullStateUndo` 折叠为一步可撤销操作
-
+- **绘制合帧（rAF）**：同一帧内多次 `draw()` 合并为一次全量重绘，避免事件链并发触发导致的重复绘制与重复持久化
+- **右键菜单上移到 Canvas 基类**：菜单构建、插入/删除行列、行高列宽对话框、设置单元格格式对话框统一由 `Canvas` 基类实现，行头/列头/主画布共享，仅通过 `resolveContextMenuCell()` 与 `handleContextMenuAction()` 重写差异
+- **全量状态快照撤销**：复杂结构操作（筛选/隐藏/排序/插入行列/右键菜单操作）通过 `runWithFullStateUndo` 折叠为一步可撤销操作
 - **统一打印入口**：打印设置（页边距/纸张/缩放/打印区域）统一读写 `data.printSetting`，工具栏与打印预览面板共用
 
-***
+---
 
 ## 5. 核心模块详解
+
 
 ### 5.1 数据架构层 (dataArchitecture)
 
@@ -233,7 +221,7 @@ silkspaces/
 
 #### 5.1.1 DataCollection
 
-**文件**：[dataCollection.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/dataArchitecture/dataCollection.ts)\
+**文件**：[dataCollection.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/dataArchitecture/dataCollection.ts)  
 **继承**：`EventEmitter`
 
 数据集合管理器，是整个应用的数据中心。协调列头、行头、单元格、可见视图等子模块，提供数据操作、坐标转换和矩形计算等功能。
@@ -287,6 +275,17 @@ silkspaces/
 | `isColHidden` / `isRowHidden`                          | `(pos: number) => boolean`                                      | 判断指定列/行是否隐藏                        |
 | `setRowsHidden` / `setColsHidden`                      | `(start, end, hidden) => void`                                  | 隐藏/显示行列（统一入口，含 recalc/clamp/补足/广播） |
 | `deleteRows` / `deleteCols`                            | `(start, end) => void`                                          | 删除行列                               |
+| `insertRows` / `insertCols`                            | `(at, count) => void`                                           | 在指定位置插入 N 行 / N 列                  |
+| `insertCellsRight` / `insertCellsDown`                 | `(startCol, endCol, startRow, endRow) => void`                  | 插入单元格（活动单元格右移 / 下移）                |
+| `shiftCellsLeft` / `shiftCellsUp`                      | `(startCol, endCol, startRow, endRow) => void`                  | 删除单元格语义（左移 / 上移填补空缺）               |
+| `setCellsNumberFormat`                                 | `(startCol, endCol, startRow, endRow, format) => void`          | 区域数字格式码设置                          |
+| `setCellsBorderColor`                                  | `(startCol, endCol, startRow, endRow, color) => void`           | 区域边框颜色设置                           |
+| `toggleMergeCells` / `mergeCells` / `unmergeCells`     | `(axis?) => void`                                               | 合并 / 取消合并单元格                       |
+| `mergeCellsByCol` / `mergeCellsByRow`                  | `() => void`                                                    | 按整列 / 整行快速合并                       |
+| `pastePlainText` / `pasteTextOnly` / `pasteFormatOnly` | `() => void`                                                    | 只粘贴文本 / 只粘贴文本 / 只粘贴格式              |
+| `copySelection` / `cutSelection` / `pasteSelection`    | `() => void`                                                    | 单元格级剪贴板操作（内部委托 ClipboardManager）   |
+| `copyChars` / `cutChars` / `pasteChars`                | `(insertIndex, chars) => number`                                | 字符级剪贴板操作                           |
+| `notifyToolbarStateChange`                             | `() => void`                                                    | 主动通知工具栏刷新按钮状态（快照回写后调用）             |
 | `getColName` / `getColNumber`                          | `(num) => string` / `(char) => number`                          | 列号↔列名互转                            |
 | `getCellName` / `getCellColAndRow`                     | `(col, row) => string` / `(cell) => {col, row}`                 | 单元格名↔行列号互转                         |
 | `calculateCellRect`                                    | `(col, row) => { left, top, width, height }`                    | 计算单元格视图矩形（含合并处理与滚动偏移）              |
@@ -302,42 +301,46 @@ silkspaces/
 
 #### 5.1.2 Cell
 
-**文件**：[cell.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/dataArchitecture/cell.ts)\
+**文件**：[cell.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/dataArchitecture/cell.ts)  
 **继承**：`EventEmitter`
 
 表示电子表格的单元格，包含样式和值属性。
 
-| 属性                  | 类型               | 说明                            |
-| ------------------- | ---------------- | ----------------------------- |
-| `cell`              | `string`         | 单元格名称（如 "A1"）                 |
-| `isEdit`            | `boolean`        | 是否正在编辑                        |
-| `colspan`           | `number?`        | 跨列数                           |
-| `rowspan`           | `number?`        | 跨行数                           |
-| `fontFamily`        | `string?`        | 字体族                           |
-| `fontSize`          | `number?`        | 字体大小                          |
-| `fontWeight`        | `boolean?`       | 是否加粗                          |
-| `fontStyle`         | `boolean?`       | 是否斜体                          |
-| `fontColor`         | `string?`        | 字体颜色                          |
-| `underline`         | `boolean?`       | 下划线                           |
-| `strikethrough`     | `boolean?`       | 删除线                           |
-| `borderTopWidth`    | `number?`        | 上边框宽度                         |
-| `borderBottomWidth` | `number?`        | 下边框宽度                         |
-| `borderLeftWidth`   | `number?`        | 左边框宽度                         |
-| `borderRightWidth`  | `number?`        | 右边框宽度                         |
-| `textAlign`         | `TextAlign?`     | 水平对齐（`left`/`center`/`right`） |
-| `alignItems`        | `VerticalAlign?` | 垂直对齐（`top`/`middle`/`bottom`） |
-| `backgroundColor`   | `string?`        | 背景颜色                          |
-| `chars`             | `Char[]`         | 字符数组                          |
-| `filter`            | `boolean?`       | 是否过滤                          |
-| `wrap`              | `boolean?`       | 自动换行                          |
-| `letterSpacing`     | `number?`        | 字间距                           |
-| `lineSpacing`       | `number?`        | 行间距                           |
+| 属性                  | 类型               | 说明                                                                        |
+| ------------------- | ---------------- | ------------------------------------------------------------------------- |
+| `cell`              | `string`         | 单元格名称（如 "A1"）                                                             |
+| `isEdit`            | `boolean`        | 是否正在编辑                                                                    |
+| `colspan`           | `number?`        | 跨列数                                                                       |
+| `rowspan`           | `number?`        | 跨行数                                                                       |
+| `fontFamily`        | `string?`        | 字体族                                                                       |
+| `fontSize`          | `number?`        | 字体大小                                                                      |
+| `fontWeight`        | `boolean?`       | 是否加粗                                                                      |
+| `fontStyle`         | `boolean?`       | 是否斜体                                                                      |
+| `fontColor`         | `string?`        | 字体颜色                                                                      |
+| `underline`         | `boolean?`       | 下划线                                                                       |
+| `strikethrough`     | `boolean?`       | 删除线                                                                       |
+| `borderTopWidth`    | `number?`        | 上边框宽度                                                                     |
+| `borderBottomWidth` | `number?`        | 下边框宽度                                                                     |
+| `borderLeftWidth`   | `number?`        | 左边框宽度                                                                     |
+| `borderRightWidth`  | `number?`        | 右边框宽度                                                                     |
+| `textAlign`         | `TextAlign?`     | 水平对齐（`left`/`center`/`right`）                                             |
+| `alignItems`        | `VerticalAlign?` | 垂直对齐（`top`/`middle`/`bottom`）                                             |
+| `backgroundColor`   | `string?`        | 背景颜色                                                                      |
+| `chars`             | `Char[]`         | 字符数组                                                                      |
+| `filter`            | `boolean?`       | 是否过滤                                                                      |
+| `wrap`              | `boolean?`       | 自动换行                                                                      |
+| `letterSpacing`     | `number?`        | 字间距                                                                       |
+| `lineSpacing`       | `number?`        | 行间距                                                                       |
+| `numberFormat`      | `string?`        | 数字格式码（`General`/`0.00`/`#,##0.00`/`0.00%`/`¥#,##0.00`/`0.00E+00`/`@`/日期码） |
+| `borderColor`       | `string?`        | 边框颜色（默认 `#000000`）                                                        |
 
 所有属性均通过 getter/setter + `updateProperty` 实现变更事件通知。
 
+> **重要**：`reset()` 只清空内容与「即用样式」，**保留 `numberFormat`**——它属于格式配置而非即用样式，`toJSON`/`fromJSON` 均已序列化该字段。
+
 #### 5.1.3 Char
 
-**文件**：[char.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/dataArchitecture/char.ts)\
+**文件**：[char.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/dataArchitecture/char.ts)  
 **继承**：`EventEmitter`
 
 表示单元格中的单个字符，支持字符级别的样式控制。
@@ -355,7 +358,7 @@ silkspaces/
 
 #### 5.1.4 ColHeaders / RowHeaders
 
-**文件**：[header.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/dataArchitecture/header.ts)\
+**文件**：[header.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/dataArchitecture/header.ts)  
 **继承**：`EventEmitter`
 
 管理列头和行头的位置与尺寸信息。
@@ -382,7 +385,7 @@ silkspaces/
 
 #### 5.1.5 VisibleView
 
-**文件**：[visibleView.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/dataArchitecture/visibleView.ts)\
+**文件**：[visibleView.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/dataArchitecture/visibleView.ts)  
 **继承**：`EventEmitter`
 
 管理可见视图的尺寸参数，为 Canvas 渲染提供计算依据。
@@ -426,7 +429,7 @@ silkspaces/
 
 #### 5.1.7 Values
 
-**文件**：[values.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/dataArchitecture/values.ts)\
+**文件**：[values.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/dataArchitecture/values.ts)  
 **继承**：`EventEmitter`
 
 预留的值对象类，目前仅有基本结构，为未来扩展保留。
@@ -440,16 +443,15 @@ silkspaces/
 **排序轴：**
 
 - `axis: 'column'` — 按某列的值排序行（列排序）
-
 - `axis: 'row'` — 按某行的值排序列（行排序）
 
 **排序模式（按优先级）：**
 
-| 模式     | 配置                      | 说明                             |
-| ------ | ----------------------- | ------------------------------ |
-| 不连续模式  | `indices: number[]`     | 仅对 indices 指定位置排序              |
-| 连续范围模式 | `startIndex + endIndex` | 对 \[startIndex, endIndex] 范围排序 |
-| 全量模式   | 不提供上述参数                 | 对全部行/列排序                       |
+| 模式     | 配置                      | 说明                            |
+| ------ | ----------------------- | ----------------------------- |
+| 不连续模式  | `indices: number[]`     | 仅对 indices 指定位置排序             |
+| 连续范围模式 | `startIndex + endIndex` | 对 [startIndex, endIndex] 范围排序 |
+| 全量模式   | 不提供上述参数                 | 对全部行/列排序                      |
 
 **混合类型分级（升序）：**
 
@@ -473,16 +475,14 @@ silkspaces/
 **保护规则：**
 
 - 排序前自动排除筛选按钮（`cell.filter !== undefined`）所在行/列，防止筛选锚点位置错乱
-
 - 内容单元格的合并格式与主单元格不一致时中止排序并提示
-
 - `keyIndex` 越界报错（无法钳位，否则按错误列排序）
-
 - `targetIndices` 钳制到 `[0, max-1]`，去重并升序
 
 > **被引用**：`Filter` 组件使用 `compareMixedText` 对去重后的列内容进行排序展示；`sectionProcess` 通过 `data.matrixSorter` 调用 `sort()` 执行排序。
 
-***
+---
+
 
 ### 5.2 Canvas 渲染层 (sheets)
 
@@ -490,29 +490,107 @@ Canvas 渲染层负责将数据绘制到 HTML5 Canvas 上，实现高性能表�
 
 #### 5.2.1 Canvas (基类)
 
-**文件**：[canvas.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/canvas.ts)\
+**文件**：[canvas.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/canvas.ts)  
 **继承**：`EventEmitter`
 
 所有 Canvas 组件的基类，提供画布基础操作和文本测量功能。
 
-| 属性              | 类型                         | 说明        |
-| --------------- | -------------------------- | --------- |
-| `canvas`        | `HTMLCanvasElement`        | Canvas 元素 |
-| `ctx`           | `CanvasRenderingContext2D` | 2D 绘图上下文  |
-| `parentElement` | `HTMLElement`              | 父容器       |
-| `data`          | `DataCollection`           | 数据集合实例    |
+| 属性              | 类型                         | 说明                         |
+| --------------- | -------------------------- | -------------------------- |
+| `canvas`        | `HTMLCanvasElement`        | Canvas 元素                  |
+| `ctx`           | `CanvasRenderingContext2D` | 2D 绘图上下文                   |
+| `parentElement` | `HTMLElement`              | 父容器                        |
+| `data`          | `DataCollection`           | 数据集合实例                     |
+| `menu`          | `Menu?`                    | 共享菜单实例（由 App 注入，画布间共用同一菜单） |
+| `menuContent`   | `MenuContent`              | 当前右键菜单内容对象                 |
 
 **关键方法：**
 
-| 方法                   | 说明                                       |
-| -------------------- | ---------------------------------------- |
-| `setupContext()`     | 初始化画布上下文参数（imageSmoothingEnabled、字体、对齐等） |
-| `updateCanvasSize()` | 更新画布尺寸，适配容器                              |
-| `draw()`             | 绘制画布内容（子类重写）                             |
+| 方法                                                    | 说明                                       |
+| ----------------------------------------------------- | ---------------------------------------- |
+| `setupContext()`                                      | 初始化画布上下文参数（imageSmoothingEnabled、字体、对齐等） |
+| `updateCanvasSize()`                                  | 更新画布尺寸，适配容器                              |
+| `draw()`                                              | 绘制画布内容（子类重写）                             |
+| `toDevicePixels()`                                    | CSS 像素 → 设备像素换算（适配 devicePixelRatio）     |
+| `setLineWidth()` / `removeHalfPixelOffset()`          | 1px 细线绘制辅助（半像素偏移）                        |
+| `measureCellText()`                                   | 单元格文本排版测量，产出 `CellContent`               |
+| `calculateCharGeometry()`                             | 单字符几何与样式测量（宽高、字体、颜色、下划线、删除线）             |
+| `drawLine/fillText/fillRect/strokeRect/moveTo/lineTo` | 绘制原语，统一处理 DPR 缩放                         |
+| `offscreen()`                                         | 创建 OffscreenCanvas 离屏渲染                  |
+| `getGeometry()`                                       | 客户端坐标 → 画布内相对坐标                          |
+| `getSelectedColsAndRows()`                            | 取当前选区的行列范围                               |
+| `scrollCellIntoView()`                                | 滚动使指定单元格进入可视区（右侧/下方有邻居时向反方向对齐）           |
+| `updateCursorStyle()`                                 | 按鼠标位置切换 CSS 光标样式                         |
+
+#### 5.2.1.1 右键菜单体系（Canvas 基类）
+
+右键菜单相关能力全部下沉到 `Canvas` 基类，`SheetCanvas` / `RowHeaderCanvas` / `ColHeaderCanvas` 共享同一套实现，仅需重写钩子方法区分行为。
+
+**钩子方法：**
+
+| 方法                              | 可见性       | 说明                                                         |
+| ------------------------------- | --------- | ---------------------------------------------------------- |
+| `setupContextMenu()`            | protected | 绑定 `contextmenu` 事件                                        |
+| `resolveContextMenuCell(x, y)`  | protected | 解析右键位置对应的单元格信息，默认走 `data.getSheetCell()`；行/列头画布重写以强制命中表头分支 |
+| `handleContextMenuAction(todo)` | protected | 分发菜单动作                                                     |
+| `refreshAfterContextMenu()`     | protected | 菜单关闭后刷新（重绘 + 工具栏状态同步）                                      |
+
+**菜单结构（自上而下）：**
+
+1. **剪贴板图标行** — 复制 / 剪切 / 粘贴 / 只粘贴文本 / 只粘贴格式（5 个 28×28 图标按钮）
+2. **删除**（hover 二级子菜单）— 单元格左移 / 单元格上移 / 删除整行 / 删除整列
+3. **插入**（hover 二级子菜单）— 插入单元格（活动单元格右移 / 下移）+ 分隔线 + 在上方/下方插入行、在左侧/右侧插入列（4 项带「份数」数字步进器）
+4. **常规项** — 隐藏 / 取消隐藏 / 行高 / 列宽 / 清除内容 / 设置单元格格式
+
+**二级子菜单实现要点：**
+
+- 子菜单容器 **append 到 `document.body`**（不挂在主菜单内），避免被主菜单 `overflow` 裁剪
+- 必须内联覆盖 `.menu` 类的 `opacity:0 / visibility:hidden / transition:.2s`，否则子菜单要等淡入动画，感知为延迟显示
+- 定位到父项右边缘并 **重叠 1px**，消除 hover gap 导致的 `mouseleave` 误关；右侧空间不足时翻转到左侧，超出视口时钳位
+- `mouseleave` 延迟 **120ms** 关闭，鼠标穿过间隙或子菜单内移动时不误关
+- 通过 `menu.on('close', closeSubmenu)` 兜底清理，防止主菜单关闭瞬间子菜单残留
+
+**份数步进器（插入行列数量）：**
+
+- `input[type=number]`（min 1 / max 999）+ 右侧纵向 `+ / −` 按钮，样式与打印份数输入框同构
+- 单击 ±1；**按住连发**：初始延迟 400ms，之后每 80ms 重复
+- 连发监听 `window` 的 `pointerup` / `pointercancel`，即使指针移出按钮也能停止
+- 步进按钮 `pointerdown` 中 `preventDefault()` 阻止焦点转移与文本选择，保证长按不被打断
+- `change` 时钳制到 `[1, 999]`
+
+**对话框：**
+
+| 方法                          | 说明                         |
+| --------------------------- | -------------------------- |
+| `openDimensionDialog(opts)` | 行高 / 列宽通用对话框（Bootstrap 风格） |
+| `openRowHeightDialog()`     | 行高对话框，确认后应用到选区内所有行         |
+| `openColWidthDialog()`      | 列宽对话框，确认后应用到选区内所有列         |
+| `openFormatCellsDialog()`   | 设置单元格格式对话框（见下）             |
+
+**「设置单元格格式」对话框：**
+
+采用「分类 + 选项 + 示例预览 + 实时格式码」布局，分类包含：
+
+| 分类    | 可配置项                                                                                |
+| ----- | ----------------------------------------------------------------------------------- |
+| 常规    | 无（`General`）                                                                        |
+| 数值    | 小数位数（0-10）、千分位分隔符、负数样式（前缀 `-` / 括号 / 括号+红色）                                         |
+| 货币    | 符号（¥ $ € £）+ 数值选项                                                                   |
+| 百分比   | 小数位数                                                                                |
+| 科学记数法 | 小数位数                                                                                |
+| 文本    | `@`                                                                                 |
+| 日期    | 5 种预设（`yyyy/m/d`、`yyyy-mm-dd`、`yyyy"年"m"月"d"日"`、`m/d/yyyy`、`dddd, yyyy"年"m"月"d"日"`） |
+| 时间    | 5 种预设（`h:mm`、`h:mm:ss`、`h:mm AM/PM`、`mm:ss`、`yyyy-mm-dd h:mm:ss`）                   |
+
+同时提供边框设置：线条样式（细实线 / 粗实线）+ 边框颜色 + 施加点（无 / 外框 / 全部 / 上 / 下 / 左 / 右）。
+
+打开时从锚点单元格的 `numberFormat` 与 `borderColor` **反推初始状态**（含日期/时间分类判定），确认时调用 `setCellsNumberFormat` 与 `setCellsBorderColor` 批量应用到选区。示例预览使用固定日期 `2026-10-10 14:30:45`。
+
+> 所有右键菜单的数据变更均以 `data.runWithFullStateUndo(...)` 包裹，每项功能都可整体撤销/重做。
 
 #### 5.2.2 SheetCanvas
 
-**文件**：[sheetCanvas.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/sheetCanvas.ts)\
+**文件**：[sheetCanvas.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/sheetCanvas.ts)  
 **继承**：`Canvas`
 
 主表格画布，负责绘制单元格内容、背景、边框、网格线和选区。
@@ -520,46 +598,43 @@ Canvas 渲染层负责将数据绘制到 HTML5 Canvas 上，实现高性能表�
 **特有功能：**
 
 - 字体加载等待（`waitForFontsLoaded`）：使用 `Promise.race` 设置 3 秒超时
-
 - 加载动画（`drawLoadingAnimation`）：字体加载期间显示旋转虚线圆圈
-
 - 单元格绘制：背景色、文字内容、边框、选区高亮
-
 - 网格线绘制
 
 > **重要约束**：Canvas 文本渲染坐标必须使用 `Math.round()` 避免高 DPI 屏幕文字重影。OffscreenCanvas 绘制必须从 `(0,0)` 开始。
 
 #### 5.2.3 ColHeaderCanvas
 
-**文件**：[colHeaderCanvas.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/colHeaderCanvas.ts)\
+**文件**：[colHeaderCanvas.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/colHeaderCanvas.ts)  
 **继承**：`Canvas`
 
 列头画布，绘制列标题（A, B, C...）、选中状态和列宽调整手柄。
 
 #### 5.2.4 RowHeaderCanvas
 
-**文件**：[rowHeaderCanvas.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/rowHeaderCanvas.ts)\
+**文件**：[rowHeaderCanvas.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/rowHeaderCanvas.ts)  
 **继承**：`Canvas`
 
 行头画布，绘制行号（1, 2, 3...）、选中状态和行高调整手柄。
 
 #### 5.2.5 EditCanvas
 
-**文件**：[editCanvas.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/editCanvas.ts)\
+**文件**：[editCanvas.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/editCanvas.ts)  
 **继承**：`Canvas`
 
 编辑画布，实现单元格编辑状态下的输入框和光标显示。
 
 #### 5.2.6 AllSelect
 
-**文件**：[allSelect.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/allSelect.ts)\
+**文件**：[allSelect.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/allSelect.ts)  
 **继承**：`EventEmitter`
 
 全选按钮组件，位于行头与列头交汇处，点击选中所有单元格。
 
 #### 5.2.7 Sheets (容器)
 
-**文件**：[sheets.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/sheets.ts)\
+**文件**：[sheets.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/sheets.ts)  
 **继承**：`EventEmitter`
 
 工作表容器，是所有 Canvas 组件的父容器和管理者。
@@ -575,12 +650,27 @@ Canvas 渲染层负责将数据绘制到 HTML5 Canvas 上，实现高性能表�
 
 **关键方法：**
 
-| 方法                      | 说明                          |
-| ----------------------- | --------------------------- |
-| `draw()`                | 绘制所有画布内容                    |
-| `updateCanvasSize()`    | 更新所有画布尺寸                    |
-| `initVisibleView()`     | 初始化可见视图尺寸                   |
-| `setupResizeObserver()` | 监听容器尺寸变化（仅观察 parentElement） |
+| 方法                      | 说明                                |
+| ----------------------- | --------------------------------- |
+| `draw()`                | 绘制所有画布内容（**rAF 合帧**，返回共享 Promise） |
+| `updateCanvasSize()`    | 更新所有画布尺寸                          |
+| `initVisibleView()`     | 初始化可见视图尺寸                         |
+| `setupResizeObserver()` | 监听容器尺寸变化（仅观察 parentElement）       |
+
+**绘制合帧（rAF）机制：**
+
+事件链（`VALUES_CHANGED` / `SELECTION_CHANGED` / `ALL_*_CHANGED` 等）与右键菜单钩子 `refreshAfterContextMenu` 常在一次用户动作中并发触发 `draw()`。由于主画布全量重绘成本高，合帧机制保证同一帧只真正绘制一次。
+
+| 内部字段           | 说明                                                |
+| -------------- | ------------------------------------------------- |
+| `_drawPromise` | 合帧周期内的 draw Promise；非 `null` 表示已排入 rAF，同帧调用共享同一绘制 |
+| `_drawRafId`   | rAF 回调 ID，用于销毁/重建时取消挂起重绘                          |
+
+实现要点：
+
+- `_drawPromise` 非 `null` 即代表本帧已排入绘制，新调用直接复用，不再排 rAF
+- rAF 回调内执行真实绘制，`finally` 中清空 `_drawPromise`（释放合帧锁）并 `resolve`，**保证异常路径不会卡死后续 draw**
+- canvas 未创建时（DB 加载阶段 `OFFSETX/Y_CHANGED` 同步回调）走守卫 `return`，首次正式绘制由 `setupResizeObserver` 的 ResizeObserver 首次回调兜底
 
 **初始化流程：**
 
@@ -591,7 +681,7 @@ Canvas 渲染层负责将数据绘制到 HTML5 Canvas 上，实现高性能表�
 5. `setupResizeObserver()` — 监听尺寸变化
 6. `setupEventListeners()` — 绑定事件监听
 
-***
+---
 
 ### 5.3 UI 组件层 (common)
 
@@ -599,7 +689,7 @@ Canvas 渲染层负责将数据绘制到 HTML5 Canvas 上，实现高性能表�
 
 #### 5.3.1 Split
 
-**文件**：[split.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/split.ts)\
+**文件**：[split.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/split.ts)  
 **继承**：`EventEmitter`
 
 面板分割组件，支持水平和垂直分割，通过拖拽调整面板比例。使用 IndexedDB 持久化存储布局状态。
@@ -613,28 +703,53 @@ Canvas 渲染层负责将数据绘制到 HTML5 Canvas 上，实现高性能表�
 
 #### 5.3.2 Menu
 
-**文件**：[menu.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/menu.ts)\
+**文件**：[menu.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/menu.ts)  
 **继承**：`EventEmitter`
 
 下拉菜单组件，支持菜单项、分隔线、子菜单和自定义元素。
 
+**模块导出：**
+
+| 导出                      | 类型          | 说明                       |
+| ----------------------- | ----------- | ------------------------ |
+| `Menu`                  | `class`     | 菜单容器，管理显示/隐藏、位置计算、外部点击关闭 |
+| `MenuContent`           | `class`     | 菜单内容渲染器，递归处理 `items` 数组  |
+| `createCompositeIcon()` | `function`  | 创建带右下角角标的复合图标            |
+| `MenuOptions`           | `interface` | 菜单构造配置                   |
+| `MenuContentOptions`    | `interface` | 菜单内容构造配置                 |
+
+**`MenuContent.items` 支持的项类型：**
+
+| 类型                            | 说明                                |
+| ----------------------------- | --------------------------------- |
+| `{ todo, icon, text }`        | 普通菜单项                             |
+| `{ todo, icon, badge, text }` | 带角标的菜单项（`badge: 'T' \| 'brush'`）  |
+| `'separator'`                 | 分隔线                               |
+| `() => HTMLElement`           | 自定义元素（工厂函数），用于图标行、含子菜单的项、步进器等复杂结构 |
+
+**事件：** `close` — 菜单关闭时 emit，供右键菜单的二级子菜单注册清理钩子。
+
+**`createCompositeIcon(base, badge)`：**
+
+在 `base` 图标右下角叠加小角标（`T` 字母或 `icon-brush` 格式刷），用于「只粘贴文本 / 只粘贴格式」这类需要区分粘贴变体的场景——视觉上保留「粘贴」语义同时标明变体。
+
 #### 5.3.3 Button (BtnBase)
 
-**文件**：[button.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/button.ts)\
+**文件**：[button.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/button.ts)  
 **继承**：`EventEmitter`
 
 按钮组件，支持图标、文字、下拉箭头、菜单和状态管理（选中、禁用）。
 
 #### 5.3.4 Select
 
-**文件**：[select.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/select.ts)\
+**文件**：[select.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/select.ts)  
 **继承**：`EventEmitter`
 
 选择器组件，带下拉菜单的选项选择，用于字体选择器、字号选择器等。
 
 #### 5.3.5 Scroller
 
-**文件**：[scroller.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/scroller.ts)\
+**文件**：[scroller.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/scroller.ts)  
 **继承**：`EventEmitter`
 
 自定义滚动条组件，支持水平和垂直方向，可拖拽调整面板大小。
@@ -648,21 +763,21 @@ Canvas 渲染层负责将数据绘制到 HTML5 Canvas 上，实现高性能表�
 
 #### 5.3.6 Navigator
 
-**文件**：[navigator.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/navigator.ts)\
+**文件**：[navigator.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/navigator.ts)  
 **继承**：`EventEmitter`
 
 导航面板组件，支持面板切换和内容显示，使用 IndexedDB 持久化选中状态。默认导航项：`['文件', '工具', '脚本']`。
 
 #### 5.3.7 Message
 
-**文件**：[message.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/message.ts)\
+**文件**：[message.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/message.ts)  
 **继承**：`EventEmitter`
 
 消息提示框组件，支持成功、错误、警告、信息等类型，以及确认对话框。
 
 #### 5.3.8 Dialog
 
-**文件**：[dialog.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/dialog.ts)\
+**文件**：[dialog.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/dialog.ts)  
 **继承**：`EventEmitter`
 
 通用对话框容器组件，提供居中弹层、内容管理与关闭回调能力。
@@ -680,7 +795,7 @@ Canvas 渲染层负责将数据绘制到 HTML5 Canvas 上，实现高性能表�
 
 #### 5.3.9 ColorPicker
 
-**文件**：[colorPicker.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/colorPicker.ts)\
+**文件**：[colorPicker.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/common/colorPicker.ts)  
 **继承**：`EventEmitter`
 
 通用颜色选择器组件，提供「主题色 + 标准色 + 高级拾色器」三种选取方式。
@@ -703,22 +818,19 @@ Canvas 渲染层负责将数据绘制到 HTML5 Canvas 上，实现高性能表�
 **颜色空间转换工具：**
 
 - `rgbToHsl(r, g, b)` — RGB → HSL
-
 - `hslToRgb(h, s, l)` — HSL → RGB
-
 - `setColorFromHex(hex)` — Hex → HSL 内部状态
-
 - `parseColorToRGBA(color)` — 解析 rgba/hex 字符串到 HSL
 
 > **EyeDropper 拾色器**：仅在支持 `window.EyeDropper` API 的浏览器中可用，否则按钮禁用并提示。
 
-***
+---
 
 ### 5.4 工具栏层 (toolbar)
 
 #### 5.4.1 Toolbar
 
-**文件**：[toolbar.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/toolbar/toolbar.ts)\
+**文件**：[toolbar.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/toolbar/toolbar.ts)  
 **继承**：`EventEmitter`
 
 顶部工具栏容器，管理标签页和内容区域。
@@ -769,14 +881,12 @@ Canvas 渲染层负责将数据绘制到 HTML5 Canvas 上，实现高性能表�
 **关键设计：**
 
 - 通过 `getSharedPrinter(data)` 获取共享 `Printer` 实例，与快速访问栏的打印/打印预览按钮共用，确保设置互通
-
 - 所有设置统一读写 `data.printSetting`（随文档序列化持久化）
-
 - 下拉菜单项标记 `.print-menu` 类，预留对号位以显示 `✓` 选中状态
-
 - `markActiveItem()` 按钮打开菜单时回显当前选中项
 
-***
+---
+
 
 ### 5.5 工具模块 (utils)
 
@@ -865,25 +975,19 @@ debounce<T extends (...args: any[]) => void>(func: T, wait: number): T
 **1.** **`detectSystemFonts(fontList?, testString?, timeout=3000)`**
 
 - 通过 Canvas 测量文本宽度检测系统已安装字体
-
 - 支持中英文常见字体列表（含鸿蒙黑体、宋体、微软雅黑等）
-
 - 默认 3 秒超时
 
 **2.** **`BatchFontLoader`** **类**
 
 - 批量注册和加载自定义字体（FontFace API）
-
 - 支持超时控制（默认 30 秒）
-
 - 支持 `applyFont()` 将字体应用到 DOM 元素
 
 **3.** **`waitForFontsLoaded(fontNames?, timeout=5000)`**
 
 - 等待字体加载完成
-
 - 使用 `Promise.race` 防止无限等待
-
 - 默认 5 秒超时
 
 > **重要**：`document.fonts.ready` 可能因字体加载失败、网络问题等原因永不 resolve，必须配合超时使用。
@@ -928,13 +1032,9 @@ debounce<T extends (...args: any[]) => void>(func: T, wait: number): T
 **分页算法：**
 
 - 内容按实际尺寸与纸张可打印区域比较，不缩放
-
 - 宽度过大 → 水平分页（列不跨页拆分）
-
 - 高度过大 → 垂直分页（行不跨页拆分）
-
 - 总页数 = 列组数 × 行组数
-
 - 隐藏的行/列不参与打印；跨越隐藏行/列的合并块按可见范围收缩合并跨度
 
 **字体注入：** 预览与打印文档自动注入主文档收集的 `@font-face` 规则，并预留 `registerFontCss()` 与全局 `registerFontFaceCss()` 接口，后期用户自定义加入的字体无需改动打印组件即可应用到预览与打印。
@@ -958,7 +1058,124 @@ debounce<T extends (...args: any[]) => void>(func: T, wait: number): T
 
 > **统一入口**：所有设置统一读写 `data.printSetting`（工具栏 `set` 系列方法与预览面板共用的唯一入口，随文档序列化持久化），预览打开时即时重绘生效。
 
-***
+#### 5.5.8 numberFormat
+
+**文件**：[numberFormat.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/utils/numberFormat.ts)
+
+Excel 风格数字格式码解析与格式化工具，为 `Cell.numberFormat` 提供显示文本渲染能力。
+
+**模块导出：**
+
+| 导出                    | 签名                                           | 说明            |
+| --------------------- | -------------------------------------------- | ------------- |
+| `formatNumberValue`   | `(value: number, code: string) => string`    | 按格式码格式化数值     |
+| `getCellDisplayText`  | `(rawText: string, numberFormat?) => string` | 单元格显示文本（总入口）  |
+| `isDateTimeCode`      | `(code: string) => boolean`                  | 判断是否为日期/时间格式码 |
+| `formatDateTimeValue` | `(date: Date, code: string) => string`       | 按日期/时间格式码渲染   |
+
+**`getCellDisplayText` 判定链路：**
+
+1. 无格式 / `General` / `@` → 返回原始文本
+2. `isDateTimeCode()` 为真 → `parseDateValue()` 解析为 `Date` → `formatDateTimeValue()` 渲染
+3. 文本非数字（正则 `^-?\d+(\.\d+)?([eE][+-]?\d+)?$`）→ 返回原始文本（**非数字不受格式码影响**）
+4. 其余 → `formatNumberValue()` 按码格式化
+
+**`formatNumberValue` 支持的模式：**
+
+| 模式      | 示例码                     | 说明                      |
+| ------- | ----------------------- | ----------------------- |
+| 常规 / 文本 | `General`、`@`           | 原样输出                    |
+| 固定小数位   | `0`、`0.00`              | `toFixed`               |
+| 千分位     | `#,##0`、`#,##0.00`      | 整数部分插入分隔符               |
+| 百分比     | `0%`、`0.00%`            | 值 × 100 后追加 `%`         |
+| 货币      | `¥#,##0.00`、`$#,##0.00` | 提取前缀符号 + 数值格式           |
+| 科学记数法   | `0.00E+00`              | 指数按码中 `0` 的个数补零         |
+| 多段码     | `正;负;零`                 | 按值正/负/零选择对应段            |
+| 括号负数    | `#,##0.00;(#,##0.00)`   | 负数用括号包裹                 |
+| 颜色标签    | `[Red]`                 | **仅剥离，不在文本中体现**（需绘制层处理） |
+
+**日期/时间 token：**
+
+| token          | 输出                               |
+| -------------- | -------------------------------- |
+| `yyyy` / `yy`  | 4 位年 / 2 位年                      |
+| `m` / `mm`     | 月（**歧义消解**，见下）                   |
+| `mmm` / `mmmm` | 英文月缩写 / 全称                       |
+| `d` / `dd`     | 日（1/2 位）                         |
+| `ddd` / `dddd` | 中文短星期 `周一` / 长星期 `星期一`           |
+| `h` / `hh`     | 时（含 `AM/PM` 或 `上午/下午` 时为 12 小时制） |
+| `s` / `ss`     | 秒                                |
+| `"..."`        | 引号内字面量原样输出                       |
+
+**`m`/`mm` 月/分歧义消解（`isMinuteContext`）：**
+
+Excel 中 `m` 既可表示月也可表示分。规则：**前方最近的 token 是 `h`，或后方最近的 token 是 `s` → 判为「分」；否则判为「月」**。因此 `yyyy-mm-dd h:mm:ss` 中日期段的 `mm` 正确渲染为月，时间段的 `mm` 正确渲染为分。查找时会跳过 `:/-,` 与空格等分隔符，并跳过引号内字面量。
+
+**`parseDateValue` 解析顺序：**
+
+1. 纯数字 → Excel 序列号（基准 `1899-12-30`，value=1 对应 1899-12-31）；**以 UTC 分量构造本地 Date**，避免时区漂移
+2. `new Date(rawText)` — 支持 ISO `2026-10-10`、`2026/10/10 14:30:45` 等
+3. 中文格式正则 — `2026年10月10日` / `2026年10月10日 14:30`
+4. 均失败 → 返回 `null`（回退显示原始文本）
+
+> **被引用**：`Canvas` 基类导入 `getCellDisplayText` / `formatNumberValue` / `isDateTimeCode` / `formatDateTimeValue`，用于单元格文本绘制与「设置单元格格式」对话框的实时预览。
+
+#### 5.5.9 SheetParser
+
+**文件**：[sheetParser.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/utils/parser/sheetParser.ts)
+
+xls / xlsx 表格解析器，提取单元格数据、样式与图片，并映射为项目数据格式。
+
+**三步解析架构：**
+
+```
+decode(file) → DecodedWorkbook → extract() → ExtractedSheet[] → generate() → SheetParserResult
+   解压/解码          读取提取                映射为项目格式
+```
+
+| 步骤  | 方法                           | 输入                 | 输出                                                               |
+| --- | ---------------------------- | ------------------ | ---------------------------------------------------------------- |
+| 第一步 | `decode(file)`               | `File`             | `DecodedWorkbook`（xlsx 解包产物 / xls 原始二进制）                         |
+| 第二步 | `extract(decoded, options?)` | `DecodedWorkbook`  | `ExtractedSheet[]`（单元格、样式、合并、行列尺寸、图片）                            |
+| 第三步 | `generate(sheets, options?)` | `ExtractedSheet[]` | `SheetParserResult`（`values`/`colHeaders`/`rowHeaders`/`images`） |
+| 一站式 | `parse(file, options?)`      | `File`             | 依次执行上述三步                                                         |
+
+**格式分支：**
+
+| 格式   | 第一步                               | 第二步实现                                                                                                                                         |
+| ---- | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| xlsx | JSZip 解包为 `Map<path, Uint8Array>` | `DOMParser` 直接解析 `workbook.xml` / `.rels` / `styles.xml` / `sharedStrings.xml` / `sheetN.xml` / `drawingN.xml`，**完整提取字体/填充/对齐/边框/数字格式/合并/图片** |
+| xls  | 返回原始 `ArrayBuffer`                | 交由 `xlsx-js-style` 解析 BIFF（样式支持有限，**无法提取图片**）                                                                                                 |
+
+**主要数据结构：**
+
+| 接口                   | 说明                                                   |
+| -------------------- | ---------------------------------------------------- |
+| `DecodedWorkbook`    | `{ format, files, rawData }` 第一步输出                   |
+| `ExtractedCell`      | `{ row, col, value, type, style?, numberFormat? }`   |
+| `CellStyleInfo`      | `{ font?, fill?, alignment?, border? }`              |
+| `ExtractedImage`     | `{ data, mimeType, anchor, name? }`（anchor 含 EMU 偏移） |
+| `ExtractedSheet`     | `{ name, cells, merges, cols, rows, images, range }` |
+| `SheetParserResult`  | `{ values: Cell[], colHeaders, rowHeaders, images }` |
+| `SheetParserOptions` | `{ sheetIndex?, readStyles?, readImages? }`          |
+
+**`generate` 映射规则：**
+
+- 坐标：Excel 0-based → 项目 1-based（`col=0 → 1 = A`，`row=0 → 1`）
+- 字体样式 → `Char` 属性（`fontFamily`/`fontSize`/`fontWeight`/`fontStyle`/`fontColor`/`underline`/`strikethrough`）；值按 `Array.from(text)` 逐字符拆分为 `Char[]`，共享同一字体样式
+- 单元格样式 → `Cell` 属性（`backgroundColor`/`textAlign`/`alignItems`/`wrap`/四边 `border*Width`/`borderColor`）
+- 合并区域 → 锚点（左上角）单元格的 `colspan`/`rowspan`
+- 列宽 → `ColHeader.width`（缺省 `DEFAULT_CELL_WIDTH`），行高 → `RowHeader.height`（缺省 `DEFAULT_CELL_HEIGHT`），并逐项累加 `left` / `top`
+- 数字格式：非 `General` 的格式码写入 `cell.numberFormat`
+- 边框样式映射：`thin`/`dotted`/`dashed`/`hair` 等 → 1，`medium`/`mediumDashed` 等 → 2，`thick` → 3
+- 颜色转换：`argbToHex()` 将 `AARRGGBB` → `#RRGGBB`
+- 内置格式码：`builtinNumFmt()` 覆盖 ID 0/1/2/3/4/9-11/14-17/22/37-40/44-49
+
+> **当前状态**：`SheetParser` 尚未接入主流程（`src/` 内暂无其它模块引用），属于已完成但待集成的解析能力。
+>
+> **已知问题**：`npx tsc --noEmit` 在该文件报 6 处类型错误——`xlsx-js-style` 的 `ColInfo` / `RowInfo` 类型未声明 `customWidth` / `customHeight` 字段（运行时存在，仅类型缺失）。集成前需补类型声明或改用 `wpx/hpx` 之外的判断方式。
+
+---
 
 ### 5.6 常量与事件 (constant)
 
@@ -968,19 +1185,32 @@ debounce<T extends (...args: any[]) => void>(func: T, wait: number): T
 
 #### 核心常量
 
-| 常量                        | 值                             | 说明        |
-| ------------------------- | ----------------------------- | --------- |
-| `DEFAULT_CELL_WIDTH`      | 78                            | 默认列宽      |
-| `DEFAULT_CELL_HEIGHT`     | 24                            | 默认行高      |
-| `MIN_WIDTH`               | 20                            | 最小列宽      |
-| `MIN_HEIGHT`              | 15                            | 最小行高      |
-| `DEFAULT_FONT_SIZE`       | 16                            | 默认字号      |
-| `DEFAULT_FONT_FAMILY`     | `'HarmonyOS Sans SC Regular'` | 默认字体      |
-| `ROW_HEADER_PADDING`      | 12                            | 行头内边距     |
-| `CELL_PADDING`            | 2                             | 单元格内边距    |
-| `GRID_LINE_COLOR`         | `'#ccc'`                      | 网格线颜色     |
-| `HEADER_BG_COLOR`         | `'whitesmoke'`                | 表头背景色     |
-| `SCROLLER_THUMB_MIN_SIZE` | 20                            | 滚动条滑块最小尺寸 |
+| 常量                                     | 值                             | 说明                              |
+| -------------------------------------- | ----------------------------- | ------------------------------- |
+| `DEFAULT_CELL_WIDTH`                   | 78                            | 默认列宽                            |
+| `DEFAULT_CELL_HEIGHT`                  | 24                            | 默认行高                            |
+| `MIN_WIDTH`                            | 20                            | 最小列宽                            |
+| `MIN_HEIGHT`                           | 15                            | 最小行高                            |
+| `DEFAULT_FONT_SIZE`                    | 16                            | 默认字号                            |
+| `DEFAULT_FONT_FAMILY`                  | `'HarmonyOS Sans SC Regular'` | 默认字体                            |
+| `ROW_HEADER_PADDING`                   | 12                            | 行头内边距                           |
+| `CELL_PADDING`                         | 2                             | 单元格内边距                          |
+| `GRID_LINE_COLOR`                      | `'#ccc'`                      | 网格线颜色                           |
+| `HEADER_BG_COLOR`                      | `'whitesmoke'`                | 表头背景色                           |
+| `SCROLLER_THUMB_MIN_SIZE`              | 20                            | 滚动条滑块最小尺寸                       |
+| `DEFAULT_CELL_BG_COLOR`                | `'white'`                     | 默认单元格背景色                        |
+| `TEXT_COLOR`                           | `'black'`                     | 默认文字颜色                          |
+| `DEFAULT_CELL_HIGHLIGHT_COLOR`         | `'#ffeb3b'`                   | 高亮单元格背景色                        |
+| `DEFAULT_SELECTED_BG_COLOR`            | `'rgba(128,128,128, 0.2)'`    | 选区背景色                           |
+| `DEFAULT_SELECTED_BORDER_COLOR`        | `'#4CAF50'`                   | 选区边框色                           |
+| `DEFAULT_ANCHOR_SELECTED_BORDER_COLOR` | `'#A9A9A9'`                   | 锚点选区边框色                         |
+| `DEFAULT_SELECTED_BORDER_WIDTH`        | 3                             | 选区边框宽度                          |
+| `KEYWORDS`                             | `['\n', 'undefined']`         | 渲染时跳过的关键字                       |
+| `FONT_FAMILY_LIST`                     | 50 项                          | 字体下拉列表（`todo` 为字体名，`text` 为显示名） |
+| `NAV_PANEL`                            | `['文件', '工具', '脚本']`          | 导航面板默认项                         |
+| `TOOLBAR_TABS`                         | 6 个标签                         | `开始/插入/页面/数据/视图/工具`             |
+
+> 另有 `SHEETS_NAME`、`SCROLLER_CLASS_NAMES`、`TOOLBAR_CLASS_NAME`、`TOOLS_CLASS_NAMES`、`NAV`、`MENU_CLASS_NAMES`、`ASSISTANT` 等类名常量对象，供各组件统一引用样式标识。
 
 #### 事件枚举 DataEvents
 
@@ -989,41 +1219,38 @@ debounce<T extends (...args: any[]) => void>(func: T, wait: number): T
 **SheetProperty（工作表事件）：**
 
 - `IS_EDITTING_CHANGED` — 编辑状态变更
-
 - `SELECTION_CHANGED` — 选区变更
-
 - `ANCHOR_SELECTION_CHANGED` — 锚点选区变更
-
 - `ZOOM_CHANGED` — 缩放变更
-
 - `VALUES_CHANGED` — 值变更
-
 - `ALL_COL_WIDTH_CHANGED` / `ALL_ROW_HEIGHT_CHANGED` — 列宽/行高全局变更
-
 - `OFFSETX_CHANGED` / `OFFSETY_CHANGED` — 水平/垂直偏移变更
+- `COLUMNS_CHANGED` / `ROWS_CHANGED` — 行列结构变更
+- `CURSOR_STATE_CHANGED` / `CURSOR_POSITION_CHANGED` — 光标状态/位置变更
+- `BRUSH_MODE_CHANGED` — 格式刷模式变更
+- `SHOW_GRID_LINES_CHANGED` / `ACTIVED_SHEET_NAME_CHANGED` / `RESIZE_CHANGED`
+- `SNAPSHOT_RESTORED` — 撤销/重做全量快照回写完成。此时数据已完整恢复到目标状态，供依赖差量事件（如 `ACTIVED_CELL_CHANGED`）刷新外观的分区（工具栏按钮等）在回写未触发差量事件时也能同步状态
 
 **CellProperty（单元格事件）：**
 
 - `ACTIVED_CELL_CHANGED` — 活动单元格变更
-
 - `FONT_FAMILY_CHANGED` / `FONT_SIZE_CHANGED` — 字体属性变更
-
 - `BORDER_*_CHANGED` — 边框宽度变更
-
 - `TEXT_ALIGN_CHANGED` / `ALIGN_ITEMS_CHANGED` — 对齐变更
-
 - `BACKGROUND_COLOR_CHANGED` — 背景色变更
+- `NUMBER_FORMAT_CHANGED` — 数字格式码变更
+- `BORDER_COLOR_CHANGED` — 边框颜色变更
+- `COLSPAN_CHANGED` / `ROWSPAN_CHANGED` — 合并跨度变更
+- `FILTER_CHANGED` / `WRAP_CHANGED` / `LETTER_SPACING_CHANGED` / `LINE_SPACING_CHANGED` — 其它单元格属性变更
 
 **ValueProperty（字符事件）：**
 
 - `CHAR_CHANGED` — 字符内容变更
-
 - `CHAR_FONT_*_CHANGED` — 字符级样式变更
 
 **VisibleViewProperty（视图事件）：**
 
 - `ROW_HEADER_WIDTH_CHANGED` / `COL_HEADER_HEIGHT_CHANGED`
-
 - `SHEET_WIDTH_CHANGED` / `SHEET_HEIGHT_CHANGED`
 
 **MouseLocation 枚举：**
@@ -1039,7 +1266,7 @@ debounce<T extends (...args: any[]) => void>(func: T, wait: number): T
 | `FILTER_*` | 筛选组件根节点、容器、输入框、提示区、按钮、颜色容器等类名 |
 | `HIDDEN_*` | 隐藏指示组件类名                      |
 
-***
+---
 
 ### 5.7 助手模块 (assistant)
 
@@ -1113,14 +1340,11 @@ debounce<T extends (...args: any[]) => void>(func: T, wait: number): T
 **关键设计：**
 
 - 默认隐藏，仅由画布在悬停命中分割线时调用 `show`，离开时调用 `hide`
-
 - 点击按钮：使用 `runWithFullStateUndo` 包裹 `setRowsHidden`/`setColsHidden` 取消隐藏，作为一步可撤销操作
-
 - 鼠标离开按钮时隐藏：画布外不再产生 `mousemove`/`mouseleave`，需要按钮自行负责隐藏
-
 - 按钮拦截点击事件后画布不会收到 `mousedown`/`click`，选中状态保持不变
 
-***
+---
 
 ## 6. 类继承关系图
 
@@ -1142,6 +1366,7 @@ EventEmitter (utils/eventEmitter.ts)
 ├── Sheets (sheets/sheets.ts)
 ├── Split (common/split.ts)
 ├── Menu (common/menu.ts)
+├── MenuContent (common/menu.ts)     // 由 Menu 内部驱动，递归渲染 items
 ├── BtnBase (common/button.ts)
 ├── Select (common/select.ts)
 ├── Scroller (common/scroller.ts)
@@ -1162,16 +1387,20 @@ EventEmitter (utils/eventEmitter.ts)
   ├── Filter (assistant/filter.ts)        — 组合 Navigator + Menu + DataCollection
   ├── Hidden (assistant/hidden.ts)        — 由行/列头画布持有，组合 DataCollection
   └── Printer (utils/printer.ts)          — 由 SectionPrint / QuickAccess 经 getSharedPrinter() 共享
+
+共享实例关系：
+  ├── Menu (common/menu.ts)               — 由 App 创建并注入各 Canvas 画布，右键菜单全局共用一份
+  └── SheetParser (utils/parser/sheetParser.ts) — 无状态类，尚未接入主流程
 ```
 
-***
+---
 
 ## 7. 数据流与事件驱动
 
 项目采用 **事件驱动的单向数据流** 模式：
 
 ```
-用户交互 → DataCollection 属性变更 → emit(DataEvents) → App.setupDataListeners() → Sheets.draw()
+用户交互 → DataCollection 属性变更 → emit(DataEvents) → App.setupDataListeners() → Sheets.draw()（rAF 合帧）
                                               ↓
                                          syncValuesToDB()
 ```
@@ -1198,14 +1427,29 @@ EventEmitter (utils/eventEmitter.ts)
 2. **用户编辑**：修改 Cell/Char → setter 调用 `updateProperty()` → emit 事件 → App 监听 → `draw()` 重绘
 3. **值变更**：`DataCollection.values` setter → `updateProperty(VALUES_CHANGED)` → emit → `syncValuesToDB()` 持久化
 
-**结构操作流程（筛选/隐藏/排序/插入行列）：**
+**结构操作流程（筛选/隐藏/排序/插入行列/右键菜单）：**
 
 1. **入口**：组件调用 `data.runWithFullStateUndo(label, action)` 包裹结构操作
 2. **执行**：`action()` 内修改 `_values` / 行列头 / 筛选条件注册表 / `isHidden` 状态
 3. **快照**：最外层 `_fullStateUndoDepth === 0` 时捕获「变化后」全量快照推入撤销栈
-4. **回写**：撤销/重做时设置 `_isApplyingUndo = true`，抑制再次入栈
+4. **回写**：撤销/重做时设置 `_isApplyingUndo = true`，抑制再次入栈，完成后 emit `SNAPSHOT_RESTORED` 并调用 `notifyToolbarStateChange()`
 5. **筛选联动**：`Filter` 通过 `setFilterCondition` 写入注册表，重放全部列条件计算可见行
 6. **隐藏联动**：`Hidden` 与右键菜单的实质隐藏/取消隐藏共用 `setRowsHidden` / `setColsHidden` 统一入口
+
+**右键菜单操作流程：**
+
+1. 画布 `contextmenu` 事件 → `setupContextMenu()` 阻止默认行为并打开共享 `Menu`
+2. `resolveContextMenuCell(x, y)` 解析目标（行头/列头画布重写为强制命中表头分支）
+3. 菜单项点击 → `handleContextMenuAction(todo)` 按 `getSelectedColsAndRows()` 取范围分发
+4. 数据变更以 `runWithFullStateUndo` 包裹 → 事件链并发触发多次 `draw()` → **rAF 合帧为一次重绘**
+5. `refreshAfterContextMenu()` 收尾：重绘 + 工具栏状态同步
+
+**数字格式渲染流程：**
+
+1. `setCellsNumberFormat(...)` 写入 `cell.numberFormat`，emit `NUMBER_FORMAT_CHANGED`
+2. 绘制时 `Canvas` 读取 `cell.numberFormat` → `getCellDisplayText(rawText, numberFormat)`
+3. 判定链路：无格式 → 日期码 → 非数字 → 数值格式化
+4. 「设置单元格格式」对话框中，`buildFormatCode()` 实时合成格式码并用固定示例值 `2026-10-10 14:30:45` 预览
 
 **打印数据流：**
 
@@ -1216,7 +1460,7 @@ EventEmitter (utils/eventEmitter.ts)
 5. 自动注入主文档收集的 `@font-face` 规则
 6. 设置变更后预览面板即时重绘
 
-***
+---
 
 ## 8. 数据持久化 (IndexedDB)
 
@@ -1246,17 +1490,20 @@ EventEmitter (utils/eventEmitter.ts)
 | `getAllValues()`             | 获取所有工作表数据         |
 | `deleteValue(sheetName)`     | 删除工作表数据           |
 
-***
+---
 
 ## 9. 依赖关系
 
 ### 外部依赖
 
-| 依赖              | 用途            | 类型            |
-| --------------- | ------------- | ------------- |
-| `murmurhash-js` | 工具栏标签 ID 哈希生成 | devDependency |
+| 依赖               | 用途                    | 类型            |
+| ---------------- | --------------------- | ------------- |
+| `jszip`          | xlsx 解包（ZIP → 内部 XML） | dependency    |
+| `xlsx-js-style`  | xls BIFF 解析（带样式）      | dependency    |
+| `murmurhash-js`  | 工具栏标签 ID 哈希生成         | devDependency |
+| `@popperjs/core` | 菜单/弹层定位               | devDependency |
 
-> 项目设计理念为尽量不使用第三方库，`murmurhash-js` 是唯一的外部运行时依赖。
+> 项目设计理念为尽量不使用第三方库。`jszip` 与 `xlsx-js-style` 仅服务于 `SheetParser`（Excel 文件解析），不参与表格核心渲染链路。
 
 ### 内部模块依赖图
 
@@ -1264,7 +1511,7 @@ EventEmitter (utils/eventEmitter.ts)
 index.ts
   └── App
         ├── Split ← dom, EventEmitter, IndexDB
-        ├── Menu ← dom, EventEmitter
+        ├── Menu ← dom, EventEmitter          // 全局共享实例，注入各 Canvas
         ├── Toolbar ← dom, EventEmitter, DataCollection, Menu, murmurhash-js
         │   ├── QuickAccess ← dom, DataCollection, Menu, Button, Printer (getSharedPrinter)
         │   ├── SectionBrush ← dom, DataCollection, Menu, Button
@@ -1273,10 +1520,11 @@ index.ts
         │   ├── SectionProcess ← dom, DataCollection, Menu, Button, MatrixSorter
         │   └── SectionPrint ← dom, DataCollection, Menu, Button, Printer (getSharedPrinter)
         ├── Sheets ← dom, EventEmitter, debounce, DataCollection
-        │   ├── SheetCanvas ← Canvas ← DataCollection, CellContent, EventEmitter
+        │   ├── SheetCanvas ← Canvas ← DataCollection, CellContent, EventEmitter,
+        │   │                  Menu, MenuContent, Dialog, dom, numberFormat
         │   │   └── (创建) Filter ← dom, Navigator, Menu, DataCollection, matrixSorter(compareMixedText)
-        │   ├── ColHeaderCanvas ← Canvas ← Hidden
-        │   ├── RowHeaderCanvas ← Canvas ← Hidden
+        │   ├── ColHeaderCanvas ← Canvas ← Hidden（重写 resolveContextMenuCell）
+        │   ├── RowHeaderCanvas ← Canvas ← Hidden（重写 resolveContextMenuCell）
         │   ├── EditCanvas ← Canvas
         │   └── AllSelect ← dom, DataCollection, EventEmitter
         ├── Scroller ← dom, EventEmitter, debounce, DataCollection
@@ -1289,6 +1537,8 @@ Cell ← EventEmitter, Char
 Char ← EventEmitter
 MatrixSorter ← Cell, DataCollection
 Printer ← DataCollection, fontsLoader(getRegisteredFontFaceCss), DEFAULT_FONT_FAMILY
+SheetParser ← Cell, Char, header(ColHeader/RowHeader), constant, JSZip, xlsx-js-style
+              （独立分支，暂未被主链路引用）
 IndexDB ← 原生 IDB API
 ```
 
@@ -1296,14 +1546,13 @@ IndexDB ← 原生 IDB API
 
 `Cell` 类与 `Char` 类存在组合关系（Cell 包含 `Char[]`），但无循环引用。`DataCollection` 持有所有数据类的实例作为属性。`Filter` 与 `MatrixSorter` 通过模块级函数 `compareMixedText` 解耦，未形成类级循环依赖。
 
-***
+---
 
 ## 10. 项目运行方式
 
 ### 环境要求
 
 - Node.js（建议 16+）
-
 - npm
 
 ### 安装依赖
@@ -1329,11 +1578,8 @@ npm run build
 输出到 `dist/` 目录，包含：
 
 - `index.html` — 入口页面
-
 - `main.[hash].js` — 打包后的 JS
-
 - `main.[contenthash].css` — 提取的 CSS
-
 - `assets/` — 字体、图片等静态资源
 
 ### 应用初始化流程
@@ -1354,7 +1600,7 @@ const app = new App("#worktop");
 8. `setupDataListeners()` — 注册数据事件监听
 9. `initNavigator()` — 创建导航面板（最后初始化）
 
-***
+---
 
 ## 附录：工程约束与注意事项
 
@@ -1376,4 +1622,10 @@ const app = new App("#worktop");
 16. **Hidden 组件显隐**：必须使用 `display: flex` 而非 `display: block`，否则双三角伪元素垂直堆叠错行
 17. **MatrixSorter 类型判定**：数字优先于时间（如 `20240101` 是数字而非日期），混合内容以首字符类型为准
 18. **MatrixSorter 合并一致性**：内容单元格的 (colspan, rowspan) 必须与主单元格一致，否则中止排序并提示
-
+19. **绘制合帧**：`Sheets.draw()` 返回共享 Promise，同帧多次调用只绘制一次；`_drawPromise` 必须在 `finally` 中清空，否则异常路径会卡死后续重绘
+20. **右键菜单共享实例**：`Menu` 由 App 创建并注入各 Canvas，画布间共用同一份；子菜单容器必须 append 到 `document.body` 并内联覆盖 `.menu` 的 `opacity/visibility/transition`，否则被裁剪或延迟显示
+21. **子菜单 hover 间隙**：子菜单定位需与父项重叠 1px + `mouseleave` 延迟 120ms 关闭，并通过 `menu.on('close')` 兜底清理，防止误关或残留
+22. **长按步进**：`pointerdown` 中必须 `preventDefault()` 阻止焦点转移与文本选择；连发监听 `window` 的 `pointerup`/`pointercancel` 才能在指针移出时停止
+23. **numberFormat 与 reset**：`Cell.reset()` 只清内容与即用样式，必须保留 `numberFormat`（属格式配置），否则格式刷/清除内容会意外丢失数字格式
+24. **numberFormat 渲染**：非数字文本不受格式码影响；`m`/`mm` 必须经 `isMinuteContext` 消解月/分歧义；Excel 序列号转 Date 须以 UTC 分量构造本地 Date，避免时区漂移
+25. **SheetParser 坐标映射**：Excel 0-based → 项目 1-based；xls 样式支持有限且无法提取图片，需在调用侧降级处理
