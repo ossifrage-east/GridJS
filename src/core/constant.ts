@@ -37,6 +37,17 @@ export const TOOLBAR_CLASS_NAME = {
     SECTION_LINE: 'toolbar-section-line',
 }
 export const NAV_PANEL: string[] = ['文件', '工具', '脚本']
+/**
+ * 各导航项「内容区」的初始化宽度（像素）
+ *
+ * 未在此声明的导航项，初始化宽度为「容器宽度平分」。
+ * 用户人工拖拽后的宽度会以 `nav-content-width:<导航项文本>` 为键存入
+ * IndexedDB，刷新或点击切换到该导航项时优先读取已保存值。
+ */
+export const NAV_CONTENT_WIDTH: Record<string, number> = {
+    '文件': 360,
+    '工具': 360,
+};
 export const TOOLBAR_TABS = {
     START:'开始',
     INSERT:'插入',
@@ -105,6 +116,7 @@ export const FILE_TREE_CLASS_NAMES = {   // 定义文件树（「文件」导航
     SEARCH_INPUT: 'file-tree-search-input',
     ACTIONS: 'file-tree-actions',
     BUTTON: 'file-tree-button',
+    ROOT_ACTIONS: 'file-tree-root-actions',
     BODY: 'file-tree-body',
     EMPTY: 'file-tree-empty',
     NODE: 'file-tree-node',
@@ -112,6 +124,7 @@ export const FILE_TREE_CLASS_NAMES = {   // 定义文件树（「文件」导航
     TOGGLE: 'file-tree-toggle',
     ICON: 'file-tree-icon',
     LABEL: 'file-tree-label',
+    RENAME_INPUT: 'file-tree-rename-input',
     CHILDREN: 'file-tree-children',
     OPEN: 'is-open',
     SELECTED: 'is-selected',

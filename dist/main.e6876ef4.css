@@ -15,7 +15,7 @@
   src:  url(assets/626041596f.eot?zbrbpb#iefix) format('embedded-opentype'),
     url(assets/9db920c9a3.ttf?zbrbpb) format('truetype'),
     url(assets/d1cb4d386b.woff?zbrbpb) format('woff'),
-    url(assets/e56c7ffe50.svg?zbrbpb#gridjs) format('svg');
+    url(assets/459f15dab3.svg?zbrbpb#gridjs) format('svg');
   font-weight: normal;
   font-style: normal;
   font-display: block;
@@ -363,7 +363,10 @@
 .icon-locate:before,
 .icon-folder:before,
 .icon-folder-open:before,
-.icon-file:before {
+.icon-file:before,
+.icon-new-file:before,
+.icon-new-folder:before,
+.icon-open:before {
   content: '';
   display: block;
   width: 15px;
@@ -401,6 +404,21 @@
 /* 文件：带折角的纸张 */
 .icon-file:before {
   background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 15 15%27%3E%3Cpath d=%27M3.5 1.8 h5.1 l3 3 V13.2 H3.5 Z%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linejoin=%27round%27/%3E%3Cpath d=%27M8.6 1.8 V4.8 H11.6%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linejoin=%27round%27/%3E%3C/svg%3E");
+}
+
+/* 新建文件：纸张 + 右下角加号 */
+.icon-new-file:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 15 15%27%3E%3Cpath d=%27M2.6 1.6 h4.7 l2.9 2.9 v3.4%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linejoin=%27round%27/%3E%3Cpath d=%27M7.3 1.6 V4.5 h2.9%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linejoin=%27round%27/%3E%3Cpath d=%27M2.6 1.6 v11.8 h4.4%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linejoin=%27round%27/%3E%3Cpath d=%27M11.2 8.9 v4.4 M9 11.1 h4.4%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.3%27 stroke-linecap=%27round%27/%3E%3C/svg%3E");
+}
+
+/* 新建文件夹：文件夹 + 右下角加号 */
+.icon-new-folder:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 15 15%27%3E%3Cpath d=%27M1.5 12.4 V3.3 h3.1 l1.1 1.2 h4.5 v2.3%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linejoin=%27round%27/%3E%3Cpath d=%27M1.5 12.4 h4.6%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linecap=%27round%27/%3E%3Cpath d=%27M11.2 8.9 v4.4 M9 11.1 h4.4%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.3%27 stroke-linecap=%27round%27/%3E%3C/svg%3E");
+}
+
+/* 打开：文件夹 + 向上箭头（表示打开入口） */
+.icon-open:before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 15 15%27%3E%3Cpath d=%27M1.5 13.4 V8.1 h3.1 l1.1 1.2 h4.5 v4.1%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linejoin=%27round%27/%3E%3Cpath d=%27M1.5 13.4 h4.6%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.2%27 stroke-linecap=%27round%27/%3E%3Cpath d=%27M11.3 1.6 v4.2 M9.2 3.7 L11.3 1.6 L13.4 3.7%27 fill=%27none%27 stroke=%27%23444444%27 stroke-width=%271.3%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27/%3E%3C/svg%3E");
 }
 
 
@@ -657,341 +675,6 @@ html, body {
     opacity: 1;
   }
 }
-/*!*********************************************************************************************************************************************************************************************!*\
-  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/fileTree.scss ***!
-  \*********************************************************************************************************************************************************************************************/
-@charset "UTF-8";
-/*  # 文件树（「文件」导航页）的 SCSS 文件
-    # author: 东方鹗
-    # B站: https://space.bilibili.com/194359739
-    # 知乎: https://www.zhihu.com/people/eastossifrage
-    # CSDN: https://blog.csdn.net/os373
-*/
-.file-tree {
-  display: -webkit-box;
-  display: -webkit-flex;
-  display: -ms-flexbox;
-  display: flex;
-  -webkit-box-orient: vertical;
-  -webkit-box-direction: normal;
-  -webkit-flex-direction: column;
-      -ms-flex-direction: column;
-          flex-direction: column;
-  box-sizing: border-box;
-  width: 100%;
-  height: 100%;
-  padding: 8px;
-  overflow: hidden;
-  background-color: #fff;
-  font-size: 14px;
-  color: #212529;
-}
-
-/* —— 顶部一行：搜索栏 + 展开 / 收缩 / 定位 按钮 —— */
-.file-tree-toolbar {
-  display: -webkit-box;
-  display: -webkit-flex;
-  display: -ms-flexbox;
-  display: flex;
-  -webkit-box-orient: horizontal;
-  -webkit-box-direction: normal;
-  -webkit-flex-direction: row;
-      -ms-flex-direction: row;
-          flex-direction: row;
-  -webkit-box-align: center;
-  -webkit-align-items: center;
-      -ms-flex-align: center;
-          align-items: center;
-  -webkit-box-flex: 0;
-  -webkit-flex: none;
-      -ms-flex: none;
-          flex: none;
-  gap: 6px;
-  padding-bottom: 6px;
-  border-bottom: 1px solid #e9ecef;
-}
-
-.file-tree-search {
-  display: -webkit-box;
-  display: -webkit-flex;
-  display: -ms-flexbox;
-  display: flex;
-  -webkit-box-orient: horizontal;
-  -webkit-box-direction: normal;
-  -webkit-flex-direction: row;
-      -ms-flex-direction: row;
-          flex-direction: row;
-  -webkit-box-align: center;
-  -webkit-align-items: center;
-      -ms-flex-align: center;
-          align-items: center;
-  -webkit-box-flex: 1;
-  -webkit-flex: 1 1 auto;
-      -ms-flex: 1 1 auto;
-          flex: 1 1 auto;
-  min-width: 0;
-  height: 26px;
-  box-sizing: border-box;
-  padding: 0 6px;
-  border: 1px solid #ced4da;
-  border-radius: 4px;
-  background-color: #fff;
-  -webkit-transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
-  transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
-}
-.file-tree-search:hover {
-  border-color: #adb5bd;
-}
-.file-tree-search:focus-within {
-  border-color: #4CAF50;
-  box-shadow: 0 0 0 0.15rem rgba(76, 170, 80, 0.25);
-}
-.file-tree-search {
-  /* 放大镜：沿用 icon.css 中已定义的字体图标 */
-}
-.file-tree-search i.icon-search {
-  -webkit-box-flex: 0;
-  -webkit-flex: none;
-      -ms-flex: none;
-          flex: none;
-  margin-right: 4px;
-  color: #adb5bd;
-  font-size: 14px;
-}
-
-.file-tree-search-input {
-  -webkit-box-flex: 1;
-  -webkit-flex: 1 1 auto;
-      -ms-flex: 1 1 auto;
-          flex: 1 1 auto;
-  min-width: 0;
-  height: 100%;
-  padding: 0;
-  border: none;
-  outline: none;
-  background: transparent;
-  font-family: inherit;
-  font-size: 14px;
-  color: #212529;
-}
-.file-tree-search-input::-webkit-input-placeholder {
-  color: #adb5bd;
-}
-.file-tree-search-input:-ms-input-placeholder {
-  color: #adb5bd;
-}
-.file-tree-search-input::placeholder {
-  color: #adb5bd;
-}
-
-.file-tree-actions {
-  display: -webkit-box;
-  display: -webkit-flex;
-  display: -ms-flexbox;
-  display: flex;
-  -webkit-box-orient: horizontal;
-  -webkit-box-direction: normal;
-  -webkit-flex-direction: row;
-      -ms-flex-direction: row;
-          flex-direction: row;
-  -webkit-box-align: center;
-  -webkit-align-items: center;
-      -ms-flex-align: center;
-          align-items: center;
-  -webkit-box-flex: 0;
-  -webkit-flex: none;
-      -ms-flex: none;
-          flex: none;
-  gap: 2px;
-}
-
-/* 按钮内只放图标：图标来自 icon.css（字体图标 + 内联 SVG） */
-.file-tree-button {
-  display: -webkit-box;
-  display: -webkit-flex;
-  display: -ms-flexbox;
-  display: flex;
-  -webkit-box-align: center;
-  -webkit-align-items: center;
-      -ms-flex-align: center;
-          align-items: center;
-  -webkit-box-pack: center;
-  -webkit-justify-content: center;
-      -ms-flex-pack: center;
-          justify-content: center;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border: 1px solid transparent;
-  border-radius: 4px;
-  background: transparent;
-  cursor: pointer;
-  outline: none;
-}
-.file-tree-button i {
-  display: block;
-  width: 15px;
-  height: 15px;
-}
-.file-tree-button:hover {
-  border-color: rgba(0, 0, 0, 0.06);
-  background-color: rgba(0, 0, 0, 0.08);
-}
-.file-tree-button:active {
-  background-color: rgba(0, 0, 0, 0.16);
-}
-
-/* —— 树主体 —— */
-.file-tree-body {
-  -webkit-box-flex: 1;
-  -webkit-flex: 1 1 auto;
-      -ms-flex: 1 1 auto;
-          flex: 1 1 auto;
-  overflow: auto;
-  padding-top: 6px;
-}
-
-.file-tree-empty {
-  padding: 12px 4px;
-  color: #adb5bd;
-  font-size: 12px;
-  text-align: center;
-}
-
-.file-tree-row {
-  display: -webkit-box;
-  display: -webkit-flex;
-  display: -ms-flexbox;
-  display: flex;
-  -webkit-box-orient: horizontal;
-  -webkit-box-direction: normal;
-  -webkit-flex-direction: row;
-      -ms-flex-direction: row;
-          flex-direction: row;
-  -webkit-box-align: center;
-  -webkit-align-items: center;
-      -ms-flex-align: center;
-          align-items: center;
-  height: 24px;
-  border-radius: 3px;
-  cursor: pointer;
-  color: #212529;
-}
-.file-tree-row:hover {
-  background-color: rgba(0, 0, 0, 0.05);
-}
-.file-tree-row.is-selected {
-  background-color: rgba(76, 170, 80, 0.16);
-}
-.file-tree-row.is-located {
-  -webkit-animation: fileTreeLocate 0.9s ease-out 1;
-          animation: fileTreeLocate 0.9s ease-out 1;
-}
-
-@-webkit-keyframes fileTreeLocate {
-  0% {
-    box-shadow: inset 0 0 0 1px #4CAF50;
-    background-color: rgba(76, 170, 80, 0.35);
-  }
-  100% {
-    box-shadow: inset 0 0 0 1px transparent;
-    background-color: transparent;
-  }
-}
-
-@keyframes fileTreeLocate {
-  0% {
-    box-shadow: inset 0 0 0 1px #4CAF50;
-    background-color: rgba(76, 170, 80, 0.35);
-  }
-  100% {
-    box-shadow: inset 0 0 0 1px transparent;
-    background-color: transparent;
-  }
-}
-/* 展开箭头：收起时旋转 -90°，文件用等宽占位保证同层图标对齐 */
-.file-tree-toggle {
-  display: -webkit-box;
-  display: -webkit-flex;
-  display: -ms-flexbox;
-  display: flex;
-  -webkit-box-align: center;
-  -webkit-align-items: center;
-      -ms-flex-align: center;
-          align-items: center;
-  -webkit-box-pack: center;
-  -webkit-justify-content: center;
-      -ms-flex-pack: center;
-          justify-content: center;
-  -webkit-box-flex: 0;
-  -webkit-flex: none;
-      -ms-flex: none;
-          flex: none;
-  width: 14px;
-  height: 14px;
-  color: #6c757d;
-  font-size: 12px;
-}
-.file-tree-toggle i {
-  display: block;
-  -webkit-transform: rotate(-90deg);
-          transform: rotate(-90deg);
-  -webkit-transition: -webkit-transform 0.15s ease;
-  transition: -webkit-transform 0.15s ease;
-  transition: transform 0.15s ease;
-  transition: transform 0.15s ease, -webkit-transform 0.15s ease;
-}
-
-.file-tree-row.is-open .file-tree-toggle i {
-  -webkit-transform: rotate(0deg);
-          transform: rotate(0deg);
-}
-
-.file-tree-icon {
-  display: -webkit-box;
-  display: -webkit-flex;
-  display: -ms-flexbox;
-  display: flex;
-  -webkit-box-align: center;
-  -webkit-align-items: center;
-      -ms-flex-align: center;
-          align-items: center;
-  -webkit-box-pack: center;
-  -webkit-justify-content: center;
-      -ms-flex-pack: center;
-          justify-content: center;
-  -webkit-box-flex: 0;
-  -webkit-flex: none;
-      -ms-flex: none;
-          flex: none;
-  width: 16px;
-  height: 16px;
-  margin: 0 4px 0 2px;
-}
-.file-tree-icon i {
-  display: block;
-  width: 15px;
-  height: 15px;
-}
-
-.file-tree-label {
-  -webkit-box-flex: 1;
-  -webkit-flex: 1 1 auto;
-      -ms-flex: 1 1 auto;
-          flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-/* 以 hidden 属性控制显隐的元素显式隐藏：
-   避免被组件内其它 display 规则覆盖（如 flex 布局） */
-.file-tree-node[hidden],
-.file-tree-children[hidden],
-.file-tree-empty[hidden] {
-  display: none;
-}
 /*!*****************************************************************************************************************************************************************************************!*\
   !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/menu.scss ***!
   \*****************************************************************************************************************************************************************************************/
@@ -1196,6 +879,456 @@ html, body {
 }
 .menu-count-stepper .menu-count-btns button:active {
   background: #dee2e6;
+}
+/*!*********************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/fileTree.scss ***!
+  \*********************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # 文件树（「文件」导航页）的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+.file-tree {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: vertical;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: column;
+      -ms-flex-direction: column;
+          flex-direction: column;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  /* 底/右不设内边距：让树主体（滚动容器）一直延伸到面板边缘，
+     横向滚动条才会紧贴内容区最下方、竖向滚动条紧贴最右侧。
+     若保留底部内边距，滚动条会与面板底边之间留出一道空隙。 */
+  padding: 8px 0 0 8px;
+  overflow: hidden;
+  background-color: #fff;
+  font-size: 14px;
+  color: #212529;
+}
+
+/* —— 顶部一行：搜索栏 + 展开 / 收缩 / 定位 按钮 —— */
+.file-tree-toolbar {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: horizontal;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: row;
+      -ms-flex-direction: row;
+          flex-direction: row;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  gap: 6px;
+  /* 右侧补回面板内边距，避免按钮紧贴竖向滚动条 */
+  padding: 0 8px 6px 0;
+  border-bottom: 1px solid #e9ecef;
+}
+
+.file-tree-search {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: horizontal;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: row;
+      -ms-flex-direction: row;
+          flex-direction: row;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  min-width: 0;
+  height: 26px;
+  box-sizing: border-box;
+  padding: 0 6px;
+  border: 1px solid #ced4da;
+  border-radius: 4px;
+  background-color: #fff;
+  -webkit-transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+  transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+}
+.file-tree-search:hover {
+  border-color: #adb5bd;
+}
+.file-tree-search:focus-within {
+  border-color: #4CAF50;
+  box-shadow: 0 0 0 0.15rem rgba(76, 170, 80, 0.25);
+}
+.file-tree-search {
+  /* 放大镜：沿用 icon.css 中已定义的字体图标 */
+}
+.file-tree-search i.icon-search {
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  margin-right: 4px;
+  color: #adb5bd;
+  font-size: 14px;
+}
+
+.file-tree-search-input {
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-family: inherit;
+  font-size: 14px;
+  color: #212529;
+}
+.file-tree-search-input::-webkit-input-placeholder {
+  color: #adb5bd;
+}
+.file-tree-search-input:-ms-input-placeholder {
+  color: #adb5bd;
+}
+.file-tree-search-input::placeholder {
+  color: #adb5bd;
+}
+
+.file-tree-actions {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: horizontal;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: row;
+      -ms-flex-direction: row;
+          flex-direction: row;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  gap: 2px;
+}
+
+/* 按钮内只放图标：图标来自 icon.css（字体图标 + 内联 SVG） */
+.file-tree-button {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  outline: none;
+}
+.file-tree-button i {
+  display: block;
+  width: 15px;
+  height: 15px;
+}
+.file-tree-button:hover {
+  border-color: rgba(0, 0, 0, 0.06);
+  background-color: rgba(0, 0, 0, 0.08);
+}
+.file-tree-button:active {
+  background-color: rgba(0, 0, 0, 0.16);
+}
+
+/* —— 树主体 —— */
+.file-tree-body {
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  box-sizing: border-box;
+  /* auto 而非 scroll：内容宽/高未超出区域时完全不出现滚动条；
+     溢出时横向条落在内容区最下方、竖向条落在最右侧 */
+  overflow: auto;
+  padding-top: 6px;
+  -ms-scroll-chaining: none;
+      overscroll-behavior: contain;
+}
+
+/* 滚动条：细窄样式，与整体配色一致（仅在溢出时出现） */
+.file-tree-body::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.file-tree-body::-webkit-scrollbar-track {
+  background-color: transparent;
+  border-radius: 4px;
+}
+
+.file-tree-body::-webkit-scrollbar-thumb {
+  background-color: #ced4da;
+  border-radius: 4px;
+}
+.file-tree-body::-webkit-scrollbar-thumb:hover {
+  background-color: #adb5bd;
+}
+
+.file-tree-body::-webkit-scrollbar-thumb:horizontal {
+  /* 横向条保持可见高度，避免与竖向条交汇处出现难以拖取的细角 */
+  min-height: 8px;
+}
+
+.file-tree-body::-webkit-scrollbar-corner {
+  background-color: transparent;
+}
+
+.file-tree-empty {
+  padding: 12px 4px;
+  color: #adb5bd;
+  font-size: 12px;
+  text-align: center;
+}
+
+.file-tree-row {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: horizontal;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: row;
+      -ms-flex-direction: row;
+          flex-direction: row;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  height: 24px;
+  /* 不收缩到容器宽度以下：文件名过长时内容超出区域宽度，触发横向滚动条 */
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  width: -webkit-max-content;
+  width: max-content;
+  min-width: 100%;
+  border-radius: 3px;
+  cursor: pointer;
+  color: #212529;
+}
+.file-tree-row:hover {
+  background-color: rgba(0, 0, 0, 0.05);
+}
+.file-tree-row.is-selected {
+  background-color: rgba(76, 170, 80, 0.16);
+}
+.file-tree-row.is-located {
+  -webkit-animation: fileTreeLocate 0.9s ease-out 1;
+          animation: fileTreeLocate 0.9s ease-out 1;
+}
+
+@-webkit-keyframes fileTreeLocate {
+  0% {
+    box-shadow: inset 0 0 0 1px #4CAF50;
+    background-color: rgba(76, 170, 80, 0.35);
+  }
+  100% {
+    box-shadow: inset 0 0 0 1px transparent;
+    background-color: transparent;
+  }
+}
+
+@keyframes fileTreeLocate {
+  0% {
+    box-shadow: inset 0 0 0 1px #4CAF50;
+    background-color: rgba(76, 170, 80, 0.35);
+  }
+  100% {
+    box-shadow: inset 0 0 0 1px transparent;
+    background-color: transparent;
+  }
+}
+/* 展开箭头：收起时旋转 -90°，文件用等宽占位保证同层图标对齐 */
+.file-tree-toggle {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  width: 14px;
+  height: 14px;
+  color: #6c757d;
+  font-size: 12px;
+}
+.file-tree-toggle i {
+  display: block;
+  -webkit-transform: rotate(-90deg);
+          transform: rotate(-90deg);
+  -webkit-transition: -webkit-transform 0.15s ease;
+  transition: -webkit-transform 0.15s ease;
+  transition: transform 0.15s ease;
+  transition: transform 0.15s ease, -webkit-transform 0.15s ease;
+}
+
+.file-tree-row.is-open .file-tree-toggle i {
+  -webkit-transform: rotate(0deg);
+          transform: rotate(0deg);
+}
+
+.file-tree-icon {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 0 4px 0 2px;
+}
+.file-tree-icon i {
+  display: block;
+  width: 15px;
+  height: 15px;
+}
+
+.file-tree-label {
+  /* 不随容器收缩：与行一起按内容撑开，触发横向滚动条 */
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  white-space: nowrap;
+}
+
+/* 重命名输入框：与标签同字号、占位一致，避免重命名时行宽突变 */
+.file-tree-rename-input {
+  -webkit-box-flex: 0;
+  -webkit-flex: none;
+      -ms-flex: none;
+          flex: none;
+  min-width: 60px;
+  padding: 0 2px;
+  border: 1px solid #4CAF50;
+  border-radius: 2px;
+  outline: none;
+  background: #fff;
+  font-family: inherit;
+  font-size: 14px;
+  color: #212529;
+  line-height: 20px;
+}
+
+/* 以 hidden 属性控制显隐的元素显式隐藏：
+   避免被组件内其它 display 规则覆盖（如 flex 布局） */
+.file-tree-node[hidden],
+.file-tree-children[hidden],
+.file-tree-empty[hidden] {
+  display: none;
+}
+/*!***********************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/fileOpener.scss ***!
+  \***********************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # 文件打开器（拖放提示层）的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+/* 隐藏的文件选择输入框：仅由 pickAndOpen() 触发点击 */
+.file-opener-input {
+  display: none;
+}
+
+/* 拖放提示层：覆盖整个拖放目标，拖入文件时浮现「释放以打开文件」 */
+.file-drop-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  box-sizing: border-box;
+  /* 半透明遮罩 + 虚线边框，明确指示可放置区域 */
+  background-color: rgba(76, 170, 80, 0.08);
+  border: 2px dashed #4CAF50;
+  border-radius: 4px;
+  pointer-events: none; /* 不拦截 drop 事件，保证拖放目标仍能收到 drop */
+  -webkit-user-select: none;
+      -ms-user-select: none;
+          user-select: none;
+  /* 以 hidden 属性控制显隐：显式覆盖 display:flex，防止被 flex 布局规则覆盖 */
+}
+.file-drop-hint[hidden] {
+  display: none;
+}
+.file-drop-hint span {
+  padding: 8px 20px;
+  border-radius: 4px;
+  background-color: rgba(76, 170, 80, 0.9);
+  color: #fff;
+  font-size: 14px;
+  line-height: 1.4;
 }
 /*!*******************************************************************************************************************************************************************************************!*\
   !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/hidden.scss ***!
@@ -2085,6 +2218,80 @@ div {
 }
 #fontSize .toolbar-select-icon {
   width: 16px;
+}
+/*!*******************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/slider.scss ***!
+  \*******************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # 通用滑块组件的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+/* 组件根容器：轨道 + 数值输入框 + 单位文本横向排列并垂直居中 */
+.slider {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: horizontal;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: row;
+      -ms-flex-direction: row;
+          flex-direction: row;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  gap: 0.5rem;
+}
+
+/* 滑动轨道：指针手势由组件 JS 自实现（保证跟手），此处仅做外观与交互态处理 */
+.slider-track {
+  accent-color: #0d6efd;
+  cursor: pointer;
+  -ms-touch-action: none;
+      touch-action: none;
+  outline: none;
+}
+.slider-track:focus, .slider-track:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+/* 数值输入框：form-control 风格（focus 蓝色焦点环），隐藏原生步进箭头 */
+.slider-input {
+  padding: 0.25rem 0.375rem;
+  font-size: 0.8125rem;
+  border: 1px solid #ced4da;
+  border-radius: 0.375rem;
+  background: #fff;
+  color: #212529;
+  text-align: right;
+  outline: none;
+  box-sizing: border-box;
+  -webkit-transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+  transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+}
+.slider-input:focus {
+  outline: none;
+  border-color: #86b7fe;
+  box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25);
+}
+.slider-input::-webkit-outer-spin-button, .slider-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.slider-input[type=number] {
+  -webkit-appearance: textfield;
+          appearance: textfield;
+}
+
+/* 单位文本：弱化展示，不抢占数值视觉权重 */
+.slider-unit {
+  font-size: 0.8125rem;
+  color: #6c757d;
 }
 /*!******************************************************************************************************************************************************************************************!*\
   !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/brand.scss ***!

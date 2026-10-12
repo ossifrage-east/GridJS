@@ -7,6 +7,7 @@
 
 import type { Cell } from "../core/dataArchitecture/cell";
 import type { DataCollection } from "../core/dataArchitecture/dataCollection";
+import { Slider, SliderChangeSource } from "../core/common/slider";
 import { getRegisteredFontFaceCss } from "./fontsLoader";
 // 默认字体与主页面 canvas 保持一致（单一数据源），保证预览/打印与主页面的字体观感相同
 import { DEFAULT_FONT_FAMILY } from "../core/constant";
@@ -259,8 +260,8 @@ export class Printer {
     private _pageRangeSelect: HTMLSelectElement | null = null;
     private _pageRangeInput: HTMLInputElement | null = null;
     private _pageRangeRow: HTMLElement | null = null;
-    private _zoomSlider: HTMLInputElement | null = null;
-    private _zoomInput: HTMLInputElement | null = null;
+    /** 页脚预览缩放滑块组件（common/slider 共用组件：轨道 + 百分比输入框 + 单位） */
+    private _zoomSlider: Slider | null = null;
     /** 预览缩放手动覆盖值（百分比，10-400；null=自动按可用高度适配） */
     private _previewZoomPercent: number | null = null;
 
@@ -579,17 +580,8 @@ export class Printer {
                 .gs-print-btn[data-gs-print-action="print"]:active { background: #0a58ca; border-color: #0a58ca; color: #fff; }
                 .gs-print-footer { flex: none; display: flex; align-items: center; justify-content: center; gap: 0.75rem; padding: 0.75rem 1rem; background: #f8f9fa; border-top: 1px solid #dee2e6; position: relative; }
                 .gs-print-indicator { font-size: 0.875rem; color: #212529; min-width: 110px; text-align: center; }
-                /* 预览缩放控件：固定于页脚右侧（页码居中不受影响），滑块 + 百分比输入框 */
+                /* 预览缩放控件容器：固定于页脚右侧（页码居中不受影响）；内部滑块由 common/slider 提供样式 */
                 .gs-print-footer-zoom { position: absolute; right: 1rem; top: 50%; transform: translateY(-50%); display: flex; align-items: center; gap: 0.5rem; }
-                .gs-print-zoom-slider { width: 120px; accent-color: #0d6efd; cursor: pointer; touch-action: none; outline: none; }
-                .gs-print-zoom-slider:focus,
-                .gs-print-zoom-slider:focus-visible { outline: none; box-shadow: none; }
-                .gs-print-zoom-input { width: 3.5rem; padding: 0.25rem 0.375rem; font-size: 0.8125rem; border: 1px solid #ced4da; border-radius: 0.375rem; background: #fff; color: #212529; text-align: right; outline: none; box-sizing: border-box; transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out; }
-                .gs-print-zoom-input:focus { outline: none; border-color: #86b7fe; box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25); }
-                .gs-print-zoom-input::-webkit-outer-spin-button,
-                .gs-print-zoom-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
-                .gs-print-zoom-input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
-                .gs-print-zoom-unit { font-size: 0.8125rem; color: #6c757d; }
                 /* 翻页按钮 = .btn-outline-secondary 风格 */
                 .gs-print-nav-btn { padding: 0.25rem 0.75rem; font-size: 0.875rem; border: 1px solid #6c757d; border-radius: 0.375rem; background: #fff; color: #6c757d; cursor: pointer; transition: color 0.15s ease-in-out, background 0.15s ease-in-out, border-color 0.15s ease-in-out; }
                 .gs-print-nav-btn:hover:not(:disabled) { background: #6c757d; border-color: #6c757d; color: #fff; }
@@ -611,11 +603,7 @@ export class Printer {
                         <button class="gs-print-nav-btn" data-gs-print-nav="prev">&lt;</button>
                         <span class="gs-print-indicator"></span>
                         <button class="gs-print-nav-btn" data-gs-print-nav="next">&gt;</button>
-                        <div class="gs-print-footer-zoom">
-                            <input type="range" class="gs-print-zoom-slider" min="10" max="400" step="1" data-gs-print-role="zoom-slider">
-                            <input type="number" class="gs-print-zoom-input" min="10" max="400" step="1" data-gs-print-role="zoom-input">
-                            <span class="gs-print-zoom-unit">%</span>
-                        </div>
+                        <div class="gs-print-footer-zoom" data-gs-print-role="zoom"></div>
                     </div>
                 </div>
                 <div class="gs-print-panel">
@@ -917,66 +905,24 @@ export class Printer {
         this.pageIndicator = overlay.querySelector<HTMLElement>('.gs-print-indicator');
         this.prevBtn = overlay.querySelector<HTMLButtonElement>('[data-gs-print-nav="prev"]');
         this.nextBtn = overlay.querySelector<HTMLButtonElement>('[data-gs-print-nav="next"]');
-        // 预览缩放：页脚滑块 + 百分比输入框（10-400），覆盖自动适配（null=自动按可用高度适配）
-        const zoomSlider = overlay.querySelector<HTMLInputElement>('[data-gs-print-role="zoom-slider"]');
-        const zoomInput = overlay.querySelector<HTMLInputElement>('[data-gs-print-role="zoom-input"]');
-        this._zoomSlider = zoomSlider;
-        this._zoomInput = zoomInput;
-        if (zoomSlider) {
-            // 拖动跟手保障：range 原生拖拽手势在此环境下会失效（拖动不跟手）。
-            // 统一改用指针事件自实现拖动：按下后按指针位置换算滑块值（按 step 吸附）
-            // 并派发 input 事件，复用下方监听完成缩放应用与双向同步；
-            // 键盘方向键仍走 range 原生行为
-            const applyPointer = (clientX: number) => {
-                const rect = zoomSlider.getBoundingClientRect();
-                if (rect.width <= 0) return;
-                const min = Number(zoomSlider.min) || 10;
-                const max = Number(zoomSlider.max) || 400;
-                const step = Number(zoomSlider.step) || 1;
-                const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
-                const snapped = Math.round((min + ratio * (max - min)) / step) * step;
-                zoomSlider.value = String(Math.min(max, Math.max(min, snapped)));
-                zoomSlider.dispatchEvent(new Event('input'));
-            };
-            zoomSlider.addEventListener('pointerdown', (e) => {
-                if (e.pointerType === 'mouse' && e.button !== 0) return;  // 仅响应鼠标左键
-                e.preventDefault();  // 接管拖动，避免原生手势叠加；焦点被阻止后手动恢复
-                zoomSlider.focus();
-                // 指针捕获：拖出滑块/窗口范围仍持续跟手；不支持时退化为窗口级监听
-                try { zoomSlider.setPointerCapture(e.pointerId); } catch { /* ignore */ }
-                applyPointer(e.clientX);  // 按下即跳转到点击位置（与原生轨道点击行为一致）
-                const onMove = (ev: PointerEvent) => applyPointer(ev.clientX);
-                const onUp = () => {
-                    window.removeEventListener('pointermove', onMove);
-                    window.removeEventListener('pointerup', onUp);
-                    window.removeEventListener('pointercancel', onUp);
-                };
-                window.addEventListener('pointermove', onMove);
-                window.addEventListener('pointerup', onUp);
-                window.addEventListener('pointercancel', onUp);
-            });
-            // 阻断 range 原生拖拽手势，由上方指针拖动统一接管（鼠标专有兜底）
-            zoomSlider.addEventListener('mousedown', (e) => e.preventDefault());
-            zoomSlider.addEventListener('input', () => {
-                const n = Number(zoomSlider.value);
-                if (!Number.isFinite(n)) return;
-                this._previewZoomPercent = Math.min(400, Math.max(10, n));
-                // 传 false：拖动期间不回写滑块 value，仅同步右侧数字输入框
-                this._applyPreviewZoom(false);
-                if (this._zoomInput && document.activeElement !== this._zoomInput) {
-                    this._zoomInput.value = String(this._previewZoomPercent);
-                }
-            });
-        }
-        if (zoomInput) {
-            zoomInput.addEventListener('change', () => {
-                const n = Number(zoomInput.value);
-                if (Number.isFinite(n) && n > 0) {
-                    this._previewZoomPercent = Math.min(400, Math.max(10, Math.round(n)));
-                }
-                this._applyPreviewZoom();
-            });
-        }
+        // 预览缩放：页脚共用滑块组件（common/slider：轨道 + 百分比输入框，10-400），
+        // 覆盖自动适配（null=自动按可用高度适配）；拖动中不回写轨道，避免打断原生手势
+        const zoomHost = overlay.querySelector<HTMLElement>('[data-gs-print-role="zoom"]');
+        this._zoomSlider = zoomHost ? new Slider({
+            parentElement: zoomHost,
+            min: 10,
+            max: 400,
+            step: 1,
+            unit: '%',
+            sliderWidth: '120px',
+            accentColor: '#0d6efd',
+            onChange: (value: number, source: SliderChangeSource) => {
+                this._previewZoomPercent = value;
+                // 轨道拖动中传 false：程序回写轨道 value 会打断原生拖拽手势（滑块卡住不跟手），
+                // 此时仅同步数值输入框；数值框提交则回写完整控件状态
+                this._applyPreviewZoom(source !== 'track');
+            },
+        }) : null;
         this._renderPagesInto(pagesContainer);
 
         // 事件委托：设置区打印/关闭按钮 + 底部分页导航按钮
@@ -1018,8 +964,8 @@ export class Printer {
         this._pageRangeSelect = null;
         this._pageRangeInput = null;
         this._pageRangeRow = null;
+        this._zoomSlider?.destroy();
         this._zoomSlider = null;
-        this._zoomInput = null;
         this._previewZoomPercent = null;
         this.pageDivs = [];
         this.pageIndicator = null;
@@ -1141,8 +1087,7 @@ export class Printer {
         }
         if (!syncControls) return;
         const percent = String(Math.round(zoom * 100));
-        if (this._zoomSlider) this._zoomSlider.value = percent;
-        if (this._zoomInput && document.activeElement !== this._zoomInput) this._zoomInput.value = percent;
+        this._zoomSlider?.setValue(Number(percent));
     }
 
     /**

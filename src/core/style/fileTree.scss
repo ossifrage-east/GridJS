@@ -12,7 +12,10 @@
     box-sizing: border-box;
     width: 100%;
     height: 100%;
-    padding: 8px;
+    /* 底/右不设内边距：让树主体（滚动容器）一直延伸到面板边缘，
+       横向滚动条才会紧贴内容区最下方、竖向滚动条紧贴最右侧。
+       若保留底部内边距，滚动条会与面板底边之间留出一道空隙。 */
+    padding: 8px 0 0 8px;
     overflow: hidden;
     background-color: #fff;
     font-size: 14px;
@@ -27,7 +30,8 @@
     align-items: center;
     flex: none;
     gap: 6px;
-    padding-bottom: 6px;
+    /* 右侧补回面板内边距，避免按钮紧贴竖向滚动条 */
+    padding: 0 8px 6px 0;
     border-bottom: 1px solid #e9ecef;
 }
 
@@ -122,8 +126,41 @@
 
 .file-tree-body {
     flex: 1 1 auto;
+    box-sizing: border-box;
+    /* auto 而非 scroll：内容宽/高未超出区域时完全不出现滚动条；
+       溢出时横向条落在内容区最下方、竖向条落在最右侧 */
     overflow: auto;
     padding-top: 6px;
+    overscroll-behavior: contain;
+}
+
+/* 滚动条：细窄样式，与整体配色一致（仅在溢出时出现） */
+.file-tree-body::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+.file-tree-body::-webkit-scrollbar-track {
+    background-color: transparent;
+    border-radius: 4px;
+}
+
+.file-tree-body::-webkit-scrollbar-thumb {
+    background-color: #ced4da;
+    border-radius: 4px;
+
+    &:hover {
+        background-color: #adb5bd;
+    }
+}
+
+.file-tree-body::-webkit-scrollbar-thumb:horizontal {
+    /* 横向条保持可见高度，避免与竖向条交汇处出现难以拖取的细角 */
+    min-height: 8px;
+}
+
+.file-tree-body::-webkit-scrollbar-corner {
+    background-color: transparent;
 }
 
 .file-tree-empty {
@@ -138,6 +175,10 @@
     flex-direction: row;
     align-items: center;
     height: 24px;
+    /* 不收缩到容器宽度以下：文件名过长时内容超出区域宽度，触发横向滚动条 */
+    flex: none;
+    width: max-content;
+    min-width: 100%;
     border-radius: 3px;
     cursor: pointer;
     color: #212529;
@@ -206,11 +247,24 @@
 }
 
 .file-tree-label {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: hidden;
+    /* 不随容器收缩：与行一起按内容撑开，触发横向滚动条 */
+    flex: none;
     white-space: nowrap;
-    text-overflow: ellipsis;
+}
+
+/* 重命名输入框：与标签同字号、占位一致，避免重命名时行宽突变 */
+.file-tree-rename-input {
+    flex: none;
+    min-width: 60px;
+    padding: 0 2px;
+    border: 1px solid #4CAF50;
+    border-radius: 2px;
+    outline: none;
+    background: #fff;
+    font-family: inherit;
+    font-size: 14px;
+    color: #212529;
+    line-height: 20px;
 }
 
 /* 以 hidden 属性控制显隐的元素显式隐藏：

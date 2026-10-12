@@ -1,0 +1,66 @@
+/*  # 通用滑块组件的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+
+/* 组件根容器：轨道 + 数值输入框 + 单位文本横向排列并垂直居中 */
+.slider {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+/* 滑动轨道：指针手势由组件 JS 自实现（保证跟手），此处仅做外观与交互态处理 */
+.slider-track {
+    accent-color: #0d6efd;
+    cursor: pointer;
+    touch-action: none;
+    outline: none;
+
+    &:focus,
+    &:focus-visible {
+        outline: none;
+        box-shadow: none;
+    }
+}
+
+/* 数值输入框：form-control 风格（focus 蓝色焦点环），隐藏原生步进箭头 */
+.slider-input {
+    padding: 0.25rem 0.375rem;
+    font-size: 0.8125rem;
+    border: 1px solid #ced4da;
+    border-radius: 0.375rem;
+    background: #fff;
+    color: #212529;
+    text-align: right;
+    outline: none;
+    box-sizing: border-box;
+    transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+
+    &:focus {
+        outline: none;
+        border-color: #86b7fe;
+        box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25);
+    }
+
+    &::-webkit-outer-spin-button,
+    &::-webkit-inner-spin-button {
+        -webkit-appearance: none;
+        margin: 0;
+    }
+
+    &[type="number"] {
+        -moz-appearance: textfield;
+        appearance: textfield;
+    }
+}
+
+/* 单位文本：弱化展示，不抢占数值视觉权重 */
+.slider-unit {
+    font-size: 0.8125rem;
+    color: #6c757d;
+}

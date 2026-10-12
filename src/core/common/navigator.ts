@@ -3,10 +3,25 @@ import { IndexDB } from '../dataArchitecture/indexDB';
 import '../style/nav.scss';
 
 /**
+ * Navigator 构造选项接口
+ */
+export interface NavigatorOptions {
+    /** 面板项排列方向：true=横向，false=纵向 */
+    horizontal?: boolean;
+    /**
+     * 某个导航项内容区变为可见时触发（参数为导航项文本）
+     *
+     * 用于按导航项恢复 / 初始化内容区宽度：
+     * 首次挂载恢复上次选中项、以及后续点击切换时都会回调。
+     */
+    onItemShow?: (navItemText: string) => void;
+}
+
+/**
  * Navigator 导航组件类
  * 提供面板导航功能，支持多项导航项的切换显示
  * 使用 IndexDB 持久化存储当前选中状态
- * 
+ *
  * @class Navigator
  * @example
  * const navigator = new Navigator();
@@ -28,19 +43,26 @@ export class Navigator {
     /** 面板唯一标识 */
     private panelId: string;
     private horizontal: boolean;
+    /** 内容区显示回调（按导航项恢复宽度时使用） */
+    private readonly onItemShow?: (navItemText: string) => void;
 
     /**
      * 构造函数
      * 初始化导航面板和内容区域元素
      */
-    constructor(horizontal: boolean = true) {
+    constructor(options: NavigatorOptions | boolean = true) {
+        // 兼容旧的 `new Navigator(horizontal: boolean)` 调用形式
+        const normalized: NavigatorOptions = typeof options === 'boolean'
+            ? { horizontal: options }
+            : options;
         this.panel = document.createElement('div');
         this.content = document.createElement('div');
         this.contentItemID = new Map();
         this.db = new IndexDB();
-        this.horizontal = horizontal;
-        
-        this.panel.className = NAV.PANEL;        
+        this.horizontal = normalized.horizontal ?? true;
+        this.onItemShow = normalized.onItemShow;
+
+        this.panel.className = NAV.PANEL;
         this.panelId = this.generateHashId('NAV_PANEL');
         this.panel.id = this.panelId;
         this.content.className = NAV.CONTENT;
@@ -137,9 +159,21 @@ export class Navigator {
         } else if (savedId === panelItem.dataset.targetId) {
             contentItem.hidden = false;
             panelItem.classList.add('checked');
+            // 刷新后恢复上次选中的导航项：同步恢复其内容区宽度
+            this.notifyItemShow(panelItem.textContent ?? '');
         } else {
             contentItem.hidden = true;
         }
+    }
+
+    /**
+     * 通知外部某个导航项内容区已显示（用于恢复 / 初始化其宽度）
+     * @private
+     * @param {string} navItemText - 导航项文本
+     */
+    private notifyItemShow(navItemText: string): void {
+        if (!navItemText) return;
+        this.onItemShow?.(navItemText);
     }
 
     /**
@@ -176,11 +210,13 @@ export class Navigator {
 
         if (!currentChecked) {
             this.showContent(contentItem, panelItem);
+            this.notifyItemShow(panelItem.textContent ?? '');
             await this.saveCurrentId(contentItem.id);
         } else if (panelItem !== currentChecked) {
             this.switchContent(currentChecked, panelItem, contentItem);
+            this.notifyItemShow(panelItem.textContent ?? '');
             await this.saveCurrentId(contentItem.id);
-            
+
             if (navContent?.hidden) {
                 navContent.hidden = false;
             }
@@ -322,6 +358,7 @@ export class Navigator {
             } else {
                 this.showContent(contentItem as HTMLDivElement, panelItem as HTMLDivElement);
             }
+            this.notifyItemShow(panelItem.textContent ?? '');
         }
         // 内容区整体处于隐藏状态（如首次打开尚无保存状态）时恢复显示
         if (this.content.hidden) {

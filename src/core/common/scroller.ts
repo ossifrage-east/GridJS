@@ -31,6 +31,8 @@ export interface ScrollbarElements {
  */
 interface ScrollbarOptions {
     parentElement?: HTMLElement | null;
+    /** 滚轮事件监听目标（如包含 sheetCanvas/editCanvas/textarea 的工作表容器）；缺省回退 parentElement */
+    wheelElement?: HTMLElement | null;
     direction?: 'horizontal' | 'vertical';
     data?: DataCollection;
     thumbMinSize?: number;
@@ -63,6 +65,37 @@ export class Scroller extends EventEmitter {
     private wheelTargetOffset: number = 0;
     /** 滚轮合并 rAF ID */
     private wheelRafId: number | null = null;
+    /** 滚轮事件实际监听的元素（wheelElement ?? parentElement），destroy 时移除监听用 */
+    private wheelListenerTarget: HTMLElement | null = null;
+    /** 缩放步进因子（Ctrl+滚轮 每次 ±10%） */
+    private static readonly ZOOM_FACTOR = 1.1;
+    /** 缩放下限 */
+    private static readonly ZOOM_MIN = 0.25;
+    /** 缩放上限 */
+    private static readonly ZOOM_MAX = 4;
+
+    // —— document 级具名处理器：注册/移除使用同一引用，保证 destroy 能真正解除监听 ——
+    private readonly onDocumentMouseMove = (e: MouseEvent): void => this.handleDrag(e);
+    /** mouseup 同时结束拖拽与步进（合并原先两个重复监听） */
+    private readonly onDocumentMouseUp = (e: MouseEvent): void => {
+        this.endDrag(e);
+        this.stopStep();
+    };
+    private readonly onDocumentTouchMove = (e: TouchEvent): void => this.handleTouchMove(e);
+    /** touchend 同时结束触摸与步进（合并原先两个重复监听） */
+    private readonly onDocumentTouchEnd = (e: TouchEvent): void => {
+        this.endTouch(e);
+        this.stopStep();
+    };
+    private readonly onDocumentTouchCancel = (e: TouchEvent): void => this.endTouch(e);
+    private readonly onWheelEvent = (e: WheelEvent): void => this.handleWheel(e);
+
+    // —— 数据事件具名处理器：destroy 时可精确 off ——
+    private readonly onOffsetXChanged = (): void => this.debouncedUpdate();
+    private readonly onOffsetYChanged = (): void => this.debouncedUpdate();
+    private readonly onAllColWidthChanged = (): void => this.debouncedUpdate();
+    private readonly onAllRowHeightChanged = (): void => this.debouncedUpdate();
+    private readonly onZoomChanged = (): void => this.debouncedUpdate();
 
     /**
      * 构造函数
@@ -121,21 +154,25 @@ export class Scroller extends EventEmitter {
         thumb.addEventListener('touchstart', (e) => this.handleTouchStart(e), { passive: false });
         track.addEventListener('touchstart', (e) => this.handleTrackTouch(e), { passive: false });
 
-        document.addEventListener('mousemove', (e) => this.handleDrag(e));
-        document.addEventListener('mouseup', (e) => this.endDrag(e));
+        document.addEventListener('mousemove', this.onDocumentMouseMove);
+        document.addEventListener('mouseup', this.onDocumentMouseUp);
 
-        document.addEventListener('touchmove', (e) => this.handleTouchMove(e), { passive: false });
-        document.addEventListener('touchend', (e) => this.endTouch(e));
-        document.addEventListener('touchcancel', (e) => this.endTouch(e));
+        document.addEventListener('touchmove', this.onDocumentTouchMove, { passive: false });
+        document.addEventListener('touchend', this.onDocumentTouchEnd);
+        document.addEventListener('touchcancel', this.onDocumentTouchCancel);
 
         back.addEventListener('mousedown', (e) => this.startStep(e, 'back'));
         forward.addEventListener('mousedown', (e) => this.startStep(e, 'forward'));
         back.addEventListener('touchstart', (e) => this.startStep(e, 'back'));
         forward.addEventListener('touchstart', (e) => this.startStep(e, 'forward'));
 
-        document.addEventListener('mouseup', () => this.stopStep());
-        document.addEventListener('touchend', () => this.stopStep());
-        document.addEventListener('wheel', (e) => this.handleWheel(e), { passive: false });
+        // 滚轮监听绑定到工作表容器（含 sheetCanvas/editCanvas/textarea），
+        // 滚轮在画布或编辑态 textarea 上均可滚动主页面；未提供时回退 parentElement
+        const wheelTarget = this.options.wheelElement ?? this.options.parentElement;
+        if (wheelTarget) {
+            this.wheelListenerTarget = wheelTarget;
+            wheelTarget.addEventListener('wheel', this.onWheelEvent, { passive: false });
+        }
     }
 
     /**
@@ -155,21 +192,15 @@ export class Scroller extends EventEmitter {
      */
     private setupDataListeners(): void {
         if (this.options.data) {
-            this.options.data.colHeaders.on(DataEvents.OFFSETX_CHANGED, () => {
-                this.debouncedUpdate();
-            });
-            this.options.data.rowHeaders.on(DataEvents.OFFSETY_CHANGED, () => {
-                this.debouncedUpdate();
-            });
+            this.options.data.colHeaders.on(DataEvents.OFFSETX_CHANGED, this.onOffsetXChanged);
+            this.options.data.rowHeaders.on(DataEvents.OFFSETY_CHANGED, this.onOffsetYChanged);
             // 总宽/总高变化时也要更新滑块尺寸与位置：
             // 否则 addCol/addRow 后 allColWidth/allRowHeight 已变但滑块仍停留在
             // 初始的「占满 track」状态，导致 maxDelta=0 拖不动
-            this.options.data.colHeaders.on(DataEvents.ALL_COL_WIDTH_CHANGED, () => {
-                this.debouncedUpdate();
-            });
-            this.options.data.rowHeaders.on(DataEvents.ALL_ROW_HEIGHT_CHANGED, () => {
-                this.debouncedUpdate();
-            });
+            this.options.data.colHeaders.on(DataEvents.ALL_COL_WIDTH_CHANGED, this.onAllColWidthChanged);
+            this.options.data.rowHeaders.on(DataEvents.ALL_ROW_HEIGHT_CHANGED, this.onAllRowHeightChanged);
+            // 缩放变化影响滑块长度与位置（totalWidth * zoom）
+            this.options.data.on(DataEvents.ZOOM_CHANGED, this.onZoomChanged);
         }
     }
 
@@ -520,10 +551,20 @@ export class Scroller extends EventEmitter {
      */
     private handleWheel(e: WheelEvent) {
         if (!this.options.data) return;
+        const data = this.options.data;
+
+        // Ctrl + 滚轮：缩放主页面（由垂直滚动条实例统一处理，水平实例仅拦截默认行为）
+        if (e.ctrlKey) {
+            e.preventDefault(); // 阻止浏览器页面缩放
+            if (this.options.direction !== 'vertical') return;
+            const factor = e.deltaY < 0 ? Scroller.ZOOM_FACTOR : 1 / Scroller.ZOOM_FACTOR;
+            const zoom = Math.min(Scroller.ZOOM_MAX, Math.max(Scroller.ZOOM_MIN, data.zoom * factor));
+            data.zoom = Math.round(zoom * 100) / 100; // 保留两位小数，避免浮点累积漂移
+            return;
+        }
 
         // 根据 deltaMode 归一化到像素单位，兼容不同设备
         // deltaMode: 0=像素, 1=行, 2=页
-        const data = this.options.data;
         const rowHeight = DEFAULT_CELL_HEIGHT * data.zoom;
         const colWidth = DEFAULT_CELL_WIDTH * data.zoom;
 
@@ -610,16 +651,14 @@ export class Scroller extends EventEmitter {
 
     /**
      * 销毁滚动条组件
+     *
+     * 清理顺序：动画帧/定时器 → 尺寸监听 → document 级监听 → 滚轮监听 →
+     * 数据事件监听 → DOM 移除 → 事件总线清空。
+     * document 级与数据级监听均使用与注册时相同的具名引用，确保真正解除，
+     * 避免旧实现传入新箭头函数导致 removeEventListener 失效（内存泄漏）。
      */
     public destroy(): void {
-        this.resizeObserver.disconnect();
-
-        document.removeEventListener('mousemove', (e) => this.handleDrag(e));
-        document.removeEventListener('mouseup', (e) => this.endDrag(e));
-        document.removeEventListener('touchmove', (e) => this.handleTouchMove(e));
-        document.removeEventListener('touchend', (e) => this.endTouch(e));
-        document.removeEventListener('touchcancel', (e) => this.endTouch(e));
-
+        // 1. 停止进行中的动画帧与定时器
         if (this.rafId) {
             cancelAnimationFrame(this.rafId);
             this.rafId = null;
@@ -634,10 +673,37 @@ export class Scroller extends EventEmitter {
         }
         this.stopStep();
 
+        // 2. 尺寸监听
+        this.resizeObserver.disconnect();
+
+        // 3. document 级监听（与注册时同一引用）
+        document.removeEventListener('mousemove', this.onDocumentMouseMove);
+        document.removeEventListener('mouseup', this.onDocumentMouseUp);
+        document.removeEventListener('touchmove', this.onDocumentTouchMove);
+        document.removeEventListener('touchend', this.onDocumentTouchEnd);
+        document.removeEventListener('touchcancel', this.onDocumentTouchCancel);
+
+        // 4. 滚轮监听
+        if (this.wheelListenerTarget) {
+            this.wheelListenerTarget.removeEventListener('wheel', this.onWheelEvent);
+            this.wheelListenerTarget = null;
+        }
+
+        // 5. 数据事件监听
+        if (this.options.data) {
+            this.options.data.colHeaders.off(DataEvents.OFFSETX_CHANGED, this.onOffsetXChanged);
+            this.options.data.rowHeaders.off(DataEvents.OFFSETY_CHANGED, this.onOffsetYChanged);
+            this.options.data.colHeaders.off(DataEvents.ALL_COL_WIDTH_CHANGED, this.onAllColWidthChanged);
+            this.options.data.rowHeaders.off(DataEvents.ALL_ROW_HEIGHT_CHANGED, this.onAllRowHeightChanged);
+            this.options.data.off(DataEvents.ZOOM_CHANGED, this.onZoomChanged);
+        }
+
+        // 6. 移除 DOM
         if (this.elements.container.parentElement) {
             this.elements.container.parentElement.removeChild(this.elements.container);
         }
 
+        // 7. 事件总线清空
         this.removeAllListeners();
     }
 }

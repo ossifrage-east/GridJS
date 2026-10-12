@@ -1,0 +1,43 @@
+/*  # 文件打开器（拖放提示层）的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+
+/* 隐藏的文件选择输入框：仅由 pickAndOpen() 触发点击 */
+.file-opener-input {
+    display: none;
+}
+
+/* 拖放提示层：覆盖整个拖放目标，拖入文件时浮现「释放以打开文件」 */
+.file-drop-hint {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    /* 半透明遮罩 + 虚线边框，明确指示可放置区域 */
+    background-color: rgba(76, 170, 80, 0.08);
+    border: 2px dashed #4CAF50;
+    border-radius: 4px;
+    pointer-events: none;   /* 不拦截 drop 事件，保证拖放目标仍能收到 drop */
+    user-select: none;
+
+    /* 以 hidden 属性控制显隐：显式覆盖 display:flex，防止被 flex 布局规则覆盖 */
+    &[hidden] {
+        display: none;
+    }
+
+    span {
+        padding: 8px 20px;
+        border-radius: 4px;
+        background-color: rgba(76, 170, 80, 0.9);
+        color: #fff;
+        font-size: 14px;
+        line-height: 1.4;
+    }
+}

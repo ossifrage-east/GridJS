@@ -57,6 +57,13 @@ interface SplitOptions {
     storageKey?: string;
     /** 是否记住面板大小，默认值为 true */
     rememberSize?: boolean;
+    /**
+     * 拖拽结束回调（参数为后侧面板当前尺寸，像素）
+     *
+     * 仅在用户**实际拖动分割条并松开**后触发，用于把导航内容区宽度按导航项持久化。
+     * 与 {@link SplitOptions.onResize} 的区别：后者在容器尺寸变化 / 程序化布局时也会触发。
+     */
+    onDragEnd?: (nextSize: number) => void;
 }
 
 /**
@@ -129,7 +136,8 @@ export class Split {
         maxSize: Infinity,
         nextSize: 0,
         storageKey: 'split-position',
-        rememberSize: true
+        rememberSize: true,
+        onDragEnd: undefined
     };
 
     /**
@@ -315,6 +323,36 @@ export class Split {
     }
 
     /**
+     * 获取后侧面板（导航内容区）的当前尺寸
+     *
+     * 由 {@link currentPosition} 与容器尺寸推算，而非读取 splitNext.clientWidth：
+     * 后者依赖实际布局（容器尚未完成布局时为 0，且每次读取都会触发强制重排）
+     * @returns {number} 后侧面板尺寸（像素）
+     */
+    public getNextSize(): number {
+        const { horizontal } = this.options;
+        const containerSize = getContainerSize(this.elements.container, horizontal);
+        return Math.max(0, containerSize - this.currentPosition);
+    }
+
+    /**
+     * 设置后侧面板（导航内容区）的目标尺寸
+     *
+     * 与 {@link setPosition}（以分割位置为参数）不同，此处以「后侧面板宽度」为参数，
+     * 便于按导航项的初始化宽度 / 已保存宽度直接设置。
+     * 实际生效尺寸会被最小 / 最大尺寸约束与容器尺寸收敛。
+     * @param {number} size - 期望的后侧面板尺寸（像素）
+     */
+    public setNextSize(size: number): void {
+        const { container } = this.elements;
+        const { horizontal } = this.options;
+        const containerSize = getContainerSize(container, horizontal);
+        if (!containerSize) return;
+        // 分割位置 = 容器尺寸 - 后侧尺寸（两种方向同构）
+        this.updateLayout(containerSize - size);
+    }
+
+    /**
      * 设置事件监听器
      * @private
      */
@@ -367,6 +405,8 @@ export class Split {
         this.isDragging = false;
         document.body.style.userSelect = '';
         document.body.style.cursor = '';
+        // 真实拖拽结束：回调当前后侧尺寸，供调用方持久化「用户拖出来的宽度」
+        this.options.onDragEnd?.(this.getNextSize());
     };
 
     /**

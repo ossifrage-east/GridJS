@@ -19,23 +19,29 @@
     # CSDN: https://blog.csdn.net/os373
 */
 
-import { TOOLS_CLASS_NAMES, DEFAULT_CELL_HEIGHT, ROW_HEADER_PADDING, 
-    NAV_PANEL, 
+import { TOOLS_CLASS_NAMES, DEFAULT_CELL_HEIGHT, ROW_HEADER_PADDING,
+    NAV_PANEL,
+    NAV_CONTENT_WIDTH,
     DEFAULT_FONT_FAMILY,
     DEFAULT_FONT_SIZE,
     FONT_FAMILY_LIST,
     DataEvents
-} from "./constant"; 
+} from "./constant";
 import { Split } from "./common/split";
 import { Navigator } from "./common/navigator";
 import { FileTree } from "./common/fileTree";
+import { FileOpener } from "./common/fileOpener";
 import { Sheets } from "./sheets/sheets";
 import { DataCollection } from "./dataArchitecture/dataCollection";
+import { IndexDB } from "./dataArchitecture/indexDB";
 import { Scroller } from "./common/scroller";
 import { Toolbar } from "./toolbar/toolbar";
 import { Menu } from "./common/menu";
 import { QuickAccess } from "./toolbar/quickAccess";
 import favicon from "../assets/images/favicon.ico";
+
+/** 导航内容区宽度在 IndexDB 中的键前缀（完整键 = 前缀 + 导航项文本） */
+const NAV_WIDTH_KEY_PREFIX = 'nav-content-width:';
 
 
 export class App {
@@ -51,6 +57,11 @@ export class App {
     private menu!: Menu;
     private navigator!: Navigator;
     private fileTree!: FileTree;
+    private fileOpener!: FileOpener;
+    /** 导航内容区宽度的持久化存储（键：NAV_WIDTH_KEY_PREFIX + 导航项文本） */
+    private readonly navWidthDb: IndexDB = new IndexDB();
+    /** 当前显示的导航项文本：拖拽保存宽度时作为键 */
+    private currentNavItemText = '';
 
     /**
      * 初始化工具栏
@@ -86,14 +97,16 @@ export class App {
     /**
      * 初始化容器分割线
      */
-    private initContainerSplit() {        
+    private initContainerSplit() {
         this.containerSplit = new Split({
-            parentElement: this.worktop, 
-            id: TOOLS_CLASS_NAMES.CONTAINER, 
+            parentElement: this.worktop,
+            id: TOOLS_CLASS_NAMES.CONTAINER,
             storageKey: TOOLS_CLASS_NAMES.CONTAINER,
-            nextSize: 360   // 左右分栏不默认平分：右侧面板（导航内容区）默认宽度 360px
+            nextSize: 360,   // 左右分栏不默认平分：右侧面板（导航内容区）默认宽度 360px
+            // 仅在真实拖拽结束后保存：容器尺寸变化 / 程序化设置宽度不会污染已保存值
+            onDragEnd: (nextSize: number) => this.saveNavContentWidth(nextSize),
         });
-        this.containerSplit.handleVisibility();   // 元素是否可见监控 
+        this.containerSplit.handleVisibility();   // 元素是否可见监控
     }
     
     /**
@@ -131,7 +144,11 @@ export class App {
      * 初始化导航器
      */
     private async initNavigator() {
-        const navigator = new Navigator(false);
+        const navigator = new Navigator({
+            horizontal: false,
+            // 导航项内容区变为可见时，恢复其宽度（已保存值优先，否则用初始化值）
+            onItemShow: (navItemText: string) => this.restoreNavContentWidth(navItemText),
+        });
         this.navigator = navigator;
         const { panel, content } = navigator.getElements();
         const { splitNext } = this.containerSplit.getElements();
@@ -148,12 +165,80 @@ export class App {
     }
 
     /**
+     * 恢复指定导航项的内容区宽度
+     *
+     * 优先级：IndexedDB 中已保存的宽度（人工拖拽产生） > `NAV_CONTENT_WIDTH`
+     * 中的初始化宽度 > 容器宽度平分。
+     * @param navItemText - 导航项文本
+     */
+    private restoreNavContentWidth(navItemText: string): void {
+        const split = this.containerSplit;
+        if (!split) return;
+        // 记录当前导航项，后续拖拽保存宽度以此为键
+        this.currentNavItemText = navItemText;
+        const containerWidth = split.getElements().container.clientWidth;
+        if (!containerWidth) return;
+
+        // 读取已保存宽度（异步，不阻塞切换：先用初始化值兜底，读取到后再校正）
+        this.navWidthDb.getSetting(NAV_WIDTH_KEY_PREFIX + navItemText).then((saved: unknown) => {
+            if (typeof saved === 'number' && Number.isFinite(saved) && saved > 0) {
+                split.setNextSize(saved);
+            }
+        }).catch(() => {
+            // IndexDB 不可用时忽略，退回初始化值
+        });
+
+        const initWidth = NAV_CONTENT_WIDTH[navItemText];
+        split.setNextSize(initWidth ?? Math.round(containerWidth / 2));
+    }
+
+    /**
+     * 持久化当前导航项的内容区宽度（人工拖拽后调用）
+     * @param width - 内容区宽度（像素）
+     */
+    private saveNavContentWidth(width: number): void {
+        const navItemText = this.currentNavItemText;
+        if (!navItemText || !Number.isFinite(width) || width <= 0) return;
+        this.navWidthDb.setSetting(
+            NAV_WIDTH_KEY_PREFIX + navItemText,
+            Math.round(width),
+            'nav-content-width'
+        ).catch(() => {
+            // 持久化失败不影响交互
+        });
+    }
+
+    /**
      * 初始化「文件」页签：树形文件页面
-     * 顶部为搜索栏（同行右侧为展开 / 收缩 / 定位按钮），下方为树形文件列表
+     *
+     * 顶部为搜索栏（同行右侧为展开 / 收缩 / 定位按钮），下方为树形文件列表；
+     * 新建 / 打开 / 剪切粘贴等操作统一通过树节点右键菜单完成
      */
     private initFileTree(navigator: Navigator) {
-        this.fileTree = new FileTree();
+        // 文件打开器：负责「打开」按钮与主页面拖放，解析成功后把文件名登记到文件树
+        this.fileOpener = new FileOpener({
+            data: this.data,
+            onOpened: (fileName: string) => {
+                this.fileTree.addNode(fileName);
+                this.data.messageBox.success(`已打开 ${fileName}`);
+            },
+            onError: (message: string) => this.data.messageBox.error(message),
+        });
+        document.body.appendChild(this.fileOpener.getFileInput());
+
+        this.fileTree = new FileTree({
+            menu: this.menu,
+            onOpen: () => this.fileOpener.pickAndOpen(),
+        });
         navigator.navContentItemMount(NAV_PANEL[0], this.fileTree.getElements().container);   // NAV_PANEL[0] 即「文件」
+        // 「定位」以主页面当前显示的文件名为目标：随工作表切换同步
+        this.fileTree.setActivedFileName(this.data.activedSheetName);
+        this.data.on(DataEvents.ACTIVED_SHEET_NAME_CHANGED, (_, name: string) => {
+            this.fileTree?.setActivedFileName(name);
+        });
+
+        // 主页面拖放：拖入 xlsx/xls/docx/doc/pptx/ppt 即自动打开
+        this.fileOpener.bindDropZone(this.sheets.getElements().sheets);
     }
 
     /**
@@ -199,13 +284,18 @@ export class App {
     }
 
     private initScroller() {
+        // 滚轮监听统一挂到工作表容器：滚动条实例只负责各自方向的分量，
+        // 使 sheetCanvas/editCanvas/textarea 激活时滚轮也能滚动主页面滚动条
+        const wheelElement = this.sheets.getElements().sheets;
         this.hScroller = new Scroller({
             parentElement: this.bottomToolsSplit.getElements().splitNext,
+            wheelElement,
             direction: 'horizontal',
             data: this.data,
         });
         this.vScroller = new Scroller({
             parentElement: this.rightToolsSplit.getElements().splitNext,
+            wheelElement,
             direction: 'vertical',
             data: this.data,
         });
