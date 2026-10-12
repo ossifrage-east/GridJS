@@ -45,6 +45,18 @@ export class Navigator {
     private horizontal: boolean;
     /** 内容区显示回调（按导航项恢复宽度时使用） */
     private readonly onItemShow?: (navItemText: string) => void;
+    /**
+     * 面板项 → 内容项 的直接引用映射
+     *
+     * 显隐切换必须操作本实例自己创建的内容项元素。早期实现用
+     * `document.getElementById(panelItem.dataset.targetId)` 做**全局**查找，
+     * 而 id 由 `murmur3(text, 'hawk@#')` 生成，页面内其它组件（如顶部工具栏
+     * 的标签组 `toolbar-group`）会为同名文本生成**相同 id**；同名元素在文档中
+     * 更靠前时（工具栏位于左侧面板，早于右侧导航内容区），全局查找会命中错误
+     * 元素，导致原导航项内容区不隐藏（「工具」即此例）。
+     * 因此这里直接持有引用，不再依赖任何全局 id 查找。
+     */
+    private readonly contentItemOf: Map<HTMLElement, HTMLDivElement> = new Map();
 
     /**
      * 构造函数
@@ -97,11 +109,21 @@ export class Navigator {
      * @returns {Promise<void>}
      */
     public async navItemMount(...navItemTexts: string[]): Promise<void> {
+        // 面板 id 同时是选中状态的存储键：按导航项集合派生，
+        // 使同一页面内的多个 Navigator 实例（如主导航与筛选面板）
+        // 既不共用存储键互相覆盖状态，也不产生重复的面板 id
+        if (navItemTexts.length) {
+            this.panelId = this.generateHashId(`NAV_PANEL:${navItemTexts.join('|')}`);
+            this.panel.id = this.panelId;
+        }
+
         const savedId = await this.db.getSetting(this.panelId);
         
         for (const text of navItemTexts) {
             const panelItem = this.createPanelItem(text);
             const contentItem = this.createContentItem(text);
+            // 记录对应关系：后续显隐切换直接取引用，不做全局 id 查找
+            this.contentItemOf.set(panelItem, contentItem);
             
             this.panel.appendChild(panelItem);
             this.content.appendChild(contentItem);
@@ -118,8 +140,12 @@ export class Navigator {
      * @returns {HTMLDivElement} 创建的面板项元素
      */
     private createPanelItem(text: string): HTMLDivElement {
-        const panelItem = document.createElement('div');        
-        panelItem.classList = NAV.PANEL_ITEM;
+        const panelItem = document.createElement('div');
+        // 注意：classList 在 DOM 中是只读访问器（DOMTokenList），
+        // 不能整体赋值（`panelItem.classList = 'x'` 在严格模式下会抛错，
+        // 导致 navItemMount 中断、后续导航项全部注册失败）。
+        // 必须用 classList.add 设置类名。
+        panelItem.classList.add(NAV.PANEL_ITEM);
         panelItem.classList.add(this.horizontal ? 'horizontal' : 'vertical');
         panelItem.textContent = text;
         panelItem.dataset.targetId = this.generateHashId(text);
@@ -206,7 +232,6 @@ export class Navigator {
         if (panelItem !== target) return;
 
         const currentChecked = this.panel.querySelector('.checked') as HTMLElement | null;
-        const navContent = document.querySelector(`.${NAV.CONTENT}`) as HTMLElement | null;
 
         if (!currentChecked) {
             this.showContent(contentItem, panelItem);
@@ -217,8 +242,8 @@ export class Navigator {
             this.notifyItemShow(panelItem.textContent ?? '');
             await this.saveCurrentId(contentItem.id);
 
-            if (navContent?.hidden) {
-                navContent.hidden = false;
+            if (this.content.hidden) {
+                this.content.hidden = false;
             }
         }
     }
@@ -262,7 +287,9 @@ export class Navigator {
     ): void {
         currentChecked.classList.remove('checked');
         
-        const currentContent = document.getElementById(currentChecked.dataset.targetId || '') as HTMLElement | null;
+        // 只操作本导航组件的内容项：不能用 document.getElementById，
+        // 否则会命中其它组件中同一哈希 id 的元素（见 contentItemOf 说明）
+        const currentContent = this.contentItemOf.get(currentChecked);
         if (currentContent) {
             currentContent.hidden = true;
         }
@@ -278,15 +305,13 @@ export class Navigator {
     private hideAllContent(panelItem: HTMLDivElement): void {
         panelItem.classList.remove('checked');
         
-        const checkedContent = document.getElementById(panelItem.dataset.targetId || '') as HTMLElement | null;
+        const checkedContent = this.contentItemOf.get(panelItem);
         if (checkedContent) {
             checkedContent.hidden = true;
         }
         
-        const navContent = document.querySelector(`.${NAV.CONTENT}`) as HTMLElement | null;
-        if (navContent) {
-            navContent.hidden = true;
-        }
+        // 内容区容器同样取自本实例，避免命中页面上其它 Navigator 的容器
+        this.content.hidden = true;
     }
 
     /**
@@ -313,17 +338,33 @@ export class Navigator {
     }
 
     /**
+     * 在**本实例**的内容容器内按 id 查找内容项（只匹配直接子元素）
+     *
+     * 不使用 `document.getElementById`：id 由文本哈希生成，
+     * 页面上其它组件存在同 id 元素时会返回错误节点。
+     * @param {string} id - 内容项 id
+     * @returns {HTMLDivElement | null} 内容项元素
+     */
+    private findContentItem(id: string): HTMLDivElement | null {
+        if (!id) return null;
+        for (const child of Array.from(this.content.children)) {
+            if ((child as HTMLElement).id === id) return child as HTMLDivElement;
+        }
+        return null;
+    }
+
+    /**
      * 挂载内容到指定导航项
      *
-     * 在 this.content 内部按 id 查找目标内容项（使用属性选择器 [id="..."]，
-     * 兼容以数字开头的十六进制哈希 id），不依赖 document.getElementById，
+     * 在 this.content 内部按 id 查找目标内容项（逐个子元素比对 id，
+     * 兼容以数字、短横线开头的十六进制哈希 id），不依赖 document.getElementById，
      * 因此内容容器尚未连接到 document 时也能正确挂载。
      * @param {string} navItemText - 导航项文本
      * @param {...HTMLElement} HTMLElements - 要挂载的HTML元素
      */
     public navContentItemMount(navItemText: string, ...HTMLElements: HTMLElement[]): void {
         const navContentItemID = this.contentItemID.get(navItemText) || this.generateHashId(navItemText);
-        const navContentItem = this.content.querySelector(`[id="${navContentItemID}"]`);
+        const navContentItem = this.findContentItem(navContentItemID);
         
         if (navContentItem) {
             navContentItem.append(...HTMLElements);
@@ -348,7 +389,7 @@ export class Navigator {
         if (!itemId) return;
 
         const panelItem = this.panel.querySelector(`[data-target-id="${itemId}"]`) as HTMLElement | null;
-        const contentItem = this.content.querySelector(`[id="${itemId}"]`) as HTMLElement | null;
+        const contentItem = this.findContentItem(itemId);
         if (!panelItem || !contentItem) return;
 
         const currentChecked = this.panel.querySelector('.checked') as HTMLElement | null;
@@ -400,6 +441,7 @@ export class Navigator {
             this.content.removeChild(this.content.firstChild);
         }
         this.contentItemID.clear();
+        this.contentItemOf.clear();
         await this.clearSavedId();
     }
 }

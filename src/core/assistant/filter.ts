@@ -205,14 +205,38 @@ export class Filter {
         this.currentCol = col;
         this.currentRow = row;
         const { left, top, width, height } = this.data.calculateCellRect(col, row);
+        // 先应用缩放变换，再读取尺寸：getBoundingClientRect 返回的是变换后的视觉尺寸，
+        // 因此「右下角对齐单元格右下角」的算法在任意缩放下自动成立（详见 applyZoomScale）
+        this.applyZoomScale();
         // 单元格右下角的屏幕坐标（内容坐标乘 zoom 后叠加固定行/列表头尺寸）
         const rect = this.filter.getBoundingClientRect();
-        const _left = Math.round((left + width) * this.data.zoom) + this.data.visibleView.rowHeaderWidth - rect.width;
-        const _top = Math.round((top + height) * this.data.zoom) + this.data.visibleView.colHeaderHeight - rect.height;
+        const _left = Math.round((left + width) * this.data.zoom + this.data.visibleView.rowHeaderWidth - rect.width);
+        const _top = Math.round((top + height) * this.data.zoom + this.data.visibleView.colHeaderHeight - rect.height);
         this.filter.style.left = `${_left}px`;
         this.filter.style.top = `${_top}px`;
         // 定位时同步显隐：该列无内容的单元格不显示筛选按钮
         this.updateFilterVisibility();
+    }
+
+    /**
+     * 按主页面当前缩放比例对筛选按钮应用等比缩放
+     *
+     * 按钮需与单元格内容同步放大/缩小（否则缩放后按钮相对单元格显得过大/过小）。
+     * 采用 transform 而非改 width/height：不影响内部箭头布局，且只触发合成层。
+     *
+     * **变换原点必须是左上角**，这是 {@link setPosition} 定位算法成立的前提：
+     * left/top 定位的是「未变换盒子」的左上角，以左上角为原点时，
+     * 按钮的视觉右下角 = (left + rect.width, top + rect.height)，
+     * 而 rect 取到的正是变换后的尺寸——于是「用视觉尺寸从单元格右下角回退」即可精确对齐，
+     * 无需按 zoom 手工折算尺寸（若用默认的 50% 原点，视觉框会向中心收拢，定位将偏移）。
+     * @private
+     * @returns {void}
+     */
+    private applyZoomScale(): void {
+        const zoom = this.data.zoom;
+        this.filter.style.transformOrigin = 'top left';
+        // 1:1 时移除变换，避免无谓的合成层与亚像素模糊
+        this.filter.style.transform = zoom === 1 ? '' : `scale(${zoom})`;
     }
 
     /**

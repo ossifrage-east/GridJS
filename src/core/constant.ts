@@ -129,6 +129,7 @@ export const FILE_TREE_CLASS_NAMES = {   // 定义文件树（「文件」导航
     OPEN: 'is-open',
     SELECTED: 'is-selected',
     LOCATED: 'is-located',
+    ACTIVED: 'is-actived',
 }
 
 export const MENU_CLASS_NAMES = {

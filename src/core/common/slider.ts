@@ -27,7 +27,21 @@ export interface SliderOptions {
     unit?: string;
     /** 是否显示数值输入框（与滑块双向同步），默认 true */
     showInput?: boolean;
-    /** 滑块轨道宽度（CSS 长度） */
+    /**
+     * 是否垂直方向，默认 false（水平）
+     *
+     * 垂直时轨道纵向排列、**最小值在下端**，取值换算改为读指针 Y 坐标；
+     * 未显式指定 {@link sliderWidth} 时不写死内联长度，由样式表撑满容器高度
+     */
+    vertical?: boolean;
+    /**
+     * 是否使用细线样式，默认 false（浏览器原生外观）
+     *
+     * 细线样式下轨道为 2px 细线、手柄为小圆点，配色取自主题色板
+     * （见 slider.scss），适合窄条工具区里的紧凑控件
+     */
+    thin?: boolean;
+    /** 滑块轨道长度（CSS 长度）：水平方向写入 width，垂直方向写入 height */
     sliderWidth?: string;
     /** 数值输入框宽度（CSS 长度） */
     inputWidth?: string;
@@ -54,10 +68,16 @@ export type SliderChangeSource = 'track' | 'input';
  * - 单位文本：仅作展示，不参与取值。
  *
  * 双向同步规则：
- * - 轨道 → 数值框：拖动过程中同步，数值框正在聚焦编辑时跳过，避免覆盖输入；
- * - 数值框 → 轨道：提交时同步；
+ * - 轨道 → 数值框：拖动过程中同步；数值框聚焦**且存在未提交的编辑**时跳过，
+ *   避免覆盖输入（仅聚焦、内容未变时照常同步）；
+ * - 数值框 → 轨道：提交时（change 失焦 / 回车）同步；
  * - 外部 {@link setValue}：默认两者都同步，可通过参数只同步数值框
  *   （拖动期间由控件内部完成，避免程序赋值打断原生拖拽手势）。
+ *
+ * 方向与外观：
+ * - `vertical: true` 时轨道纵向排列、最小值在下端，拖动换算读指针 Y 坐标；
+ * - `thin: true` 时使用细线外观（2px 轨道 + 小圆点手柄，主题色），
+ *   适合右侧工具栏这类窄条区域里的紧凑滑块。
  *
  * @class Slider
  * @example
@@ -81,6 +101,14 @@ export class Slider {
     private readonly unitElement: HTMLSpanElement | null;
     /** 配置选项 */
     private readonly options: SliderOptions;
+    /**
+     * 最近一次由组件写入数值框的值
+     *
+     * 用于区分「框内存在未提交的编辑」与「仅聚焦但内容未变」：
+     * 前者同步时跳过（避免覆盖用户输入），后者照常同步
+     * （例如提交后输入框仍保持聚焦时，Ctrl+滚轮 缩放仍能回写显示）。
+     */
+    private lastInputSynced = '';
 
     /**
      * 构造函数
@@ -92,13 +120,16 @@ export class Slider {
             max: 100,
             step: 1,
             showInput: true,
-            sliderWidth: '120px',
+            // 垂直方向的长度默认交由样式表撑满容器（100%），故不注入内联长度
+            sliderWidth: options.vertical ? undefined : '120px',
             inputWidth: '3.5rem',
             accentColor: '#0d6efd',
             ...options
         };
 
         this.container = createDiv({ className: 'slider' });
+        if (this.options.vertical) this.container.classList.add('slider-vertical');
+        if (this.options.thin) this.container.classList.add('slider-thin');
 
         const { min, max, step } = this.options;
         this.track = createInput({
@@ -111,7 +142,12 @@ export class Slider {
             },
         });
         if (this.options.sliderWidth) {
-            this.track.style.width = this.options.sliderWidth;
+            // 轨道长度写在主轴方向：水平看宽度、垂直看高度
+            if (this.options.vertical) {
+                this.track.style.height = this.options.sliderWidth;
+            } else {
+                this.track.style.width = this.options.sliderWidth;
+            }
         }
         if (this.options.accentColor) {
             this.track.style.accentColor = this.options.accentColor;
@@ -154,16 +190,22 @@ export class Slider {
      */
     private bindEvents(): void {
         const { track, numberInput } = this;
+        const { vertical } = this.options;
 
         // —— 轨道：自实现指针拖动，保证跟手 ——
-        const applyPointer = (clientX: number): void => {
+        // 水平：左端 min、右端 max；垂直：下端 min、上端 max（与 slider.scss 的纵向书写模式一致）
+        const applyPointer = (clientX: number, clientY: number): void => {
             const rect = track.getBoundingClientRect();
-            if (rect.width <= 0) return;
             const min = Number(track.min) || 0;
             const max = Number(track.max) || 100;
             const step = Number(track.step) || 1;
-            const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
-            const snapped = Math.round((min + ratio * (max - min)) / step) * step;
+            const length = vertical ? rect.height : rect.width;
+            if (length <= 0) return;
+            const ratio = vertical
+                ? (rect.bottom - clientY) / length
+                : (clientX - rect.left) / length;
+            const clamped = Math.min(1, Math.max(0, ratio));
+            const snapped = Math.round((min + clamped * (max - min)) / step) * step;
             track.value = String(Math.min(max, Math.max(min, snapped)));
             track.dispatchEvent(new Event('input'));
         };
@@ -174,8 +216,8 @@ export class Slider {
             track.focus();
             // 指针捕获：拖出滑块/窗口范围仍持续跟手；不支持时退化为窗口级监听
             try { track.setPointerCapture(e.pointerId); } catch { /* ignore */ }
-            applyPointer(e.clientX);  // 按下即跳转到点击位置（与原生轨道点击行为一致）
-            const onMove = (ev: PointerEvent) => applyPointer(ev.clientX);
+            applyPointer(e.clientX, e.clientY);  // 按下即跳转到点击位置（与原生轨道点击行为一致）
+            const onMove = (ev: PointerEvent) => applyPointer(ev.clientX, ev.clientY);
             const onUp = () => {
                 window.removeEventListener('pointermove', onMove);
                 window.removeEventListener('pointerup', onUp);
@@ -199,14 +241,37 @@ export class Slider {
 
         // —— 数值框提交：收敛并吸附后回写轨道 ——
         if (numberInput) {
-            numberInput.addEventListener('change', () => {
-                const n = Number(numberInput.value);
-                const snapped = Number.isFinite(n) ? this.snap(n) : this.getValue();
-                numberInput.value = String(snapped);
-                track.value = String(snapped);
-                this.options.onChange?.(snapped, 'input');
+            // 显式聚焦：宿主页面可能吞掉 mousedown 的默认行为（如表格组件的
+            // 全局 preventDefault），导致点击无法聚焦、无法键入。与轨道一致，
+            // 由组件自己接管焦点（pointerdown 覆盖鼠标 / 触屏 / 触控笔）。
+            numberInput.addEventListener('pointerdown', () => numberInput.focus());
+
+            numberInput.addEventListener('change', () => this.commitNumberInput());
+            // 回车提交：手动填数后无需先点别处失焦
+            numberInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    this.commitNumberInput();
+                }
             });
         }
+    }
+
+    /**
+     * 提交数值输入框内容：解析 → 吸附收敛 → 回写轨道 → 触发回调
+     * （输入非法时回退为当前值，不改变状态）
+     * @private
+     */
+    private commitNumberInput(): void {
+        const { numberInput, track } = this;
+        if (!numberInput) return;
+
+        const n = Number(numberInput.value);
+        const snapped = Number.isFinite(n) ? this.snap(n) : this.getValue();
+        numberInput.value = String(snapped);
+        this.lastInputSynced = String(snapped);   // 本次写入视为已同步，不再是「未提交的编辑」
+        track.value = String(snapped);
+        this.options.onChange?.(snapped, 'input');
     }
 
     /**
@@ -224,15 +289,25 @@ export class Slider {
     }
 
     /**
-     * 同步数值输入框显示（正在聚焦编辑时跳过，避免覆盖用户输入）
+     * 同步数值输入框显示
+     *
+     * 仅当「输入框处于聚焦状态 **且框内存在未提交的编辑**」时跳过，
+     * 以免覆盖用户正在输入的内容；其它情况（含提交后仍聚焦、
+     * 仅聚焦未改动）一律照常同步，保证外部变化（如 Ctrl+滚轮 缩放）
+     * 能实时反映到数值框。
      * @private
      * @param {number} value - 目标值
      */
     private syncNumberInput(value: number): void {
         const { numberInput } = this;
-        if (numberInput && document.activeElement !== numberInput) {
-            numberInput.value = String(value);
-        }
+        if (!numberInput) return;
+
+        const target = String(value);
+        const isEditing = document.activeElement === numberInput && numberInput.value !== this.lastInputSynced;
+        if (isEditing) return;
+
+        numberInput.value = target;
+        this.lastInputSynced = target;
     }
 
     /**

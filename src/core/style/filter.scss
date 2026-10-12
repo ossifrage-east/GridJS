@@ -6,6 +6,9 @@
 */
 
 
+/* 按钮尺寸 12px 内容区 + 4px 内边距 + 1px 边框 = 视觉 22px；
+   随主页面缩放时由 scripts 侧设置 transform: scale(zoom) 与 transform-origin: top left
+   （见 Filter.applyZoomScale），不要在样式表里覆盖 transform / transform-origin */
 .filter {
     position: absolute;
     display: block;

@@ -121,5 +121,26 @@ div {
         right: 0;
         top: 0;
         border-bottom: 1px solid #ccc;
+
+        /* 上侧面板改为纵向 flex：导航面板占满剩余空间，缩放滑块贴底固定 */
+        .split-pre {
+            display: flex;
+            flex-direction: column;
+
+            > .nav-panel {
+                flex: 1 1 auto;
+                min-height: 0;
+                height: auto;   // 覆盖全局 .nav-panel 的 height:100%，改由 flex 分配
+            }
+
+            /* 缩放控件：垂直细线滑块 + 下方数值框，固定高度、不参与伸缩 */
+            > .slider {
+                flex: 0 0 auto;
+                height: 152px;
+                width: 100%;
+                padding: 6px 0 10px;
+                box-sizing: border-box;
+            }
+        }
     }    
 }

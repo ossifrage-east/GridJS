@@ -69,10 +69,10 @@ export class Scroller extends EventEmitter {
     private wheelListenerTarget: HTMLElement | null = null;
     /** 缩放步进因子（Ctrl+滚轮 每次 ±10%） */
     private static readonly ZOOM_FACTOR = 1.1;
-    /** 缩放下限 */
-    private static readonly ZOOM_MIN = 0.25;
-    /** 缩放上限 */
-    private static readonly ZOOM_MAX = 4;
+    /** 缩放下限（对外公开：外部缩放控件如右侧工具栏滑块需与之保持一致） */
+    public static readonly ZOOM_MIN = 0.25;
+    /** 缩放上限（对外公开：同上） */
+    public static readonly ZOOM_MAX = 4;
 
     // —— document 级具名处理器：注册/移除使用同一引用，保证 destroy 能真正解除监听 ——
     private readonly onDocumentMouseMove = (e: MouseEvent): void => this.handleDrag(e);

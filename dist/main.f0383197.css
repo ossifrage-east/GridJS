@@ -642,6 +642,12 @@ html, body {
   display: flex;
   width: 100%;
   height: 100%;
+  /* 以 hidden 属性控制显隐：显式覆盖上面的 display:flex。
+     否则作者样式的 display 会压过 UA 的 [hidden]{display:none}，
+     导致双击收起 / 首次进入时导航内容区无法真正隐藏 */
+}
+.nav-content[hidden] {
+  display: none;
 }
 .nav-content .content-item {
   margin: 0px;
@@ -1151,6 +1157,17 @@ html, body {
 .file-tree-row.is-selected {
   background-color: rgba(76, 170, 80, 0.16);
 }
+.file-tree-row {
+  /* 当前主页面显示的文件：常驻高亮（与「选中」「定位闪烁」相互独立） */
+}
+.file-tree-row.is-actived {
+  background-color: rgba(76, 170, 80, 0.1);
+  box-shadow: inset 2px 0 0 0 #4CAF50;
+}
+.file-tree-row.is-actived .file-tree-label {
+  color: #2f7d33;
+  font-weight: 600;
+}
 .file-tree-row.is-located {
   -webkit-animation: fileTreeLocate 0.9s ease-out 1;
           animation: fileTreeLocate 0.9s ease-out 1;
@@ -1431,6 +1448,9 @@ html, body {
     # 知乎: https://www.zhihu.com/people/eastossifrage
     # CSDN: https://blog.csdn.net/os373
 */
+/* 按钮尺寸 12px 内容区 + 4px 内边距 + 1px 边框 = 视觉 22px；
+   随主页面缩放时由 scripts 侧设置 transform: scale(zoom) 与 transform-origin: top left
+   （见 Filter.applyZoomScale），不要在样式表里覆盖 transform / transform-origin */
 .filter {
   position: absolute;
   display: block;
@@ -1827,6 +1847,39 @@ div {
   right: 0;
   top: 0;
   border-bottom: 1px solid #ccc;
+  /* 上侧面板改为纵向 flex：导航面板占满剩余空间，缩放滑块贴底固定 */
+}
+.sheets #rightTools .split-pre {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: vertical;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: column;
+      -ms-flex-direction: column;
+          flex-direction: column;
+}
+.sheets #rightTools .split-pre > .nav-panel {
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+}
+.sheets #rightTools .split-pre {
+  /* 缩放控件：垂直细线滑块 + 下方数值框，固定高度、不参与伸缩 */
+}
+.sheets #rightTools .split-pre > .slider {
+  -webkit-box-flex: 0;
+  -webkit-flex: 0 0 auto;
+      -ms-flex: 0 0 auto;
+          flex: 0 0 auto;
+  height: 152px;
+  width: 100%;
+  padding: 6px 0 10px;
+  box-sizing: border-box;
 }
 /*!*********************************************************************************************************************************************************************************************!*\
   !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/scroller.scss ***!
@@ -1992,6 +2045,206 @@ div {
 }
 .scroll-vertical .scroll-forward:active {
   background-color: #aaa;
+}
+/*!*******************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/slider.scss ***!
+  \*******************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # 通用滑块组件的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+/* 组件根容器：轨道 + 数值输入框 + 单位文本横向排列并垂直居中 */
+.slider {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: horizontal;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: row;
+      -ms-flex-direction: row;
+          flex-direction: row;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  gap: 0.5rem;
+}
+
+/* 垂直方向：轨道纵向排列，最小值在下端；数值输入框自然落在轨道下方 */
+.slider-vertical {
+  -webkit-box-orient: vertical;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: column;
+      -ms-flex-direction: column;
+          flex-direction: column;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  width: 100%;
+  height: 100%;
+  gap: 0.25rem;
+}
+.slider-vertical .slider-track {
+  /* 原生 range 在纵向书写模式下沿纵向排列（Chrome 119+ / Firefox 130+ / Safari 17.4+）；
+     direction: rtl 使最小值落到下端（上端为最大值），与组件内指针换算保持一致 */
+  -webkit-writing-mode: vertical-lr;
+      -ms-writing-mode: bt-lr;
+          writing-mode: vertical-lr;
+  direction: rtl;
+  width: 12px; /* 交互热区厚度：细线由下方背景绘制，热区略宽便于点按 */
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto; /* 长度由剩余空间决定（下方数值框占固定高度） */
+  height: auto;
+  min-height: 24px; /* 极窄容器下仍保留可拖拽长度 */
+  margin: 0 auto;
+}
+.slider-vertical {
+  /* 数值输入框：贴轨道下方、占满窄条宽度并居中，收掉默认的左右内边距 */
+}
+.slider-vertical .slider-input {
+  -webkit-box-flex: 0;
+  -webkit-flex: 0 0 auto;
+      -ms-flex: 0 0 auto;
+          flex: 0 0 auto;
+  width: -webkit-calc(100% - 4px);
+  width: calc(100% - 4px);
+  min-width: 0;
+  padding: 2px 0;
+  line-height: 1.1;
+  text-align: center;
+  font-size: 0.625rem; /* 26px 窄条内保证三位数不溢出 */
+  border-radius: 0.1875rem;
+}
+.slider-vertical {
+  /* 单位文本：极小号居中，仅作单位提示 */
+}
+.slider-vertical .slider-unit {
+  -webkit-box-flex: 0;
+  -webkit-flex: 0 0 auto;
+      -ms-flex: 0 0 auto;
+          flex: 0 0 auto;
+  font-size: 0.625rem;
+  line-height: 1;
+}
+
+/* 滑动轨道：指针手势由组件 JS 自实现（保证跟手），此处仅做外观与交互态处理 */
+.slider-track {
+  accent-color: #0d6efd;
+  cursor: pointer;
+  -ms-touch-action: none;
+      touch-action: none;
+  outline: none;
+}
+.slider-track:focus, .slider-track:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+/* 细线样式：2px 轨道 + 小圆点手柄
+   轨道用元素自身背景绘制而非轨道伪元素：避免各浏览器对纵向书写模式下
+   ::-webkit-slider-runnable-track 宽高含义的解释差异，视觉稳定 */
+.slider-thin .slider-track {
+  -webkit-appearance: none;
+  appearance: none;
+  background-color: transparent;
+  background-image: -webkit-gradient(linear, left top, left bottom, from(#c8c8c8), to(#c8c8c8));
+  background-image: linear-gradient(#c8c8c8, #c8c8c8);
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 100% 2px;
+  border-radius: 2px;
+  /* 原生轨道伪元素保持透明，只留下方自绘的细线 */
+}
+.slider-thin .slider-track::-webkit-slider-runnable-track {
+  background: transparent;
+  border: none;
+}
+.slider-thin .slider-track::-moz-range-track {
+  background: transparent;
+  border: none;
+}
+.slider-thin .slider-track {
+  /* 圆点手柄：紧凑、居中，贴合主题主色 */
+}
+.slider-thin .slider-track::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 8px;
+  height: 8px;
+  border: none;
+  border-radius: 50%;
+  background-color: #4CAF50;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06);
+}
+.slider-thin .slider-track::-moz-range-thumb {
+  width: 8px;
+  height: 8px;
+  border: none;
+  border-radius: 50%;
+  background-color: #4CAF50;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06);
+}
+.slider-thin .slider-track:hover::-webkit-slider-thumb {
+  background-color: #43A047;
+}
+.slider-thin .slider-track:hover::-moz-range-thumb {
+  background-color: #43A047;
+}
+.slider-thin .slider-track:active::-webkit-slider-thumb {
+  background-color: #388E3C;
+}
+.slider-thin .slider-track:active::-moz-range-thumb {
+  background-color: #388E3C;
+}
+
+/* 细线 + 垂直：细线沿纵向铺满长度 */
+.slider-thin.slider-vertical .slider-track {
+  background-size: 2px 100%;
+}
+
+/* 数值输入框：form-control 风格（focus 蓝色焦点环），隐藏原生步进箭头 */
+.slider-input {
+  padding: 0.25rem 0.375rem;
+  font-size: 0.8125rem;
+  border: 1px solid #ced4da;
+  border-radius: 0.375rem;
+  background: #fff;
+  color: #212529;
+  text-align: right;
+  outline: none;
+  box-sizing: border-box;
+  -webkit-transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+  transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+}
+.slider-input:focus {
+  outline: none;
+  border-color: #86b7fe;
+  box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25);
+}
+.slider-input::-webkit-outer-spin-button, .slider-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.slider-input[type=number] {
+  -webkit-appearance: textfield;
+          appearance: textfield;
+}
+
+/* 单位文本：弱化展示，不抢占数值视觉权重 */
+.slider-unit {
+  font-size: 0.8125rem;
+  color: #6c757d;
 }
 /*!********************************************************************************************************************************************************************************************!*\
   !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/toolbar.scss ***!
@@ -2218,80 +2471,6 @@ div {
 }
 #fontSize .toolbar-select-icon {
   width: 16px;
-}
-/*!*******************************************************************************************************************************************************************************************!*\
-  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/slider.scss ***!
-  \*******************************************************************************************************************************************************************************************/
-@charset "UTF-8";
-/*  # 通用滑块组件的 SCSS 文件
-    # author: 东方鹗
-    # B站: https://space.bilibili.com/194359739
-    # 知乎: https://www.zhihu.com/people/eastossifrage
-    # CSDN: https://blog.csdn.net/os373
-*/
-/* 组件根容器：轨道 + 数值输入框 + 单位文本横向排列并垂直居中 */
-.slider {
-  display: -webkit-box;
-  display: -webkit-flex;
-  display: -ms-flexbox;
-  display: flex;
-  -webkit-box-orient: horizontal;
-  -webkit-box-direction: normal;
-  -webkit-flex-direction: row;
-      -ms-flex-direction: row;
-          flex-direction: row;
-  -webkit-box-align: center;
-  -webkit-align-items: center;
-      -ms-flex-align: center;
-          align-items: center;
-  gap: 0.5rem;
-}
-
-/* 滑动轨道：指针手势由组件 JS 自实现（保证跟手），此处仅做外观与交互态处理 */
-.slider-track {
-  accent-color: #0d6efd;
-  cursor: pointer;
-  -ms-touch-action: none;
-      touch-action: none;
-  outline: none;
-}
-.slider-track:focus, .slider-track:focus-visible {
-  outline: none;
-  box-shadow: none;
-}
-
-/* 数值输入框：form-control 风格（focus 蓝色焦点环），隐藏原生步进箭头 */
-.slider-input {
-  padding: 0.25rem 0.375rem;
-  font-size: 0.8125rem;
-  border: 1px solid #ced4da;
-  border-radius: 0.375rem;
-  background: #fff;
-  color: #212529;
-  text-align: right;
-  outline: none;
-  box-sizing: border-box;
-  -webkit-transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
-  transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
-}
-.slider-input:focus {
-  outline: none;
-  border-color: #86b7fe;
-  box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25);
-}
-.slider-input::-webkit-outer-spin-button, .slider-input::-webkit-inner-spin-button {
-  -webkit-appearance: none;
-  margin: 0;
-}
-.slider-input[type=number] {
-  -webkit-appearance: textfield;
-          appearance: textfield;
-}
-
-/* 单位文本：弱化展示，不抢占数值视觉权重 */
-.slider-unit {
-  font-size: 0.8125rem;
-  color: #6c757d;
 }
 /*!******************************************************************************************************************************************************************************************!*\
   !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/brand.scss ***!

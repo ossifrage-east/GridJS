@@ -6,6 +6,7 @@
 */
 
 import { createDiv, createSpan, createInput, createButton, createElement } from "../../utils/dom";
+import { stripExtension } from "../../utils/fileName";
 import { FILE_TREE_CLASS_NAMES as TREE, MENU_CLASS_NAMES } from "../constant";
 import { Menu, MenuContent } from "./menu";
 import '../style/fileTree.scss';
@@ -19,6 +20,12 @@ export interface FileNode {
     name: string;
     /** 子节点：存在即视为文件夹（空数组表示空文件夹） */
     children?: FileNode[];
+    /**
+     * 文件夹展开状态（仅文件夹会带此字段，仅供持久化还原使用）
+     *
+     * 缺省时按默认规则处理：根层展开、更深层收起（见 {@link createNode}）。
+     */
+    open?: boolean;
 }
 
 /**
@@ -27,12 +34,64 @@ export interface FileNode {
  */
 const NEW_FILE_MENU_ITEMS = [
     { todo: 'XLSX', text: '新建XLSX' },
-    { todo: 'XLS', text: '新建XLS' },
+    // { todo: 'XLS', text: '新建XLS' },
     { todo: 'DOCX', text: '新建DOCX' },
-    { todo: 'DOC', text: '新建DOC' },
+    // { todo: 'DOC', text: '新建DOC' },
     { todo: 'PPTX', text: '新建PPTX' },
-    { todo: 'PPT', text: '新建PPT' },
+    // { todo: 'PPT', text: '新建PPT' },
 ];
+
+/**
+ * 新建文件的初始名称
+ *
+ * 基础名自带序号（`sheet1.xlsx` / `doc1.docx` / `ppt1.pptx`），
+ * 当前目录内重名时**递增其中的数字**（`sheet1.xlsx` → `sheet2.xlsx` …）。
+ */
+const NEW_FILE_BASE_NAMES: Record<string, string> = {
+    XLSX: 'sheet1.xlsx',
+    DOCX: 'doc1.docx',
+    PPTX: 'ppt1.pptx',
+};
+
+/**
+ * 文件内容搬迁计划项
+ *
+ * 树只认识**显示名**，而文件内容存在外部（IndexedDB 的 `values` 库，键为去扩展名的工作表名）。
+ * 因此「某个文件的名字变了 / 被复制了 / 被删除了」这类副作用一律以显示名告知外部，
+ * 由外部换算成存档键后执行。
+ * @interface FileMovePlan
+ */
+export interface FileMovePlan {
+    /** 源文件显示名（含扩展名） */
+    from: string;
+    /** 目标文件显示名（含扩展名） */
+    to: string;
+}
+
+/**
+ * 内容桥：把「结构变化」翻译成「文件内容的同步动作」
+ *
+ * 四个动作都由树在**语义发生变化的时刻**调用一次，调用方负责真正读写数据：
+ * - {@link FileContentBridge.create}：新建文件（库中尚无存档时补一份空白存档）；
+ * - {@link FileContentBridge.copy}：复制 / 粘贴（复制模式），含文件夹递归；
+ * - {@link FileContentBridge.move}：改名（重命名、剪切粘贴导致的改名）；
+ * - {@link FileContentBridge.remove}：删除（含文件夹递归）。
+ * @interface FileContentBridge
+ */
+export interface FileContentBridge {
+    /**
+     * 补建文件存档：新建出来的文件在数据库中还没有存档时写入一份空白存档
+     *
+     * 只补不覆盖：这条路径也会在「登记已打开的文件」时被调用，此时内容刚由打开器写入。
+     */
+    create?: (names: string[]) => void;
+    /** 复制文件内容：把 `from` 的存档复制到 `to` */
+    copy?: (plans: FileMovePlan[]) => void;
+    /** 搬迁文件内容：把 `from` 的存档搬到 `to`（源键不再保留） */
+    move?: (plans: FileMovePlan[]) => void;
+    /** 删除文件内容：清理这些显示名对应文件在数据库中的存档 */
+    remove?: (names: string[]) => void;
+}
 
 /**
  * 文件树构造选项接口
@@ -47,6 +106,26 @@ export interface FileTreeOptions {
     menu?: Menu | null;
     /** 点击「打开」按钮时触发（由外部弹出文件选择对话框） */
     onOpen?: () => void;
+    /**
+     * 双击文件节点时触发（参数为节点显示名，含扩展名）
+     *
+     * 由外部装载该文件内容到主页面；若主页面已显示该文件，外部应保持内容不变。
+     */
+    onActivate?: (fileName: string) => void;
+    /**
+     * 树结构、名称或展开状态发生变化时触发（新增 / 删除 / 重命名 / 粘贴 / 展开收起）
+     *
+     * 用于外部持久化：把回调参数存起来，页面刷新时再通过
+     * {@link FileTreeOptions.nodes} 注入还原，即可让树回到刷新前的样子。
+     * 参数为当前整棵树的深拷贝（纯数据，可直接交给结构化克隆存储）。
+     */
+    onChange?: (nodes: FileNode[]) => void;
+    /**
+     * 内容桥：复制 / 改名 / 删除文件时同步数据库中的文件内容
+     *
+     * 不传则树只做结构操作（粘贴出来的文件是空表、删除不清理存档）。
+     */
+    content?: FileContentBridge;
 }
 
 /**
@@ -102,13 +181,28 @@ const DEFAULT_FILE_NODES: FileNode[] = [
  * - 定位：定位**当前主页面显示的文件**（由 {@link setActivedFileName} 同步
  *   `data.activedSheetName`）在树中的位置，展开全部祖先并闪烁高亮；
  *   找不到时依次降级为：搜索首个命中项 → 当前选中项 → 第一个根节点。
- * - 右键菜单：新建文件（hover 展开六项二级菜单）/ 新建文件夹 / 打开 /
- *   分割线 / 剪切 / 复制 / 粘贴 / 分割线 / 重命名 / 删除。
+ * - 右键菜单：新建文件（hover 展开二级菜单：新建XLSX / 新建DOCX / 新建PPTX）/
+ *   新建文件夹 / 打开 / 分割线 / 剪切 / 复制 / 粘贴 / 分割线 / 重命名 / 删除。
  *   右键文件夹时「新建」作用于该文件夹，右键文件时作用于其所在文件夹。
- * - 命名规则：新建时**仅当当前目录内同名冲突才追加序号** ——
- *   无冲突直接用基础名（`新建文件夹` / `新建文件.xlsx`），
- *   冲突时递增（`新建文件夹1`、`新建文件夹2` …）。
- *   粘贴保留原文件名/夹名，仅在目标目录冲突时追加序号去重。
+ * - 命名规则：新建时**仅当当前目录内同名冲突才递增序号** ——
+ *   文件夹无冲突用基础名（`新建文件夹`），冲突时追加序号（`新建文件夹1`…）；
+ *   文件基础名自带序号（`sheet1.xlsx` / `doc1.docx` / `ppt1.pptx`），
+ *   冲突时递增其中的数字（`sheet1.xlsx` → `sheet2.xlsx` …）。
+ *   粘贴 / 复制重名时用同一套规则（{@link uniqueName}）：名称里带数字就递增它
+ *   （`doc1.docx` → `doc2.docx`），否则追加序号（`报表.xlsx` → `报表1.xlsx`）。
+ * - 双击文件节点：由 {@link FileTreeOptions.onActivate} 交给外部装载内容到主页面；
+ *   主页面已显示该文件时不产生任何变化（由外部保证）。
+ * - 当前文件高亮：主页面正在显示的文件由 {@link setActivedFileName} /
+ *   {@link showActivedFile} 同步，行上加 {@link TREE}.ACTIVED 常驻高亮
+ *   （与「选中」`is-selected`、「定位闪烁」`is-located` 三态相互独立）；
+ *   文件被改名时高亮跟随新名，被删除时高亮随之消失。
+ * - 内容同步：新增 / 复制 / 改名 / 删除文件会通过 {@link FileTreeOptions.content}
+ *   通知外部同步数据库中该文件的内容（树只认识显示名，不接触存档数据）；
+ *   新增只「补建」不覆盖，因此刷新恢复、打开文件登记等路径同样安全。
+ * - 持久化：新增 / 删除 / 重命名 / 粘贴，以及文件夹展开收起，都会通过
+ *   {@link FileTreeOptions.onChange} 通知外部落库；外部在下次启动时用
+ *   {@link FileTreeOptions.nodes} 注入还原，即「刷新后树里仍是刷新前的文件，
+ *   原来折叠的文件夹也依然是折叠的」（{@link FileTree.getNodes} 可取当前整棵树）。
  * - 删除保护：根节点（「工作区」）不可删除。
  *
  * @class FileTree
@@ -116,8 +210,7 @@ const DEFAULT_FILE_NODES: FileNode[] = [
  * const fileTree = new FileTree({ menu, onOpen: () => opener.pickAndOpen() });
  * navigator.navContentItemMount('文件', fileTree.getElements().container);
  * // 打开文件成功后登记节点，并同步主页面文件名供「定位」使用
- * fileTree.addNode('销售数据.xlsx');
- * fileTree.setActivedFileName('销售数据');
+ * fileTree.showActivedFile('销售数据.xlsx');
  */
 export class FileTree {
     /** 页面容器（挂载到导航内容项） */
@@ -193,18 +286,45 @@ export class FileTree {
     /**
      * 在指定父节点下新建一个空白文件节点
      * @private
-     * @param {string} extension - 文件扩展名（大写，如 'XLSX'）
+     * @param {string} todo - 菜单动作标识（XLSX / DOCX / PPTX）
      * @param {TreeNodeView | null} parent - 父节点（缺省为根节点「工作区」）
      */
-    private createFileNode(extension: string, parent: TreeNodeView | null = null): void {
-        this.addNode(
-            this.availableName('新建文件', parent, extension.toLowerCase()),
-            { select: true, parent }
-        );
+    private createFileNode(todo: string, parent: TreeNodeView | null = null): void {
+        this.addNode(this.availableFileName(todo, parent), { select: true, parent });
     }
 
     /**
-     * 生成当前目录内可用的名称
+     * 生成当前目录内可用的文件名称
+     *
+     * 规则：基础名自带序号（{@link NEW_FILE_BASE_NAMES}，如 `sheet1.xlsx`），
+     * 当前目录已存在同名时**递增其中的数字**：`sheet1.xlsx` → `sheet2.xlsx` → …
+     * 序号自基础名的数字起步，因此删除 `sheet2.xlsx` 后再新建会重新得到 `sheet2.xlsx`，
+     * 与文件夹命名（{@link availableName}）「以目录实际内容为准」的风格一致。
+     * @private
+     * @param {string} todo - 菜单动作标识（XLSX / DOCX / PPTX）
+     * @param {TreeNodeView | null} parent - 父节点（缺省为根节点）
+     * @returns {string} 当前目录内不冲突的文件名
+     */
+    private availableFileName(todo: string, parent: TreeNodeView | null = null): string {
+        const target = parent?.childrenBox ? parent : this.rootViews[0];
+        const taken = new Set(target?.children.map((child) => child.key) ?? []);
+        const base = NEW_FILE_BASE_NAMES[todo] ?? `${todo.toLowerCase()}1.${todo.toLowerCase()}`;
+
+        // 拆出「前缀 + 数字 + 扩展名」，重名时递增中间的数字
+        const matched = /^(.*?)(\d+)(\.[^.]+)?$/.exec(base);
+        const prefix = matched ? matched[1] : base;
+        const suffix = matched ? (matched[3] ?? '') : '';
+        const start = matched ? Number(matched[2]) : 1;
+
+        for (let seq = start; seq < start + 10000; seq++) {
+            const candidate = `${prefix}${seq}${suffix}`;
+            if (!taken.has(candidate.toLowerCase())) return candidate;
+        }
+        return base;
+    }
+
+    /**
+     * 生成当前目录内可用的名称（文件夹命名规则）
      *
      * 规则：**仅当当前目录已存在同名节点时才追加序号** —— 目录内无冲突则原样返回，
      * 如「新建文件夹」→「新建文件夹1」→「新建文件夹2」…
@@ -212,27 +332,25 @@ export class FileTree {
      * 与「删除后序号继续递增」不同，这里以目录实际内容为准，
      * 因此删除「新建文件夹1」后再次新建会重新得到「新建文件夹1」，
      * 始终保证「名称不重复」且「序号从冲突处开始」。
+     * 文件命名见 {@link availableFileName}（递增基础名中的数字）。
      * @private
-     * @param {string} base - 基础名称（如 '新建文件'）
+     * @param {string} base - 基础名称（如 '新建文件夹'）
      * @param {TreeNodeView | null} parent - 父节点（缺省为根节点）
-     * @param {string} [extension] - 文件扩展名（不含点）
      * @returns {string} 当前目录内不冲突的名称
      */
-    private availableName(base: string, parent: TreeNodeView | null = null, extension?: string): string {
+    private availableName(base: string, parent: TreeNodeView | null = null): string {
         const target = parent?.childrenBox ? parent : this.rootViews[0];
-        const suffix = extension ? `.${extension}` : '';
         const taken = new Set(target?.children.map((child) => child.key) ?? []);
 
         // 无冲突：直接用基础名（不追加任何序号）
-        const plain = `${base}${suffix}`;
-        if (!taken.has(plain.toLowerCase())) return plain;
+        if (!taken.has(base.toLowerCase())) return base;
 
         // 有冲突：从 1 开始递增，跳过已占用者
         for (let seq = 1; seq < 10000; seq++) {
-            const candidate = `${base}${seq}${suffix}`;
+            const candidate = `${base}${seq}`;
             if (!taken.has(candidate.toLowerCase())) return candidate;
         }
-        return plain;
+        return base;
     }
 
     /**
@@ -369,8 +487,9 @@ export class FileTree {
             // 子节点通过 createNode 内部登记到 view.children，此处无需再接收返回值
             this.createNodes(data.children as FileNode[], childrenBox, depth + 1, view);
             el.appendChild(childrenBox);
-            // 默认展开第一层（根节点），更深的层级收起
-            this.setOpen(view, depth < 1);
+            // 默认展开第一层（根节点），更深的层级收起；
+            // 持久化还原时以存档里的展开状态为准（data.open）
+            this.setOpen(view, data.open ?? depth < 1);
         }
 
         // 登记到父节点的子节点集合：新增节点（打开文件 / 新建）同样依赖此登记，
@@ -378,6 +497,12 @@ export class FileTree {
         if (parent) parent.children.push(view);
 
         row.addEventListener('click', () => this.handleRowClick(view));
+        // 双击文件节点：由外部把该文件内容装载到主页面
+        // （文件夹不处理：展开 / 收起已由单击负责，双击会连点两次反而相互抵消）
+        row.addEventListener('dblclick', () => {
+            if (view.isFolder) return;
+            this.options.onActivate?.(view.label.textContent ?? '');
+        });
         // 右键：在鼠标位置弹出上下文菜单（选中被右键的节点作为操作目标）
         row.addEventListener('contextmenu', (e) => {
             e.preventDefault();
@@ -397,6 +522,10 @@ export class FileTree {
         this.select(view);
         if (view.isFolder) {
             this.setOpen(view, !view.isOpen);
+            // 展开 / 收起决定「刷新前能看到哪些内容」，因此一并落库：
+            // 否则刚建好并放满文件的文件夹刷新后是折叠态，里面的文件看起来「消失」了。
+            // 一次点击一次写入（记录很小），且仅此处与 expandAll / collapseAll / locate 会写。
+            this.notifyTreeChanged();
         }
     }
 
@@ -575,16 +704,43 @@ export class FileTree {
     // ════════════════════════════════════════════════════════════
 
     /**
-     * 将视图序列化为纯数据（供剪贴板暂存，切断与 DOM 的引用）
+     * 将视图序列化为纯数据（供剪贴板暂存 / 持久化导出，切断与 DOM 的引用）
      * @private
      * @param {TreeNodeView[]} views - 节点集合
+     * @param {boolean} [withOpen=false] - 是否附带文件夹展开状态（持久化用；剪贴板不需要）
      * @returns {FileNode[]} 深拷贝后的数据
      */
-    private serializeNodes(views: TreeNodeView[]): FileNode[] {
+    private serializeNodes(views: TreeNodeView[], withOpen = false): FileNode[] {
         return views.map((view) => ({
             name: view.label.textContent ?? '',
-            ...(view.isFolder ? { children: view.children.map((child) => this.serializeNodes([child])[0]) } : {}),
+            ...(view.isFolder
+                ? { children: view.children.map((child) => this.serializeNodes([child], withOpen)[0]) }
+                : {}),
+            ...(withOpen && view.isFolder ? { open: view.isOpen } : {}),
         }));
+    }
+
+    /**
+     * 导出当前整棵树（深拷贝，可直接交给结构化克隆持久化）
+     *
+     * 与剪贴板用的 {@link serializeNodes} 同源，额外带上文件夹展开状态，
+     * 使刷新还原后「原来折叠的文件夹依然是折叠的」。
+     * @returns {FileNode[]} 树数据
+     */
+    public getNodes(): FileNode[] {
+        return this.serializeNodes(this.rootViews, true);
+    }
+
+    /**
+     * 通知外部树已变化（供持久化）
+     *
+     * 在**结构、名称或文件夹展开状态**发生变化时调用：新增 / 删除 / 重命名 /
+     * 粘贴，以及展开收起（单点、全展开 / 全收起、定位时的祖先展开）。
+     * 纯选中不触发；搜索只做临时渲染（{@link renderOpen}）不改状态，同样不触发。
+     * @private
+     */
+    private notifyTreeChanged(): void {
+        this.options.onChange?.(this.getNodes());
     }
 
     /**
@@ -603,19 +759,64 @@ export class FileTree {
             return;
         }
 
+        const plans: FileMovePlan[] = [];
         this.clipboard.forEach((node) => {
             // 粘贴保留原名称：仅当目标目录已存在同名节点时才追加序号去重
-            this.createFromData({ ...node, name: this.uniqueName(target, node.name) }, target);
+            const name = this.uniqueName(target, node.name);
+            // 连同内容一起搬：复制 → 复制存档；剪切 → 存档改名（名称未变则无需搬）
+            this.collectFilePlans(node, name, plans);
+            this.createFromData({ ...node, name }, target);
         });
 
+        // 内容先于结构删除同步：剪切模式下随后要移除源节点，
+        // 若先删源就再也找不到内容的来源键了
+        if (plans.length > 0) {
+            if (this.clipboardIsCut) this.options.content?.move?.(plans);
+            else this.options.content?.copy?.(plans);
+        }
+
         if (this.clipboardIsCut) {
-            // 剪切语义：粘贴完成后移除源节点（源已在树上，先粘贴再删除避免丢失数据）
-            this.removeNodes(this.clipboardSources);
+            // 剪切语义：粘贴完成后移除源节点（源已在树上，先粘贴再删除避免丢失数据）；
+            // 内容已由内容桥搬到新名字下，因此不再清理存档
+            this.removeNodes(this.clipboardSources, false);
         }
         // 无论剪切与否，粘贴后剪贴板即失效（与 Windows 资源管理器一致）
         this.clipboard = null;
         this.clipboardSources = [];
         this.clipboardIsCut = false;
+        this.notifyTreeChanged();
+    }
+
+    /**
+     * 收集「源文件 → 目标文件」的内容搬迁计划
+     *
+     * 文件夹只影响其中文件的**路径**，不影响文件名，因此递归展开为其中的文件；
+     * 文件夹自身不产生计划项。
+     * @private
+     * @param {FileNode} source - 源节点数据（来自剪贴板的深拷贝）
+     * @param {string} targetName - 该节点粘贴后的名称
+     * @param {FileMovePlan[]} plans - 计划收集容器
+     */
+    private collectFilePlans(source: FileNode, targetName: string, plans: FileMovePlan[]): void {
+        if (Array.isArray(source.children)) {
+            source.children.forEach((child) => this.collectFilePlans(child, child.name, plans));
+            return;
+        }
+        plans.push({ from: source.name, to: targetName });
+    }
+
+    /**
+     * 收集节点（含子孙）中所有文件的显示名
+     * @private
+     * @param {TreeNodeView} view - 起始节点
+     * @param {string[]} out - 名称收集容器
+     */
+    private collectFileNames(view: TreeNodeView, out: string[]): void {
+        if (view.isFolder) {
+            view.children.forEach((child) => this.collectFileNames(child, out));
+            return;
+        }
+        out.push(view.label.textContent ?? '');
     }
 
     /**
@@ -700,20 +901,37 @@ export class FileTree {
         const siblings = view.parent?.children.filter((child) => child !== view) ?? [];
         if (siblings.some((child) => child.key === next.toLowerCase())) return;
 
+        const oldName = view.label.textContent ?? '';
+        // 改名后「当前文件」的高亮与定位要跟着走：先判断被改名的就是主页面当前显示的文件
+        // （要在改动 label / key 之前判断，否则查找条件已经变了）
+        const wasActived = !!this.activedFileName && this.findByName(this.activedFileName) === view;
+
         view.label.textContent = next;
         view.key = next.toLowerCase();
+        if (wasActived) this.activedFileName = next;
+
+        // 文件改名后内容也要跟着搬：否则存档仍留在旧键上，改名后的文件看起来是空的
+        // （文件夹改名只改变其中文件的路径，内容键是去扩展名的文件显示名，无需搬迁）
+        if (!view.isFolder && oldName && oldName !== next) {
+            this.options.content?.move?.([{ from: oldName, to: next }]);
+        }
+        this.refreshActivedHighlight();
+        this.notifyTreeChanged();
     }
 
     /**
-     * 删除节点（含子孙），并清理选中与重命名状态
+     * 删除节点（含子孙），并清理选中、重命名状态与对应的文件内容
      *
      * 幂等：对同一节点重复调用安全（已从树上摘除的节点直接跳过），
      * 便于剪切粘贴等场景无需额外判断节点是否仍在树上
      * @private
      * @param {TreeNodeView[]} views - 待删除节点集合
+     * @param {boolean} [purgeContent=true] - 是否清理这些文件在数据库中的内容；
+     *   剪切粘贴移除源节点时为 false（内容已随粘贴搬走，不能再删）
      */
-    private removeNodes(views: TreeNodeView[]): void {
+    private removeNodes(views: TreeNodeView[], purgeContent = true): void {
         let removed = false;
+        const names: string[] = [];
         views.forEach((view) => {
             // 根节点（parent 为 null）受保护，不可删除：删除后树将失去唯一入口
             if (this.isRootView(view)) return;
@@ -724,12 +942,19 @@ export class FileTree {
             if (siblings && index < 0) return;
 
             if (siblings) siblings.splice(index, 1);
+            this.collectFileNames(view, names);
             if (this.selected === view) this.selected = null;
             if (this.renaming?.view === view) this.renaming = null;
             view.el.remove();
             removed = true;
         });
-        if (removed) this.updateEmptyState();
+        if (removed) {
+            // 删除的是主页面当前显示的文件时，其节点已不存在 → 高亮随之取消
+            this.refreshActivedHighlight();
+            if (purgeContent && names.length > 0) this.options.content?.remove?.(names);
+            this.updateEmptyState();
+            this.notifyTreeChanged();
+        }
     }
 
     /**
@@ -797,18 +1022,29 @@ export class FileTree {
      * 展开全部文件夹
      */
     public expandAll(): void {
+        let changed = false;
         this.rootViews.forEach((view) => this.walk(view, (node) => {
-            if (node.isFolder) this.setOpen(node, true);
+            if (node.isFolder && !node.isOpen) {
+                this.setOpen(node, true);
+                changed = true;
+            }
         }));
+        // 整批展开只落库一次，避免逐节点写入
+        if (changed) this.notifyTreeChanged();
     }
 
     /**
      * 收起全部文件夹
      */
     public collapseAll(): void {
+        let changed = false;
         this.rootViews.forEach((view) => this.walk(view, (node) => {
-            if (node.isFolder) this.setOpen(node, false);
+            if (node.isFolder && node.isOpen) {
+                this.setOpen(node, false);
+                changed = true;
+            }
         }));
+        if (changed) this.notifyTreeChanged();
     }
 
     /**
@@ -892,9 +1128,15 @@ export class FileTree {
         const target = this.getLocateTarget();
         if (!target) return;
 
+        let opened = false;
         for (let parent = target.parent; parent !== null; parent = parent.parent) {
-            if (parent.isFolder) this.setOpen(parent, true);
+            if (parent.isFolder && !parent.isOpen) {
+                this.setOpen(parent, true);
+                opened = true;
+            }
         }
+        // 定位会展开祖先以便看到目标文件：一并落库，刷新后目标仍可见
+        if (opened) this.notifyTreeChanged();
 
         this.select(target);
         target.row.scrollIntoView({ block: 'nearest' });
@@ -902,26 +1144,118 @@ export class FileTree {
     }
 
     /**
-     * 设置当前主页面显示的文件名（「定位」据此在树中查找）
-     * @param {string} name - 文件名（不含扩展名，如 data.activedSheetName）
+     * 设置当前主页面显示的文件名（「定位」与高亮据此在树中查找）
+     *
+     * 可传显示名（`销售数据.xlsx`）或工作表名（`销售数据`），
+     * 匹配时会容忍「有无扩展名」的差异（见 {@link findByName}）。
+     * @param {string} name - 文件名或工作表名
      */
     public setActivedFileName(name: string): void {
         this.activedFileName = name ?? '';
+        this.refreshActivedHighlight();
     }
 
     /**
-     * 按文件名在整棵树中查找节点（不区分大小写，优先匹配文件而非文件夹）
+     * 获取当前主页面显示的文件名
+     * @returns {string} 文件名（可能是显示名或工作表名，取决于外部最后一次同步的值）
+     */
+    public getActivedFileName(): string {
+        return this.activedFileName;
+    }
+
+    /**
+     * 判断树中是否存在该文件节点（文件夹不算）
+     *
+     * 供外部在「删除当前文件后回退」等场景确认回退目标是否还留在树里。
+     * @param {string} name - 文件名或工作表名
+     * @returns {boolean} 是否存在对应的文件节点
+     */
+    public hasFile(name: string): boolean {
+        const found = this.findByName(name);
+        return !!found && !found.isFolder;
+    }
+
+    /**
+     * 列出树中所有文件的显示名（先序：从上到下、从浅到深）
+     *
+     * 供外部在「打开历史都用不上」时挑一个仍在树中的文件作为回退目标。
+     * @returns {string[]} 文件显示名集合（不含文件夹）
+     */
+    public listFiles(): string[] {
+        const out: string[] = [];
+        this.rootViews.forEach((view) => this.collectFileNames(view, out));
+        return out;
+    }
+
+    /**
+     * 计算根目录「工作区」下下一个可用的新文件名
+     *
+     * 与右键「新建文件」共用同一套命名规则（{@link availableFileName}），
+     * 因此默认得到 `sheet1.xlsx`（同名被占用时递增序号）。
+     * 供外部在「刷新后树里一个文件都没有」时补一个默认空白文件用。
+     * @param {string} [todo='XLSX'] - 文件类型标识（XLSX / DOCX / PPTX）
+     * @returns {string} 可用的文件显示名（含扩展名）
+     */
+    public nextFileName(todo: string = 'XLSX'): string {
+        return this.availableFileName(todo, null);
+    }
+
+    /**
+     * 刷新「当前主页面显示的文件」的常驻高亮
+     *
+     * 高亮与「选中」（{@link TREE}.SELECTED，正在操作的节点）、
+     * 「定位闪烁」（{@link TREE}.LOCATED，一次性动效）相互独立：
+     * 选中是操作目标，高亮是主页面正在显示的文件，两者可能不是同一个节点。
+     * 找不到对应节点（例如文件刚被删除）时不残留任何高亮。
      * @private
-     * @param {string} name - 文件名
+     */
+    private refreshActivedHighlight(): void {
+        const found = this.activedFileName ? this.findByName(this.activedFileName) : null;
+        const target = found && !found.isFolder ? found : null;
+        this.rootViews.forEach((view) => this.walk(view, (node) => {
+            node.row.classList.toggle(TREE.ACTIVED, node === target);
+        }));
+    }
+
+    /**
+     * 登记「当前主页面打开的文件」并在树中显示
+     *
+     * 供打开文件 / 页面刷新恢复时调用：树中已有同名节点则直接复用（不重复登记），
+     * 否则追加到根节点「工作区」下；同时同步「定位」的目标名称并高亮该节点。
+     * @param {string} displayName - 文件显示名（含扩展名，如 `sheet1.xlsx`）
+     * @returns {TreeNodeView | null} 对应的节点视图
+     */
+    public showActivedFile(displayName: string): TreeNodeView | null {
+        const name = (displayName ?? '').trim();
+        if (!name) return null;
+        this.activedFileName = name;
+
+        const existing = this.findByName(name);
+        const view = existing && !existing.isFolder ? existing : this.addNode(name);
+        this.refreshActivedHighlight();
+        return view;
+    }
+
+    /**
+     * 按名称在整棵树中查找节点
+     *
+     * 匹配规则（不区分大小写）：
+     * - 名称完全一致；
+     * - 或「去掉扩展名后」一致 —— 树中节点是 `sheet1.xlsx`，而主页面记录的是
+     *   工作表名 `sheet1`（IndexDB 的存储键即工作表名），两者必须能互相定位。
+     * 同名时文件优先于文件夹。
+     * @private
+     * @param {string} name - 文件名或工作表名
      * @returns {TreeNodeView | null} 命中的节点
      */
     private findByName(name: string): TreeNodeView | null {
         const key = name.trim().toLowerCase();
         if (!key) return null;
+        const bare = stripExtension(key);
         const fallback: TreeNodeView[] = [];
         const walk = (views: TreeNodeView[]): TreeNodeView | null => {
             for (const view of views) {
-                if (view.key === key) {
+                if (view.key === key || stripExtension(view.key) === bare) {
                     // 文件优先：同名文件夹可能被当前文件之外的内容占用
                     if (!view.isFolder) return view;
                     fallback.push(view);
@@ -1014,6 +1348,10 @@ export class FileTree {
         // 新建的文件夹默认展开（空文件夹），避免创建后还需再点一次才能看到结构
         if (view.isFolder) this.setOpen(view, true);
 
+        // 新增文件即同步数据库：库中还没有该文件的存档时补一份空白存档，
+        // 使「树里看到的文件」与「库里存的内容」始终一一对应（只补不覆盖）
+        if (!view.isFolder) this.options.content?.create?.([view.label.textContent ?? uniqueName]);
+
         // 展开祖先并选中，保证新增节点可见
         for (let p = view.parent; p !== null; p = p.parent) {
             if (p.isFolder) this.setOpen(p, true);
@@ -1021,14 +1359,18 @@ export class FileTree {
         this.select(view);
         if (select) this.flash(view);
         this.updateEmptyState();
+        this.notifyTreeChanged();
         return view;
     }
 
     /**
-     * 在指定父节点下生成不重复的名称
+     * 在指定父节点下生成不重复的名称（粘贴 / 登记文件时用于兜底去重）
      *
-     * 名称冲突时在扩展名前追加递增序号（`报表` → `报表1` → `报表2` …），
-     * 与 {@link availableName} 的序号风格保持一致；粘贴时用于保留原名的兜底去重。
+     * 重名规则与「新建文件」{@link availableFileName} 保持一致：
+     * - 文件名中带数字（`sheet1.xlsx` / `doc1.docx`）→ **递增其中的数字**：
+     *   复制 `doc1.docx` 得到 `doc2.docx`（而不是 `doc11.docx`）；
+     * - 文件名中无数字（`报表.xlsx`）→ 在扩展名前追加序号：`报表1.xlsx`；
+     * - 文件夹名（`新建文件夹` / `归档`）→ 追加序号：`归档1`。
      * @private
      * @param {TreeNodeView} parent - 父节点
      * @param {string} name - 期望名称
@@ -1041,8 +1383,12 @@ export class FileTree {
         const dot = name.lastIndexOf('.');
         const base = dot > 0 ? name.slice(0, dot) : name;
         const suffix = dot > 0 ? name.slice(dot) : '';
-        for (let seq = 1; seq < 10000; seq++) {
-            const candidate = `${base}${seq}${suffix}`;
+        // 带扩展名的文件名：若名称里已有数字则从该数字起递增，否则追加序号
+        const matched = dot > 0 ? /^(.*?)(\d+)$/.exec(base) : null;
+        const prefix = matched ? matched[1] : base;
+        const start = matched ? Number(matched[2]) : 1;
+        for (let seq = start; seq < start + 10000; seq++) {
+            const candidate = `${prefix}${seq}${suffix}`;
             if (!taken.has(candidate.toLowerCase())) return candidate;
         }
         return name;

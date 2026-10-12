@@ -12,6 +12,7 @@ import { Char } from "../dataArchitecture/char";
 import { ColHeader, RowHeader } from "../dataArchitecture/header";
 import { DataCollection } from "../dataArchitecture/dataCollection";
 import { DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH } from "../constant";
+import { stripExtension } from "../../utils/fileName";
 import { SheetParser } from "../../utils/parser/sheetParser";
 import { DocumentParser } from "../../utils/parser/documentParser";
 import '../style/fileOpener.scss';
@@ -71,7 +72,7 @@ export interface FileOpenerOptions {
  * @example
  * const opener = new FileOpener({
  *     data,
- *     onOpened: (name) => fileTree.addFileNode(name),
+ *     onOpened: (name) => fileTree.showActivedFile(name),
  *     onError: (msg) => data.messageBox.error(msg),
  * });
  * document.body.appendChild(opener.getFileInput());
@@ -232,12 +233,16 @@ export class FileOpener {
      * @private
      */
     private applyDocument(fileName: string, document: OpenedDocument): void {
-        const sheetName = fileName.replace(/\.[^.]+$/, '');
+        const sheetName = stripExtension(fileName);
         this.data.runWithFullStateUndo(`打开 ${fileName}`, () => {
             this.data.activedSheetName = sheetName;
             this.applyHeaders(document.colHeaders, document.rowHeaders);
             this.data.values = document.values;
         });
+        // runWithFullStateUndo 抑制了包裹期间的所有广播（避免在撤销栈里产生空操作），
+        // 但「打开文件」是会话中途的装载：必须显式补发一次，
+        // 否则主页面仍显示上一个文件的内容（画布不会重绘）
+        this.data.notifyValuesChanged();
     }
 
     /**

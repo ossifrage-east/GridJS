@@ -68,6 +68,13 @@ export class Sheets extends EventEmitter {
     private sheetCanvas: SheetCanvas;
     /** 编辑画布元素 */
     private editCanvas: EditCanvas;
+    /**
+     * 表格区域内是否正在拖拽（mousedown 起于画布、尚未 mouseup）
+     *
+     * 用于区分「表格拖拽」与「在交互控件上操作」：前者需持续接管 mousemove
+     * （即使指针途经输入框），后者必须放行默认行为。
+     */
+    private isGridDragging = false;
 
     /** ResizeObserver 实例 */
     private resizeObserver: ResizeObserver | null;
@@ -386,10 +393,32 @@ export class Sheets extends EventEmitter {
     }
 
     /**
+     * 判断鼠标事件是否源自交互控件（输入框 / 按钮 / 可编辑元素等）
+     *
+     * Sheets 的鼠标处理只服务于表格自身的画布，且会 `preventDefault()` 掉浏览器
+     * 默认行为。而 mousedown 的默认行为之一就是**把焦点交给被点击的元素**——
+     * 若事件来自交互控件（如右侧工具条里的缩放数值框），此处必须放行，
+     * 否则点击输入框无法聚焦、无法键入。
+     * @param e 鼠标事件对象
+     * @returns 事件源自交互控件返回 true
+     */
+    private isFromInteractiveControl(e: MouseEvent): boolean {
+        const target = e.target as HTMLElement | null;
+        if (!target) return false;
+        if (target.isContentEditable) return true;
+        return ['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'OPTION', 'LABEL'].includes(target.tagName);
+    }
+
+    /**
      * 处理鼠标按下事件
      * @param e 鼠标事件对象
      */
     private handleMouseDown(e: MouseEvent): void {
+        // 交互控件（右栏的缩放数值框等）的 mousedown 一律放行：
+        // 否则 preventDefault 会吃掉「点击即聚焦」的默认行为
+        if (this.isFromInteractiveControl(e)) return;
+
+        this.isGridDragging = true;
         e.preventDefault();
         // textArea 焦点统一由 editCanvas 的文档级 mousedown 焦点管理处理：
         // 仅点击 sheetCanvas（主页面）时聚焦，点击其它位置（含行列表头）时失焦
@@ -404,6 +433,10 @@ export class Sheets extends EventEmitter {
      * @param e 鼠标事件对象
      */
     private handleMouseMove(e: MouseEvent): void {
+        // 无表格拖拽进行中且事件源自交互控件时放行：不阻止其默认行为，
+        // 使输入框内按住拖动选择文本仍可用；拖拽进行中则保持原有接管逻辑
+        if (!this.isGridDragging && this.isFromInteractiveControl(e)) return;
+
         e.preventDefault();
         this.colHeaderCanvas.handleMouseMove(e);
         this.rowHeaderCanvas.handleMouseMove(e);
@@ -416,6 +449,7 @@ export class Sheets extends EventEmitter {
      */
     private handleMouseUp(e: MouseEvent): void {
         e.preventDefault();
+        this.isGridDragging = false;
         // 先处理锚点选择并重置共享拖拽状态（isMouseDown/startLocation 等）
         this.sheetCanvas.handleMouseUp(e);
         // 再收尾行高/列宽拖拽：取消待执行的 rAF、同步应用最终值、提交连续撤销。

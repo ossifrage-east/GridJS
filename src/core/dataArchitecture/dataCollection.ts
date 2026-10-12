@@ -72,8 +72,14 @@ export class DataCollection extends EventEmitter {
      * 定位光标时读取（光标定位必须发生在 lines 刷新之后）。
      */
     private _editRestoreCursor: number = 0;
-    /** 当前选中的工作表名称 */
-    private _activedSheetName: string = 'Sheet1';
+    /**
+     * 当前选中的工作表名称
+     *
+     * 同时也是**默认空白文件**的名字（存档键 = 去扩展名的文件名）：文件树在
+     * 「刷新后一个文件都没有」时会补一个 `sheet1.xlsx`，其存档键正是这里的 `sheet1`，
+     * 因此初次装载的这张空表就是那个空白文件的内容，不会另外多出一条无归属的存档。
+     */
+    private _activedSheetName: string = 'sheet1';
     /** 是否正在编辑 */
     private _isEditting: boolean = false;
     /** 是否显示网格线 */
@@ -180,23 +186,7 @@ export class DataCollection extends EventEmitter {
             this._suppressValuesUndo = true;
             try {
                 if(valueRes) {
-                    const data = DataCollection.fromJSON(valueRes);
-                    this._activedCell = data.activedCell;
-                    this._selection = data.selection || `${data.activedCell}:${data.activedCell}`;
-                    this._anchorSelection = null;
-                    // 直接赋值数组不会触发重算，需显式重算总尺寸，
-                    // 否则 allColWidth/allRowHeight 保持 0，滚动条 thumb 会占满轨道导致无法拖动
-                    this.colHeaders.colHeaders = data.colHeaders;
-                    this.colHeaders.recalcAllColWidth();
-                    this.colHeaders.offsetWidth = data.offsetWidth;
-                    this.rowHeaders.rowHeaders = data.rowHeaders;
-                    this.rowHeaders.recalcAllRowHeight();
-                    this.rowHeaders.offsetHeight = data.offsetHeight;
-                    this._showGridLines = data.showGridLines;
-                    this._zoom = data.zoom;
-                    // 打印设置统一入口随文档恢复（未保存过时保持接口默认值）
-                    this._printSetting = data.printSetting || {};
-                    this.values = data.values;
+                    this._applyLoadedState(DataCollection.fromJSON(valueRes));
                 }
             } finally {
                 // 同步最新快照基准，解除抑制
@@ -208,10 +198,138 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 把从数据库读出的快照装载进当前数据集合
+     *
+     * 供 {@link syncValuesFromDB} 与 {@link switchToSheet} 复用；不负责撤销抑制
+     * 与快照基准，调用方需自行包裹（`_suppressValuesUndo` + `_lastValuesSnapshot`）。
+     * @param data - {@link DataCollection.fromJSON} 的解析结果
+     * @private
+     */
+    private _applyLoadedState(data: ReturnType<typeof DataCollection.fromJSON>): void {
+        this._activedCell = data.activedCell;
+        this._selection = data.selection || `${data.activedCell}:${data.activedCell}`;
+        this._anchorSelection = null;
+        // 直接赋值数组不会触发重算，需显式重算总尺寸，
+        // 否则 allColWidth/allRowHeight 保持 0，滚动条 thumb 会占满轨道导致无法拖动
+        this.colHeaders.colHeaders = data.colHeaders;
+        this.colHeaders.recalcAllColWidth();
+        this.colHeaders.offsetWidth = data.offsetWidth;
+        this.rowHeaders.rowHeaders = data.rowHeaders;
+        this.rowHeaders.recalcAllRowHeight();
+        this.rowHeaders.offsetHeight = data.offsetHeight;
+        this._showGridLines = data.showGridLines;
+        // 走公开 setter 而非直写 _zoom：缩放滑块、滚动条都依赖 ZOOM_CHANGED 同步，
+        // 直接写私有字段会让「切换文件后」的缩放显示与实际渲染不一致
+        this.zoom = data.zoom;
+        // 打印设置统一入口随文档恢复（未保存过时保持接口默认值）
+        this._printSetting = data.printSetting || {};
+        this.values = data.values;
+    }
+
+    /**
+     * 显式广播一次当前工作表内容（补发被抑制的 VALUES_CHANGED）
+     *
+     * `runWithFullStateUndo` 包裹期间 values 的自动广播被抑制（避免在撤销栈里产生空操作），
+     * 但「打开文件」这类**会话中途的全量装载**必须让主页面重绘一次，否则
+     * 画面上仍是上一个文件的内容。装载结束后调用本方法即可：
+     * 先刷新 `_lastValuesSnapshot` 基准（使后续自动保存与撤销基准对齐），再广播。
+     */
+    public notifyValuesChanged(): void {
+        this._lastValuesSnapshot = this.cloneValues(this._values);
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
+    }
+
+    /**
+     * 清空当前工作表并解除与文件的关联（主页面回到「没有打开任何文件」的空表）
+     *
+     * 用于「当前打开的文件被删除且无文件可回退」的场景。与切换一致，清空属于文档级操作：
+     * 不记录撤销，并清空撤销/重做历史。
+     *
+     * 工作表名一并清空（{@link syncValuesToDB} 据此跳过落库）：名字就是存档键，
+     * 若停留在刚被删除的文件名上，之后每帧重绘都会把这份空存档写回该键 ——
+     * 删除等于没删，库里还会多出一条树中并不存在的记录。
+     */
+    public clearCurrentSheet(): void {
+        // 走 setter 而非直写字段：通知外部（文件树据此清掉「定位 / 高亮」）
+        this.activedSheetName = '';
+        this._suppressValuesUndo = true;
+        try {
+            this._clearSheetContent();
+        } finally {
+            this._lastValuesSnapshot = this.cloneValues(this._values);
+            this._suppressValuesUndo = false;
+        }
+        // 装载期间广播被抑制，此处显式补发一次让主页面重绘为空表
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
+        this.undoManager.clear();
+    }
+
+    /**
      * 同步当前选中工作表的所有有内容的单元格数据到数据库中
+     *
+     * 没有打开任何文件（工作表名为空，见 {@link clearCurrentSheet}）时不写库：
+     * 那只是一张没有归属的空表，写下去会造出「树里没有、库里却有」的幽灵存档。
      */
     public async syncValuesToDB(): Promise<void> {
+        if (!this._activedSheetName) return;
         await this.db.setValue(this.activedSheetName, this.toJSON());
+    }
+
+    /**
+     * 切换到指定工作表并装载其内容
+     *
+     * 调用顺序上先固化「当前工作表」的内容，再切换名称并装载目标表，
+     * 因此不会丢改动。目标表尚无存档（如树中刚新建的文件）时按空表处理：
+     * 清空单元格内容、保留行列头尺寸。
+     *
+     * 切换属于文档级操作：不记录撤销，并在切换后清空撤销/重做历史，
+     * 避免「在 A 文件里撤销出 B 文件的内容」这类跨文件污染。
+     * @param {string} sheetName - 目标工作表名（不含扩展名）
+     * @returns {Promise<boolean>} 是否真正发生切换；当前已显示该表时返回 false（内容不变）
+     */
+    public async switchToSheet(sheetName: string): Promise<boolean> {
+        const target = (sheetName ?? '').trim();
+        // 已在主页面显示当前文件 → 内容无变化
+        if (!target || target === this._activedSheetName) return false;
+
+        // 先落库当前表：切换后 activedSheetName 即指向新表，届时再存就存错键了
+        await this.syncValuesToDB();
+
+        const saved = await this.db.getValue(target);
+        // 先改名称：ACTIVED_SHEET_NAME_CHANGED 通知外部（文件树「定位」据此同步），
+        // 后续自动保存也才会写到新表的键上
+        this.activedSheetName = target;
+
+        this._suppressValuesUndo = true;
+        try {
+            if (saved && saved !== '{}') {
+                this._applyLoadedState(DataCollection.fromJSON(saved));
+            } else {
+                this._clearSheetContent();
+            }
+        } finally {
+            this._lastValuesSnapshot = this.cloneValues(this._values);
+            this._suppressValuesUndo = false;
+        }
+
+        // 装载期间 VALUES_CHANGED 被抑制（与初始化装载一致，避免误记撤销），
+        // 但切换发生在会话中途，必须显式广播一次让主页面重绘为切换后的内容
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
+
+        this.undoManager.clear();
+        return true;
+    }
+
+    /**
+     * 清空当前工作表内容（保留行列头尺寸），用于打开尚无存档的新文件
+     * @private
+     */
+    private _clearSheetContent(): void {
+        this._activedCell = 'A1';
+        this._selection = 'A1:A1';
+        this._anchorSelection = null;
+        // values setter 会广播 VALUES_CHANGED → 主页面重绘为空表
+        this.values = [];
     }
     
     /**
@@ -3699,6 +3817,26 @@ export class DataCollection extends EventEmitter {
             zoom: this.zoom,
             values: this.values.map((v: Cell) => v.toJSON()),
         });
+    }
+
+    /**
+     * 空白工作表快照（内容为空，视图设置沿用当前会话）
+     *
+     * 供「新建文件」时写入数据库：让「文件树里有这个文件」与「`values` 库里
+     * 有这个文件的存档」始终一一对应（见 app.ts 的内容桥）。
+     *
+     * 之所以沿用当前视图设置（列宽、行高、缩放、打印设置）而不是全用零值：
+     * 打开一个尚无内容的文件时 {@link switchToSheet} 走的是 {@link _clearSheetContent}，
+     * 本来就保留当前行列头尺寸；若这里写入空的行列头，重新打开该文件会得到
+     * `allColWidth = 0`，滚动条与画布都会异常。
+     * @returns {string} 空白工作表快照（可直接交给 {@link IndexDB.setValue}）
+     */
+    public blankSnapshot(): string {
+        const snapshot = JSON.parse(this.toJSON());
+        snapshot.activedCell = 'A1';
+        snapshot.selection = 'A1:A1';
+        snapshot.values = [];
+        return JSON.stringify(snapshot);
     }
 
     /**
