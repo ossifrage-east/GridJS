@@ -264,7 +264,7 @@ export class Sheets extends EventEmitter {
      * 同一帧/同一宏任务内多次调用 draw() 只真正绘制一次——多次请求合并到单个
      * requestAnimationFrame 回调中执行。事件链（VALUES_CHANGED / SELECTION_CHANGED /
      * ALL_*_CHANGED 等）与右键菜单钩子 refreshAfterContextMenu 常在一次动作中并发触发
-     * draw，合帧后避免重复全量重绘（主画布全量重绘成本高）与重复 syncValuesToDB。
+     * draw，合帧后避免重复全量重绘（主画布全量重绘成本高）。
      * 首次调用仍会等待 CSS 自定义字体加载完成后再绘制。
      *
      * 实现要点：
@@ -288,7 +288,10 @@ export class Sheets extends EventEmitter {
                     this.colHeaderCanvas.draw();
                     this.sheetCanvas.draw();
                     this.editCanvas.draw();
-                    this.data.syncValuesToDB();
+                    // 注意：这里**不再**调用 data.syncValuesToDB()。
+                    // 每帧整表 toJSON() 序列化 + 写 IndexedDB 是打开大文件卡顿/崩溃的成因之一；
+                    // 落库已改由 DataCollection 的「变更事件 → 置脏 → 防抖保存」驱动
+                    // （见 DataCollection._markDirty / _scheduleAutoSave）。
                 } finally {
                     // 释放合帧锁：本帧绘制结束（或被守卫跳过）后，后续 draw() 可排入新帧
                     this._drawPromise = null;

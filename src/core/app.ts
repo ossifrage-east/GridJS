@@ -889,5 +889,13 @@ export class App {
         document.addEventListener('contextmenu', function (e) {
             e.preventDefault(); // 阻止默认右键菜单
         });
+
+        // 自动保存已从「每帧落库」改为「变更后防抖落库」，因此关闭/隐藏页面时必须补一次
+        // 立即固化，否则防抖窗口内的最后一次改动会随页面一起丢失。
+        // pagehide 覆盖关闭/刷新/前进后退；visibilitychange 覆盖切到后台（移动端可能不触发 pagehide）。
+        window.addEventListener('pagehide', () => this.data.flushPendingSave());
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') this.data.flushPendingSave();
+        });
     }
 }

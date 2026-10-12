@@ -159,19 +159,30 @@ export class ColHeaders extends EventEmitter {
 
     /**
      * 获取可见列的起始索引
+     *
+     * 语义与原先的「从头线性扫描」完全一致（返回第一个满足
+     * `offsetWidth >= left && offsetWidth < left + width` 的列，1-based；
+     * 无命中时返回 1），但利用 `left` 随索引单调不减的特性改为二分定位，
+     * 复杂度 O(log N) —— 原实现在滚动到深层列时每帧要扫描上万次。
      * @returns {{startCol: number}} 可见列的起始索引, 从1开始
      */
     public getVisibleStartCol(): {startCol: number} {
-        let startCol = 0;
-        for (let i = 0; i < this.colHeaders.length; i++) {
-            if (this.offsetWidth >= this.colHeaders[i].left
-                && this.offsetWidth < this.colHeaders[i].left + this.colHeaders[i].width
-            ) {
-                startCol = i;
-                break;
-            }
+        const len = this.colHeaders.length;
+        if (len === 0) return { startCol: 1 };
+        const offset = this.offsetWidth;
+        // 二分：最后一个 `left <= offset` 的位置（无则说明 offset 在首列之前）
+        let lo = 0, hi = len - 1, k = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (this.colHeaders[mid].left <= offset) { k = mid; lo = mid + 1; }
+            else hi = mid - 1;
         }
-        return { startCol: startCol + 1 };
+        if (k < 0) return { startCol: 1 };
+        // 命中列必须满足右边缘 > offset；从 k 向前收缩到该连续区间的起点
+        if (!(this.colHeaders[k].left + this.colHeaders[k].width > offset)) return { startCol: 1 };
+        let i = k;
+        while (i > 0 && this.colHeaders[i - 1].left + this.colHeaders[i - 1].width > offset) i--;
+        return { startCol: i + 1 };
     }
 
     /**
@@ -375,19 +386,29 @@ export class RowHeaders extends EventEmitter {
     
     /**
      * 获取可见行的起始索引
+     *
+     * 语义与原先的「从头线性扫描」完全一致（返回第一个满足
+     * `offsetHeight >= top && offsetHeight <= top + height` 的行，1-based；
+     * 无命中时返回 1），但利用 `top` 随索引单调不减的特性改为二分定位，
+     * 复杂度 O(log N) —— 原实现在滚动到深层行时每帧要扫描上万次。
      * @returns {{startRow: number}} 可见行的起始索引, 从1开始
      */
     public getVisibleStartRow(): {startRow: number} {
-        let startRow = 0;
-        for (let i = 0; i < this.rowHeaders.length; i++) {
-            if (this.offsetHeight >= this.rowHeaders[i].top
-                && this.offsetHeight <= this.rowHeaders[i].top + this.rowHeaders[i].height
-            ) {
-                startRow = i;
-                break;
-            }
+        const len = this.rowHeaders.length;
+        if (len === 0) return { startRow: 1 };
+        const offset = this.offsetHeight;
+        let lo = 0, hi = len - 1, k = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (this.rowHeaders[mid].top <= offset) { k = mid; lo = mid + 1; }
+            else hi = mid - 1;
         }
-        return { startRow: startRow + 1 };
+        if (k < 0) return { startRow: 1 };
+        // 命中行必须满足下边缘 >= offset；否则说明偏移已越过内容底部（与旧实现一致返回 1）
+        if (!(this.rowHeaders[k].top + this.rowHeaders[k].height >= offset)) return { startRow: 1 };
+        let i = k;
+        while (i > 0 && this.rowHeaders[i - 1].top + this.rowHeaders[i - 1].height >= offset) i--;
+        return { startRow: i + 1 };
     }
 
     /**

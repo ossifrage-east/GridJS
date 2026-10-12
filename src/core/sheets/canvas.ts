@@ -62,6 +62,29 @@ export class Canvas extends EventEmitter {
     menuContent: MenuContent;
 
     /**
+     * 字符宽度测量缓存：`字体串\0字符` → 宽度（CSS 像素）。
+     *
+     * `ctx.font = ...` 之后调用 `measureText` 是本项目最热的绘制开销之一
+     * （每个字符、每帧都要来一次）。一张表通常只有寥寥几种字体、字符种类也
+     * 有限，因此缓存命中率极高。键里已包含字号（含 zoom），缩放变化不会读到
+     * 错误宽度。设为静态：主画布 / 行列头 / 编辑画布 共享同一份缓存。
+     */
+    private static readonly _charWidthCache: Map<string, number> = new Map();
+    /** 字符宽度缓存条目上限（超出后整体清空，避免异常输入把内存吃满） */
+    private static readonly CHAR_WIDTH_CACHE_LIMIT = 20000;
+    /**
+     * 离屏画布池：`宽x高` → 可复用的离屏画布。
+     *
+     * 原先每绘制一个单元格就 `new OffscreenCanvas(...)` 一次，一帧数百个画布对象，
+     * 是 GC 与显存压力的主要来源。改为按「像素尺寸」复用：
+     * 同尺寸的单元格（占绝大多数）共享同一块离屏画布。
+     * 调用方约定「取用后立即清空并随即合成到主画布」，因此复用是安全的。
+     */
+    private readonly _offscreenPool: Map<string, { canvas: OffscreenCanvas, ctx: OffscreenCanvasRenderingContext2D }> = new Map();
+    /** 离屏画布池条目上限（超出后整体清空，避免尺寸抖动导致无限增长） */
+    private static readonly OFFSCREEN_POOL_LIMIT = 64;
+
+    /**
      * 构造函数
      * @constructor
      * @param {CanvasOptions} options - 初始化选项
@@ -163,8 +186,8 @@ export class Canvas extends EventEmitter {
         const { col, row } = this.data.getCellColAndRow(cell);
         const { left: cellLeft, top: cellTop, width: cellWidth, height: cellHeight } = this.data.calculateCellRect(col, row);
         
-        const index = this.data.values.findIndex((item) => item.cell === cell);
-        if (index === -1) {
+        const cellObj = this.data.getCellByName(cell);
+        if (!cellObj) {
             const x = Math.round(CELL_PADDING + cellWidth * this.data.zoom / 2);
             const y = Math.round(CELL_PADDING + (cellHeight * this.data.zoom - DEFAULT_FONT_SIZE * this.data.zoom) / 2);
 
@@ -180,14 +203,13 @@ export class Canvas extends EventEmitter {
             };
         }
         
-        const value = this.data.getCellValue(cell);
-        const cellObj = this.data.values[index];
-        const displayValue = getCellDisplayText(value, cellObj?.numberFormat);
-        const fontSize = Math.round((this.data.values[index].fontSize || DEFAULT_FONT_SIZE) 
+        const value = cellObj.getText();
+        const displayValue = getCellDisplayText(value, cellObj.numberFormat);
+        const fontSize = Math.round((cellObj.fontSize || DEFAULT_FONT_SIZE) 
             * this.data.zoom);
-        const letterSpacing = this.data.values[index].letterSpacing || 0;
-        const wrap = this.data.values[index].wrap || false;
-        const lineSpacing = this.data.values[index].lineSpacing || 0;
+        const letterSpacing = cellObj.letterSpacing || 0;
+        const wrap = cellObj.wrap || false;
+        const lineSpacing = cellObj.lineSpacing || 0;
         
         const paragraphs = displayValue.split('\n');
         let cellValueWidth = 0, cellValueHeight = 0, charStartIndex = 0;
@@ -232,18 +254,22 @@ export class Canvas extends EventEmitter {
         const contentHeight = Math.max(cellValueHeight, cellHeight * this.data.zoom);
         
         let currentY = 0;
+        // 对齐方式对同一单元格的所有行都相同，循环外读取一次即可
+        // （原先每行都重新按名称查一次单元格，是纯浪费）
+        const textAlign = cellObj.textAlign;
+        const alignItems = cellObj.alignItems;
         for (const [lineIndex, line] of lines.entries()) {
-            if (this.data.values.find((item) => item.cell === cell)?.textAlign === 'left') {
+            if (textAlign === 'left') {
                 lines[lineIndex].x = CELL_PADDING;
-            } else if (this.data.values.find((item) => item.cell === cell)?.textAlign === 'right') {
+            } else if (textAlign === 'right') {
                 lines[lineIndex].x = Math.round(cellWidth * this.data.zoom - line.lineWidth - CELL_PADDING);
             } else {
                 lines[lineIndex].x = Math.round((cellWidth * this.data.zoom - line.lineWidth) / 2);
             }
             
-            if (this.data.values.find((item) => item.cell === cell)?.alignItems === 'top') {
+            if (alignItems === 'top') {
                 lines[lineIndex].y = Math.round(CELL_PADDING + currentY);
-            } else if (this.data.values.find((item) => item.cell === cell)?.alignItems === 'bottom') {
+            } else if (alignItems === 'bottom') {
                 lines[lineIndex].y = Math.round(currentY
                     + cellHeight * this.data.zoom - cellValueHeight - CELL_PADDING);
             } else {
@@ -346,7 +372,7 @@ export class Canvas extends EventEmitter {
      *          字符几何信息和样式信息
      */
     public calculateCharGeometry(cell: string, charIndex: number): { charWidth: number; charHeight: number; fontColor: string; fontWeight: string; fontStyle: string; fontSize: number; fontFamily: string; underline: boolean; strikethrough: boolean } {
-        const cellObj = this.data.values.find((item) => item.cell === cell);
+        const cellObj = this.data.getCellByName(cell);
         // chars 数组是字符内容与样式的唯一数据源，避免额外重建整串字符串
         const charObj = cellObj?.chars?.[charIndex];
 
@@ -373,14 +399,29 @@ export class Canvas extends EventEmitter {
         }
         const isMeasurable = typeof char === 'string' && char.length > 0 && !KEYWORDS.includes(char);
 
-        this.ctx.save();
         const fontParts: string[] = [];
         if (fontStyle) fontParts.push(fontStyle);
         if (fontWeight) fontParts.push(fontWeight);
         fontParts.push(`${fontSize}px`, fontFamily);
-        this.ctx.font = fontParts.join(' ');
-        const charWidth = isMeasurable ? this.ctx.measureText(char).width : 0;
-        this.ctx.restore();
+        const font = fontParts.join(' ');
+
+        let charWidth = 0;
+        if (isMeasurable) {
+            const cacheKey = font + '\u0000' + char;
+            const cached = Canvas._charWidthCache.get(cacheKey);
+            if (cached !== undefined) {
+                charWidth = cached;
+            } else {
+                this.ctx.save();
+                this.ctx.font = font;
+                charWidth = this.ctx.measureText(char).width;
+                this.ctx.restore();
+                if (Canvas._charWidthCache.size >= Canvas.CHAR_WIDTH_CACHE_LIMIT) {
+                    Canvas._charWidthCache.clear();
+                }
+                Canvas._charWidthCache.set(cacheKey, charWidth);
+            }
+        }
 
         return { charWidth, charHeight: fontSize, fontColor, fontWeight, fontStyle, fontSize, fontFamily, underline, strikethrough };
     }
@@ -470,12 +511,44 @@ export class Canvas extends EventEmitter {
         this.ctx.lineTo(_x, _y);
     }
 
+    /**
+     * 获取一块离屏画布用于局部合成（文本 / 选区背景等）
+     *
+     * 复用策略：按「整数像素尺寸」缓存离屏画布（{@link _offscreenPool}）。
+     * 原实现每绘制一个单元格就新建一次离屏画布，一帧可达数百个对象，
+     * 是 GC 与显存抖动的主要来源。同尺寸单元格（占绝大多数）现在共享同一块画布。
+     *
+     * 复用安全前提（调用方约定）：取用后**同步**清空 → 绘制 → `drawImage` 合成到主画布，
+     * 不跨帧/跨单元格持有该画布引用。现有调用方均满足此约定。
+     *
+     * 尺寸按 `Math.floor` 归一：与 `new OffscreenCanvas()` 对浮点参数的截断（ToUint32）
+     * 行为一致，保证复用前后画布尺寸完全不变，避免合成缩放产生 1px 偏差。
+     * @param {number} width - 逻辑宽度（物理像素）
+     * @param {number} height - 逻辑高度（物理像素）
+     * @returns {{ offscreenCanvas: OffscreenCanvas, offscreenCtx: OffscreenCanvasRenderingContext2D }}
+     */
     public offscreen(width: number, height: number): {
         offscreenCanvas: OffscreenCanvas,
         offscreenCtx: OffscreenCanvasRenderingContext2D 
     } {
-        const offscreenCanvas = new OffscreenCanvas(width, height);
-        const offscreenCtx = offscreenCanvas.getContext('2d');
+        const w = Math.max(1, Math.floor(width));
+        const h = Math.max(1, Math.floor(height));
+        const key = `${w}x${h}`;
+        let entry = this._offscreenPool.get(key);
+        if (entry === undefined) {
+            const offscreenCanvas = new OffscreenCanvas(w, h);
+            const offscreenCtx = offscreenCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
+            entry = { canvas: offscreenCanvas, ctx: offscreenCtx };
+            // 尺寸抖动（如缩放动画）会让池不断膨胀，超限后整体清空
+            if (this._offscreenPool.size >= Canvas.OFFSCREEN_POOL_LIMIT) {
+                this._offscreenPool.clear();
+            }
+            this._offscreenPool.set(key, entry);
+        }
+        const offscreenCanvas = entry.canvas;
+        const offscreenCtx = entry.ctx;
+        // 复用画布需显式复位绘制状态：上一次可能残留 textAlign/'left'、逐字符 font 等
+        offscreenCtx.setTransform(1, 0, 0, 1, 0, 0);
         offscreenCtx.strokeStyle = GRID_LINE_COLOR;
         offscreenCtx.lineWidth = 1;
         offscreenCtx.font = `${Math.round(DEFAULT_FONT_SIZE * this.data.zoom * window.devicePixelRatio)}px ${DEFAULT_FONT_FAMILY}`;
@@ -1435,7 +1508,7 @@ export class Canvas extends EventEmitter {
     private openFormatCellsDialog(startCol: number, endCol: number, startRow: number, endRow: number): void {
         const data = this.data;
         const anchorCellName = data.getCellName(startCol, startRow);
-        const anchorCell = data.values.find(v => v.cell === anchorCellName);
+        const anchorCell = data.getCellByName(anchorCellName);
         const currentFormat = anchorCell?.numberFormat;
         const currentBorderColor = anchorCell?.borderColor || '#000000';
 

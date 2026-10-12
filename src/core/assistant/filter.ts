@@ -87,7 +87,7 @@ export class Filter {
         // 取消隐藏后行/列位置变化，按钮需重新定位到当前单元格的新坐标；
         // 仅在按钮可见时重算（隐藏态下 setPosition 会因 isHidden 早退，徒增开销）
         if (this.filter.style.display !== 'none' && this.currentCellName) {
-            const cell = this.data.values.find(c => c.cell === this.currentCellName) || { cell: this.currentCellName } as Cell;
+            const cell = this.data.getCellByName(this.currentCellName) || { cell: this.currentCellName } as Cell;
             this.setPosition(cell);
         }
         const col = this.currentCol;
@@ -431,7 +431,7 @@ export class Filter {
         // 优先使用本实例绑定的筛选单元格，缺省回退到当前激活单元格
         const cellName = this.currentCellName || this.data.activedCell;
         if (!cellName) return;
-        const _cell = this.data.values.find((c) => c.cell === cellName);
+        const _cell = this.data.getCellByName(cellName);
         if (!_cell || _cell.filter === undefined) return;
 
         this.tips.textContent = '';

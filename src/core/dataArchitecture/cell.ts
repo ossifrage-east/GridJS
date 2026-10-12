@@ -1,6 +1,4 @@
 import { Char } from "./char";
-import { DataEvents } from "../constant";
-import { EventEmitter } from "../../utils/eventEmitter";
 
 /**
  * 文本对齐方式类型
@@ -14,53 +12,37 @@ export type VerticalAlign = 'top' | 'middle' | 'bottom';
 
 
 /**
- * Cell 类
+ * Cell 纯数据类
  * 表示电子表格的单元格，包含样式和值属性
- * 提供属性变更监听和事件通知机制
- * 
+ *
+ * ## 为什么不再是 EventEmitter（性能约定，请勿回退）
+ * 历史实现让 `Cell` 继承 `EventEmitter`，每个单元格因此都携带一个独立的 `Map`
+ * （监听表）。一张大表动辄数十万单元格，仅此一项就吃掉大量内存，是「打开大
+ * Excel 页面崩溃」的原因之一。经全仓核查，**没有任何代码订阅过 Cell / Char
+ * 的事件**（相关 `on(...)` 只出现在文档注释里），故此处退化为纯数据类，
+ * 字段直接赋值，不再走 `updateProperty` 的「比较 + 派发」链路。
+ *
+ * 对外契约保持不变：所有既有 getter/setter（`cell` / `colspan` / `fontSize` /
+ * `chars` / `wrap` …）与 {@link Cell.clone} / {@link Cell.isEmpty} /
+ * {@link Cell.toJSON} 行为一致。
+ *
  * @class Cell
- * @extends Char
  * @example
  * const cell = new Cell();
+ * cell.cell = 'A1';
  * cell.rowspan = 2;
- * cell.borderTopWidth = 1;
- * cell.borderBottomWidth = 1;
- * cell.borderLeftWidth = 1;
- * cell.borderRightWidth = 1;
  * cell.textAlign = 'center';
- * cell.alignItems = 'middle';
- * cell.backgroundColor = '#f0f0f0';
- * cell.filter = 32;
- * cell.wrap = true;
- * cell.letterSpacing = 1;
- * cell.lineSpacing = 1;
- * cell.colspan = 2;
- * cell.chars = [new Char()];
- * cell.on('cell:rowspan', ({ property, oldValue, newValue }) => console.log(`${property} changed`));
+ * cell.chars = [Char.of('a')];
  */
-export class Cell extends EventEmitter {
+export class Cell {
     /** 单元格名称 */
-    private _cell!: string;
-    /** 是否可以编辑 */ 
+    private _cell: string = '';
+    /** 是否可以编辑 */
     private _isEdit: boolean = true;
     /** 跨列数 */
     private _colspan?: number;
     /** 跨行数 */
     private _rowspan?: number;
-    // /** 字体族 */
-    // private _fontFamily?: string;
-    // /** 字体大小 */
-    // private _fontSize?: number;
-    // /** 字体粗细 */
-    // private _fontWeight?: boolean;
-    // /** 字体样式 */
-    // private _fontStyle?: boolean;
-    // /** 字体颜色 */
-    // private _fontColor?: string;
-    // /** 下划线 */
-    // private _underline?: boolean;
-    // /** 删除线 */
-    // private _strikethrough?: boolean;
     /** 上边框宽度 */
     private _borderTopWidth?: number;
     /** 下边框宽度 */
@@ -80,7 +62,7 @@ export class Cell extends EventEmitter {
     /** 边框颜色，默认 '#000000' */
     private _borderColor?: string;
     /** 单元格值 */
-    private _chars?: Char[] = new Array<Char>();
+    private _chars: Char[] = new Array<Char>();
     /** 过滤 */
     private _filter?: number | undefined;
     /** 换行 */
@@ -94,7 +76,6 @@ export class Cell extends EventEmitter {
      * 构造函数
      */
     constructor() {
-        super();
     }
 
     /**
@@ -109,9 +90,9 @@ export class Cell extends EventEmitter {
      * @param {string} value - 单元格名称
      */
     set cell(value: string) {
-        this.updateProperty(DataEvents.CELL_CHANGED, '_cell', value);
+        this._cell = value;
     }
-    
+
     /**
      * 获取是否正在编辑
      * @returns {boolean} 是否正在编辑
@@ -125,9 +106,9 @@ export class Cell extends EventEmitter {
      * @param {boolean} value - 是否正在编辑
      */
     set isEdit(value: boolean) {
-        this.updateProperty(DataEvents.IS_EDIT_CHANGED, '_isEdit', value);
+        this._isEdit = value;
     }
-    
+
     /**
      * 获取跨列数
      * @returns {number | undefined} 跨列数
@@ -135,15 +116,15 @@ export class Cell extends EventEmitter {
     get colspan(): number | undefined {
         return this._colspan;
     }
-    
+
     /**
      * 设置跨列数
      * @param {number} colspan - 跨列数
      */
     set colspan(colspan: number) {
-        this.updateProperty(DataEvents.COLSPAN_CHANGED, '_colspan', colspan);
+        this._colspan = colspan;
     }
-    
+
     /**
      * 获取跨行数
      * @returns {number | undefined} 跨行数
@@ -151,13 +132,13 @@ export class Cell extends EventEmitter {
     get rowspan(): number | undefined {
         return this._rowspan;
     }
-    
+
     /**
      * 设置跨行数
      * @param {number} rowspan - 跨行数
      */
     set rowspan(rowspan: number) {
-        this.updateProperty(DataEvents.ROWSPAN_CHANGED, '_rowspan', rowspan);
+        this._rowspan = rowspan;
     }
 
     /**
@@ -166,8 +147,8 @@ export class Cell extends EventEmitter {
      */
     get fontFamily(): string | undefined {
         // 如果单元格有字符,则返回第一个字符的字体族
-        if (this.chars && this.chars.length > 0) {
-            return this.chars[0].fontFamily;
+        if (this._chars && this._chars.length > 0) {
+            return this._chars[0].fontFamily;
         }
         return undefined;
     }
@@ -178,9 +159,9 @@ export class Cell extends EventEmitter {
      */
     set fontFamily(value: string | undefined) {
         // 如果单元格有字符,则将字体族设置为所有字符的字体族
-        if (this.chars && this.chars.length > 0) {
-            this.chars.forEach(char => char.fontFamily = value);
-        }
+        if (this._chars && this._chars.length > 0) {
+            this._chars.forEach(char => char.fontFamily = value);
+            }
     }
 
     /**
@@ -189,8 +170,8 @@ export class Cell extends EventEmitter {
      */
     get fontSize(): number | undefined {
         // 如果单元格有字符,则返回第一个字符的字体大小
-        if (this.chars && this.chars.length > 0) {
-            return this.chars[0].fontSize;
+        if (this._chars && this._chars.length > 0) {
+            return this._chars[0].fontSize;
         }
         return undefined;
     }
@@ -201,9 +182,9 @@ export class Cell extends EventEmitter {
      */
     set fontSize(value: number | undefined) {
         // 如果单元格有字符,则将字体大小设置为所有字符的字体大小
-        if (this.chars && this.chars.length > 0) {
-            this.chars.forEach(char => char.fontSize = value);
-        }
+        if (this._chars && this._chars.length > 0) {
+            this._chars.forEach(char => char.fontSize = value);
+            }
     }
 
     /**
@@ -212,8 +193,8 @@ export class Cell extends EventEmitter {
      */
     get fontWeight(): boolean | undefined {
         // 如果单元格有字符,则返回第一个字符的字体粗细
-        if (this.chars && this.chars.length > 0) {
-            return this.chars[0].fontWeight;
+        if (this._chars && this._chars.length > 0) {
+            return this._chars[0].fontWeight;
         }
         return undefined;
     }
@@ -224,9 +205,9 @@ export class Cell extends EventEmitter {
      */
     set fontWeight(value: boolean | undefined) {
         // 如果单元格有字符,则将字体粗细设置为所有字符的字体粗细
-        if (this.chars && this.chars.length > 0) {
-            this.chars.forEach(char => char.fontWeight = value);
-        }
+        if (this._chars && this._chars.length > 0) {
+            this._chars.forEach(char => char.fontWeight = value);
+            }
     }
 
     /**
@@ -235,8 +216,8 @@ export class Cell extends EventEmitter {
      */
     get fontStyle(): boolean | undefined {
         // 如果单元格有字符,则返回第一个字符的字体样式
-        if (this.chars && this.chars.length > 0) {
-            return this.chars[0].fontStyle;
+        if (this._chars && this._chars.length > 0) {
+            return this._chars[0].fontStyle;
         }
         return undefined;
     }
@@ -247,9 +228,9 @@ export class Cell extends EventEmitter {
      */
     set fontStyle(value: boolean | undefined) {
         // 如果单元格有字符,则将字体样式设置为所有字符的字体样式
-        if (this.chars && this.chars.length > 0) {
-            this.chars.forEach(char => char.fontStyle = value);
-        }
+        if (this._chars && this._chars.length > 0) {
+            this._chars.forEach(char => char.fontStyle = value);
+            }
     }
 
     /**
@@ -258,8 +239,8 @@ export class Cell extends EventEmitter {
      */
     get fontColor(): string | undefined {
         // 如果单元格有字符,则返回第一个字符的字体颜色
-        if (this.chars && this.chars.length > 0) {
-            return this.chars[0].fontColor;
+        if (this._chars && this._chars.length > 0) {
+            return this._chars[0].fontColor;
         }
         return undefined;
     }
@@ -270,19 +251,19 @@ export class Cell extends EventEmitter {
      */
     set fontColor(value: string | undefined) {
         // 如果单元格有字符,则将字体颜色设置为所有字符的字体颜色
-        if (this.chars && this.chars.length > 0) {
-            this.chars.forEach(char => char.fontColor = value);
-        }
+        if (this._chars && this._chars.length > 0) {
+            this._chars.forEach(char => char.fontColor = value);
+            }
     }
-    
+
     /**
      * 获取下划线状态
      * @returns {boolean | undefined} 是否有下划线
      */
     get underline(): boolean | undefined {
         // 如果单元格有字符,则返回第一个字符的下划线状态
-        if (this.chars && this.chars.length > 0) {
-            return this.chars[0].underline;
+        if (this._chars && this._chars.length > 0) {
+            return this._chars[0].underline;
         }
         return undefined;
     }
@@ -293,19 +274,19 @@ export class Cell extends EventEmitter {
      */
     set underline(value: boolean | undefined) {
         // 如果单元格有字符,则将下划线状态设置为所有字符的下划线状态
-        if (this.chars && this.chars.length > 0) {
-            this.chars.forEach(char => char.underline = value);
-        }
+        if (this._chars && this._chars.length > 0) {
+            this._chars.forEach(char => char.underline = value);
+            }
     }
-    
+
     /**
      * 获取删除线状态
      * @returns {boolean | undefined} 是否有删除线
      */
     get strikethrough(): boolean | undefined {
         // 如果单元格有字符,则返回第一个字符的删除线状态
-        if (this.chars && this.chars.length > 0) {
-            return this.chars[0].strikethrough;
+        if (this._chars && this._chars.length > 0) {
+            return this._chars[0].strikethrough;
         }
         return undefined;
     }
@@ -316,9 +297,9 @@ export class Cell extends EventEmitter {
      */
     set strikethrough(value: boolean | undefined) {
         // 如果单元格有字符,则将删除线状态设置为所有字符的删除线状态
-        if (this.chars && this.chars.length > 0) {
-            this.chars.forEach(char => char.strikethrough = value);
-        }
+        if (this._chars && this._chars.length > 0) {
+            this._chars.forEach(char => char.strikethrough = value);
+            }
     }
 
     /**
@@ -333,9 +314,9 @@ export class Cell extends EventEmitter {
      * @param {number} borderTopWidth - 上边框宽度
      */
     set borderTopWidth(borderTopWidth: number) {
-        this.updateProperty(DataEvents.BORDER_TOP_WIDTH_CHANGED, '_borderTopWidth', borderTopWidth);
+        this._borderTopWidth = borderTopWidth;
     }
-    
+
     /**
      * 获取下边框宽度
      * @returns {number | undefined} 下边框宽度
@@ -343,15 +324,15 @@ export class Cell extends EventEmitter {
     get borderBottomWidth(): number | undefined {
         return this._borderBottomWidth;
     }
-    
+
     /**
      * 设置下边框宽度
      * @param {number} borderBottomWidth - 下边框宽度
      */
     set borderBottomWidth(borderBottomWidth: number) {
-        this.updateProperty(DataEvents.BORDER_BOTTOM_WIDTH_CHANGED, '_borderBottomWidth', borderBottomWidth);
+        this._borderBottomWidth = borderBottomWidth;
     }
-    
+
     /**
      * 获取左边框宽度
      * @returns {number | undefined} 左边框宽度
@@ -359,15 +340,15 @@ export class Cell extends EventEmitter {
     get borderLeftWidth(): number | undefined {
         return this._borderLeftWidth;
     }
-    
+
     /**
      * 设置左边框宽度
      * @param {number} borderLeftWidth - 左边框宽度
      */
     set borderLeftWidth(borderLeftWidth: number) {
-        this.updateProperty(DataEvents.BORDER_LEFT_WIDTH_CHANGED, '_borderLeftWidth', borderLeftWidth);
+        this._borderLeftWidth = borderLeftWidth;
     }
-    
+
     /**
      * 获取右边框宽度
      * @returns {number | undefined} 右边框宽度
@@ -375,15 +356,15 @@ export class Cell extends EventEmitter {
     get borderRightWidth(): number | undefined {
         return this._borderRightWidth;
     }
-    
+
     /**
      * 设置右边框宽度
      * @param {number} borderRightWidth - 右边框宽度
      */
     set borderRightWidth(borderRightWidth: number) {
-        this.updateProperty(DataEvents.BORDER_RIGHT_WIDTH_CHANGED, '_borderRightWidth', borderRightWidth);
+        this._borderRightWidth = borderRightWidth;
     }
-    
+
     /**
      * 获取文本对齐方式
      * @returns {TextAlign | undefined} 文本对齐方式
@@ -391,15 +372,15 @@ export class Cell extends EventEmitter {
     get textAlign(): TextAlign | undefined {
         return this._textAlign;
     }
-    
+
     /**
      * 设置文本对齐方式
      * @param {TextAlign} textAlign - 文本对齐方式
      */
     set textAlign(textAlign: TextAlign) {
-        this.updateProperty(DataEvents.TEXT_ALIGN_CHANGED, '_textAlign', textAlign);
+        this._textAlign = textAlign;
     }
-    
+
     /**
      * 获取垂直对齐方式
      * @returns {VerticalAlign | undefined} 垂直对齐方式
@@ -407,15 +388,15 @@ export class Cell extends EventEmitter {
     get alignItems(): VerticalAlign | undefined {
         return this._alignItems;
     }
-    
+
     /**
      * 设置垂直对齐方式
      * @param {VerticalAlign} alignItems - 垂直对齐方式
      */
     set alignItems(alignItems: VerticalAlign) {
-        this.updateProperty(DataEvents.ALIGN_ITEMS_CHANGED, '_alignItems', alignItems);
+        this._alignItems = alignItems;
     }
-    
+
     /**
      * 获取背景颜色
      * @returns {string | undefined} 背景颜色
@@ -423,13 +404,13 @@ export class Cell extends EventEmitter {
     get backgroundColor(): string | undefined {
         return this._backgroundColor;
     }
-    
+
     /**
      * 设置背景颜色
      * @param {string} backgroundColor - 背景颜色
      */
     set backgroundColor(backgroundColor: string) {
-        this.updateProperty(DataEvents.BACKGROUND_COLOR_CHANGED, '_backgroundColor', backgroundColor);
+        this._backgroundColor = backgroundColor;
     }
 
     /**
@@ -445,7 +426,7 @@ export class Cell extends EventEmitter {
      * @param {string} numberFormat - 数字格式码
      */
     set numberFormat(numberFormat: string) {
-        this.updateProperty(DataEvents.NUMBER_FORMAT_CHANGED, '_numberFormat', numberFormat);
+        this._numberFormat = numberFormat;
     }
 
     /**
@@ -461,24 +442,40 @@ export class Cell extends EventEmitter {
      * @param {string} borderColor - 边框颜色
      */
     set borderColor(borderColor: string) {
-        this.updateProperty(DataEvents.BORDER_COLOR_CHANGED, '_borderColor', borderColor);
+        this._borderColor = borderColor;
     }
-    
+
     /**
      * 获取单元格值内容
      * @returns {Char[] | undefined} 单元格值数组
      */
     get chars(): Char[] | undefined {
         return this._chars;
-    }    
-    
+    }
+
     /**
      * 设置单元格值内容
      * @param {Char[]} chars - 单元格值数组
      */
     set chars(chars: Char[]) {
-        this.updateProperty(DataEvents.VALUE_CHANGED, '_chars', chars);
+        this._chars = chars;
     }
+
+    /**
+     * 获取纯文本内容（字符拼接）
+     * 集中在此处拼接，避免各调用方重复 `chars.map(c => c.char).join('')`。
+     * @returns {string} 单元格文本
+     */
+    public getText(): string {
+        if (!this._chars || this._chars.length === 0) return '';
+        let text = '';
+        for (let i = 0; i < this._chars.length; i++) {
+            const ch = this._chars[i].char;
+            if (ch != null) text += ch;
+        }
+        return text;
+    }
+
     /**
      * 获取是否启用筛选
      * @returns {number | undefined} 是否启用筛选
@@ -486,15 +483,16 @@ export class Cell extends EventEmitter {
     get filter(): number | undefined {
         return this._filter;
     }
-    
+
     /**
      * 设置是否启用筛选
      * @param {number} filter - 是否启用筛选
      */
     set filter(filter: number) {
-        this.updateProperty(DataEvents.FILTER_CHANGED, '_filter', filter);
+        this._filter = filter;
+        // 筛选标记随存档持久化、并参与撤销快照等价判定，故计入修订号
     }
-    
+
     /**
      * 获取是否启用换行
      * @returns {boolean | undefined} 是否启用换行
@@ -502,15 +500,15 @@ export class Cell extends EventEmitter {
     get wrap(): boolean | undefined {
         return this._wrap;
     }
-    
+
     /**
      * 设置是否启用换行
      * @param {boolean} wrap - 是否启用换行
      */
     set wrap(wrap: boolean) {
-        this.updateProperty(DataEvents.WRAP_CHANGED, '_wrap', wrap);
+        this._wrap = wrap;
     }
-    
+
     /**
      * 获取字间距
      * @returns {number | undefined} 字间距
@@ -518,15 +516,15 @@ export class Cell extends EventEmitter {
     get letterSpacing(): number | undefined {
         return this._letterSpacing;
     }
-    
+
     /**
      * 设置字间距
      * @param {number} letterSpacing - 字间距
      */
     set letterSpacing(letterSpacing: number) {
-        this.updateProperty(DataEvents.LETTER_SPACING_CHANGED, '_letterSpacing', letterSpacing);
+        this._letterSpacing = letterSpacing;
     }
-    
+
     /**
      * 获取行间距
      * @returns {number | undefined} 行间距
@@ -534,13 +532,13 @@ export class Cell extends EventEmitter {
     get lineSpacing(): number | undefined {
         return this._lineSpacing;
     }
-    
+
     /**
      * 设置行间距
      * @param {number} lineSpacing - 行间距
      */
     set lineSpacing(lineSpacing: number) {
-        this.updateProperty(DataEvents.LINE_SPACING_CHANGED, '_lineSpacing', lineSpacing);
+        this._lineSpacing = lineSpacing;
     }
 
     /**
@@ -551,13 +549,11 @@ export class Cell extends EventEmitter {
         const chars = Array.from(value); // 将字符串转换为字符数组
         const _chars: Char[] = [];
         for (const char of chars) {
-            const _char = new Char();
-            _char.char = char;
-            _chars.push(_char);
+            _chars.push(Char.of(char));
         }
         this.chars = _chars;
     }
-    
+
     /**
      * 清空单元格值
      */
@@ -621,12 +617,6 @@ export class Cell extends EventEmitter {
                 }
             }
         }
-        // 文字的样式（单元格级）：对齐、换行、间距
-        // if (this._textAlign !== undefined || this._alignItems !== undefined
-        //     || this._wrap !== undefined || this._letterSpacing !== undefined
-        //     || this._lineSpacing !== undefined) {
-        //     return false;
-        // } 
         // 背景颜色
         if (this._backgroundColor !== undefined) {
             return false;
@@ -638,7 +628,7 @@ export class Cell extends EventEmitter {
         }
         return true;
     }
-    
+
     /**
      * 删除单元格值中的字符
      * @param {number} position - 字符索引
@@ -647,7 +637,7 @@ export class Cell extends EventEmitter {
     public deleteChar(position: number, count: number = 1) {
         const chars = this.chars;
         chars.splice(position, count);
-        this.chars = chars;
+        this._chars = chars;
     }
 
     /**
@@ -658,16 +648,14 @@ export class Cell extends EventEmitter {
     public insertChar(position: number, chars: string) {
         const _chars = Array.from(chars); // 将字符串转换为字符数组
         for (const _char of _chars) {
-            const char= new Char();
-            char.char = _char;
-            this.chars.splice(position, 0, char);
+            this._chars.splice(position, 0, Char.of(_char));
             position++;
         }
     }
 
     /**
      * 深拷贝当前 Cell 对象
-     * 直接通过内部字段赋值（绕过 setter），避免触发事件与不必要的回写，
+     * 直接通过内部字段赋值（绕过 setter），避免不必要的修订号自增，
      * 字符数组同样逐个调用 Char.clone() 进行深拷贝，确保快照与原数据完全解耦。
      * @returns {Cell} 深拷贝后的新 Cell 对象
      */
@@ -705,7 +693,7 @@ export class Cell extends EventEmitter {
         }
         return JSON.stringify(charsJSON);
     }
-    
+
     /**
      * 从字符字符串数组JSON字符串创建单元格值
      * @param {string} charsJSON - 字符字符串数组JSON字符串
@@ -741,9 +729,15 @@ export class Cell extends EventEmitter {
             lineSpacing: this._lineSpacing
         });
     }
-    
+
     /**
      * 从普通JSON创建单元格实例
+     *
+     * 【已知陷阱，勿在装载路径使用】入参为**单个 Cell 的 JSON 字符串**时，
+     * `JSON.parse` 得到的是对象而非数组，函数内的 `.map` 会抛错；
+     * 且 `fromCharsJSON(item.chars)` 会把 `chars` 当成对象解析而丢失内容。
+     * 装载存档请统一走 {@link DataCollection.fromJSON}（其内含两层字符解码）。
+     * 保留本方法仅为兼容历史调用点。
      * @param {string} json - 包含所有属性的JSON字符串
      * @returns {Cell} 单元格实例
      */
@@ -773,5 +767,5 @@ export class Cell extends EventEmitter {
         });
     }
 
-    
+
 }

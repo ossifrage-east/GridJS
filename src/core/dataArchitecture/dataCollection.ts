@@ -39,6 +39,35 @@ export class DataCollection extends EventEmitter {
     /** 当前工作表sheet，所有有内容的JSON字符串（内部后备字段，统一通过 values getter/setter 访问） */
     private _values: Cell[] = [];
     /**
+     * 稀疏单元格索引：单元格名 → Cell。
+     *
+     * **本索引是「按名称取单元格」的唯一入口**（{@link getCellByName}）。
+     * 历史实现用 `values.find(v => v.cell === name)` 线性查找，渲染路径上
+     * 「每个单元格 × 每个字符」都要查一次 → O(N²·L)，是大表卡死/崩溃的主因。
+     * 数组 `_values` 仅作为**有序视图**（迭代、序列化、长度）保留。
+     *
+     * 索引为惰性构建 + 失效重建：见 {@link _rebuildCellIndex} 与 {@link getCellByName}。
+     */
+    private _cellIndex: Map<string, Cell> = new Map();
+    /** 构建索引时 `_values` 的长度：用于廉价侦测 push/splice 造成的结构变化 */
+    private _indexedLength: number = -1;
+    /** 结构世代：任何可能改变「名 → 单元格」映射的操作都会自增（见 {@link invalidateCellIndex}） */
+    private _valuesEpoch: number = 0;
+    /** 索引当前所处的世代；与 `_valuesEpoch` 不一致说明索引可能已过期 */
+    private _indexEpoch: number = -1;
+    /**
+     * 合并单元格锚点缓存（形如 `A1:C3`），随索引一并重建。
+     * 原先 {@link getMergedCells} 每次调用都全表扫描一遍，而它又被
+     * 「每个单元格」的矩形计算调用，构成第二处 O(N²)。
+     */
+    private _mergedCells: string[] = [];
+    /**
+     * 带筛选标记（`filter !== undefined`）的单元格缓存，随索引一并重建。
+     * 供 SheetCanvas 每帧调用 {@link getFilterCells} 取用，
+     * 避免原先每帧 `values.filter(...)` 的全表扫描。
+     */
+    private _filterCells: Cell[] = [];
+    /**
      * 上一次提交时的 this.values 深拷贝快照。
      * 作为下一次变更的「变化前」基准：每次原地修改后调用 commitValues()，
      * 便会以本快照为 before、当前 _values 为 after 记录一条撤销操作。
@@ -48,6 +77,18 @@ export class DataCollection extends EventEmitter {
     private _isApplyingUndo: boolean = false;
     /** 是否禁止记录撤销（初始从数据库装载时为 true，避免把首次装载误记为一次变更） */
     private _suppressValuesUndo: boolean = false;
+    /**
+     * 「有未落库改动」标记
+     *
+     * 由 {@link _markDirty} 置位：凡改变了 {@link toJSON} 快照内容的状态变更事件
+     * （单元格内容/样式、列宽行高、网格线、活动单元格与选区、缩放、打印设置）都会触发。
+     * 落库时读的是**当下完整快照**，因此本标记只决定「要不要写」，不决定「写什么」。
+     */
+    private _valuesDirty: boolean = false;
+    /** 自动保存防抖定时器（非 null 表示已排期一次落库） */
+    private _saveTimer: ReturnType<typeof setTimeout> | null = null;
+    /** 自动保存防抖窗口（毫秒）：连续输入/拖拽期间合并为一次落库 */
+    private static readonly AUTO_SAVE_DEBOUNCE_MS = 500;
     /**
      * 全局筛选条件注册表：列号(1-based) → { anchorRow: 筛选按钮所在行(1-based), keep: 保留内容 }。
      * 注册表随全量状态快照捕获/回写，使筛选操作可整体撤销/重做；
@@ -157,6 +198,22 @@ export class DataCollection extends EventEmitter {
         this.dataLoaded = new Promise(resolve => { this._dataLoadedResolve = resolve; });
         this.messageBox = new MessageBox();
         this.matrixSorter = new MatrixSorter(this);
+        // 自动保存改由「状态变更事件 → 置脏 → 防抖落库」驱动，
+        // 取代原先 `Sheets.draw()` 每帧调用 `syncValuesToDB()`（每帧整表序列化 + 写 IndexedDB）。
+        // 之所以自行订阅而非在各变更点散落调用：本类是所有状态的唯一持有者，
+        // 无论内部还是外部（如 editCanvas）何时 emit，都能在这里统一捕获。
+        // 订阅的事件与 `toJSON()` 快照字段一一对应：值/样式、列宽、行高、网格线、
+        // 活动单元格、选区、缩放。`printSetting` 的 setter 不发事件，另行单独置脏。
+        const dirtyEvents: DataEvents[] = [
+            DataEvents.VALUES_CHANGED,
+            DataEvents.COLUMNS_CHANGED,
+            DataEvents.ROWS_CHANGED,
+            DataEvents.SHOW_GRID_LINES_CHANGED,
+            DataEvents.ZOOM_CHANGED,
+            DataEvents.ACTIVED_CELL_CHANGED,
+            DataEvents.SELECTION_CHANGED,
+        ];
+        dirtyEvents.forEach((event) => this.on(event, () => this._markDirty()));
     }
 
     /**
@@ -265,14 +322,94 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
-     * 同步当前选中工作表的所有有内容的单元格数据到数据库中
+     * 标记「有未落库改动」并排入一次防抖自动保存
      *
-     * 没有打开任何文件（工作表名为空，见 {@link clearCurrentSheet}）时不写库：
-     * 那只是一张没有归属的空表，写下去会造出「树里没有、库里却有」的幽灵存档。
+     * 所有会改变 {@link toJSON} 快照内容的状态变更都应走到这里（见构造函数中订阅的事件
+     * 与 {@link printSetting} 的 setter）。仅置脏 + 排期，不做任何序列化 ——
+     * 真正的整表 `toJSON()` 只发生在防抖窗口结束时的 {@link syncValuesToDB}。
+     */
+    private _markDirty(): void {
+        this._valuesDirty = true;
+        this._scheduleAutoSave();
+    }
+
+    /**
+     * 排入一次防抖自动保存（已有排期则合并，不再重复排期）
+     *
+     * 未打开文件（无存档键）时不排期：那只是一张无归属的空表，
+     * 写下去会造出「树里没有、库里却有」的幽灵存档（见 {@link clearCurrentSheet}）。
+     */
+    private _scheduleAutoSave(): void {
+        if (!this._activedSheetName) return;
+        if (this._saveTimer !== null) return;
+        this._saveTimer = setTimeout(() => {
+            this._saveTimer = null;
+            // 防抖窗口内若已被显式落库（_valuesDirty 被清）则不再重复写
+            if (!this._valuesDirty) return;
+            // 定时器里失败不应变成未处理的 Promise 拒绝；_writeSnapshot 已交还脏标记，
+            // 下一次变更 / 页面卸载固化时会自动重试
+            void this._writeSnapshot().catch((error) => {
+                console.error('自动保存失败，将在下次变更或页面卸载时重试：', error);
+            });
+        }, DataCollection.AUTO_SAVE_DEBOUNCE_MS);
+    }
+
+    /** 取消挂起的防抖保存（显式落库 / 强制固化前调用，避免随后又被重复写一遍） */
+    private _cancelPendingSave(): void {
+        if (this._saveTimer !== null) {
+            clearTimeout(this._saveTimer);
+            this._saveTimer = null;
+        }
+    }
+
+    /**
+     * 写入当前整表快照并清除脏标记（落库的唯一出口）
+     *
+     * 先清脏标记再 `await` 写库：写库是异步的，期间若又有新变更会重新置脏并重新排期，
+     * 不会因为「这次写库」而丢掉写库期间产生的改动。
+     */
+    private async _writeSnapshot(): Promise<void> {
+        const key = this._activedSheetName;
+        if (!key) return;
+        this._valuesDirty = false;
+        try {
+            await this.db.setValue(key, this.toJSON());
+        } catch (error) {
+            // 写库失败（如配额不足）：交还脏标记，保证后续变更 / 卸载固化 / 下次显式落库还会重试，
+            // 不至于把「本次未能持久化的改动」当成已保存而永久丢失
+            this._valuesDirty = true;
+            throw error;
+        }
+    }
+
+    /**
+     * 立即把当前工作表的**完整快照**落库（强制），并取消挂起的防抖保存
+     *
+     * - 未打开文件时直接返回：那只是一张无归属的空表，写下去会造出
+     *   「树里没有、库里却有」的幽灵存档（见 {@link clearCurrentSheet}）；
+     * - 与自动保存不同，这里**不跳过无改动的写**：它服务于「切换 / 重命名 / 复制 /
+     *   打开」等需要「先把内存内容无条件固化再操作」的流程，作为防抖路径之外的安全网
+     *   （这些流程本就低频，代价可忽略）；
+     * - 原先 `Sheets.draw()` 每帧调用本方法（每帧整表 `toJSON()` + 写 IndexedDB），
+     *   是打开大文件卡顿/崩溃的成因之一；现已从绘制线程移除，改由防抖自动保存驱动。
      */
     public async syncValuesToDB(): Promise<void> {
         if (!this._activedSheetName) return;
-        await this.db.setValue(this.activedSheetName, this.toJSON());
+        this._cancelPendingSave();
+        await this._writeSnapshot();
+    }
+
+    /**
+     * 同步（不 await）固化未落库改动，用于页面卸载等无法等待异步完成的场景
+     *
+     * 仅在「确有未落库改动」时写：`toJSON()` 是同步的，先把快照取好，
+     * 再把写库请求交给 IndexedDB 异步完成 —— 即便随后页面被销毁，数据也已被捕获。
+     */
+    public flushPendingSave(): void {
+        this._cancelPendingSave();
+        if (!this._activedSheetName || !this._valuesDirty) return;
+        // 卸载路径无法等待/恢复：失败也无处重试，吞掉拒绝避免控制台报未处理 Promise
+        void this._writeSnapshot().catch(() => {});
     }
 
     /**
@@ -338,7 +475,7 @@ export class DataCollection extends EventEmitter {
      * @returns {string} 单元格值
      */
     public getCellValue(cell: string): string {
-        return this.values.find((v) => v.cell === cell)?.chars?.map((v: Char) => v.char).join('') || '';
+        return this.getCellByName(cell)?.getText() || '';
     }
     
     /**
@@ -435,6 +572,9 @@ export class DataCollection extends EventEmitter {
      */
     public set printSetting(setting: PrinterSetting) {
         this._printSetting = setting;
+        // 打印设置随 toJSON 持久化，但不像其它字段那样有对应事件；此处直接置脏，
+        // 否则「只改了打印设置、没触发别的变更」时不会落库（原先靠每帧落库兜底）
+        this._markDirty();
     }
 
     /**
@@ -491,7 +631,92 @@ export class DataCollection extends EventEmitter {
         const oldValue = this._values;
         this._values = value;
         this._pruneEmptyCells();
+        this.invalidateCellIndex();
         this._recordValuesChange(oldValue);
+    }
+
+    /**
+     * 使「名 → 单元格」索引失效（下次查找时按需重建）
+     *
+     * 任何会改变单元格名集合或名→对象映射的操作都必须调用：整体替换 values、
+     * 重命名单元格、删除/插入行列、排序等。数组长度变化可由
+     * {@link getCellByName} 自动侦测，**等长重命名（如删除行导致 A5→A4）
+     * 则必须显式调用**，否则索引会返回过期对象。
+     */
+    public invalidateCellIndex(): void {
+        this._valuesEpoch++;
+    }
+
+    /**
+     * 重建稀疏单元格索引与合并单元格缓存
+     * 仅在索引失效后的首次查找时触发，稳态下为 O(1)。
+     * @private
+     */
+    private _rebuildCellIndex(): void {
+        const index = new Map<string, Cell>();
+        const merged: string[] = [];
+        const filterCells: Cell[] = [];
+        const values = this._values;
+        for (let i = 0; i < values.length; i++) {
+            const cell = values[i];
+            index.set(cell.cell, cell);
+            if (cell.filter !== undefined) filterCells.push(cell);
+            const colspan = cell.colspan || 1;
+            const rowspan = cell.rowspan || 1;
+            if (colspan === 1 && rowspan === 1) continue;
+            const { col, row } = this.getCellColAndRow(cell.cell);
+            merged.push(`${cell.cell}:${this.getColName(col + colspan - 1)}${row + rowspan - 1}`);
+        }
+        this._cellIndex = index;
+        this._mergedCells = merged;
+        this._filterCells = filterCells;
+        this._indexedLength = values.length;
+        this._indexEpoch = this._valuesEpoch;
+    }
+
+    /**
+     * 确保索引与合并/筛选缓存处于最新状态（供缓存类只读接口使用）
+     * @private
+     */
+    private _ensureCellIndex(): void {
+        if (this._values.length !== this._indexedLength || this._indexEpoch !== this._valuesEpoch) {
+            this._rebuildCellIndex();
+        }
+    }
+
+    /**
+     * 获取带筛选标记的单元格列表（只读引用，请勿修改）
+     * @returns {Cell[]} 带筛选标记的单元格
+     */
+    public getFilterCells(): Cell[] {
+        this._ensureCellIndex();
+        return this._filterCells;
+    }
+
+    /**
+     * 按名称取单元格（O(1)，替代 `values.find(v => v.cell === name)`）
+     *
+     * 三层防护保证不会返回过期对象：
+     * 1. 命中后校验 `cell.cell === name`，不一致说明发生过等长重命名 → 强制重建；
+     * 2. 未命中且「长度或世代」与建索引时不一致 → 重建后重试一次；
+     * 3. 两者一致仍未命中 → 本世代索引有效，确实不存在（直接返回 undefined，
+     *    不会退化成每次查找都重建，避免把 O(1) 打回 O(N)）。
+     * @param {string} name - 单元格名称（如 `A1`）
+     * @returns {Cell | undefined} 单元格；不存在时 undefined
+     */
+    public getCellByName(name: string): Cell | undefined {
+        const hit = this._cellIndex.get(name);
+        if (hit !== undefined) {
+            if (hit.cell === name) return hit;
+            this._rebuildCellIndex();
+        } else if (this._values.length !== this._indexedLength
+            || this._indexEpoch !== this._valuesEpoch) {
+            this._rebuildCellIndex();
+        } else {
+            return undefined;
+        }
+        const found = this._cellIndex.get(name);
+        return (found !== undefined && found.cell === name) ? found : undefined;
     }
 
     /**
@@ -524,21 +749,84 @@ export class DataCollection extends EventEmitter {
                 removed = true;
             }
         }
+        if (removed) this.invalidateCellIndex();
         return removed;
     }
 
     /**
-     * 比较两份快照是否等价（基于每格 toJSON 字符串）
-     * 用于跳过无实际变化的提交，避免在撤销栈中产生空操作。
-     * @param {Cell[]} a - 快照 A
-     * @param {Cell[]} b - 快照 B
-     * @returns {boolean} 是否等价
+     * 比较两个单元格的内容与样式是否等价（字段级深比较）
+     *
+     * 刻意**不做序列化**：不拼字符串、不分配对象，只做原始值比较。
+     * 之所以不用「版本号/脏标记」做判定，是因为单元格存在 `Object.assign`、
+     * `chars.splice` 等绕过 setter 的整体复制/原地修改路径，计数器极易漏记，
+     * 一旦漏记就会出现「改动没进撤销栈」这类隐性缺陷；字段级比较虽然多花
+     * 常数倍时间，但不依赖任何记账约定，行为始终正确。
+     * @private
+     */
+    private _cellsEqual(a: Cell, b: Cell): boolean {
+        if (a === b) return true;
+        if (a.cell !== b.cell
+            || a.colspan !== b.colspan || a.rowspan !== b.rowspan
+            || a.borderTopWidth !== b.borderTopWidth || a.borderBottomWidth !== b.borderBottomWidth
+            || a.borderLeftWidth !== b.borderLeftWidth || a.borderRightWidth !== b.borderRightWidth
+            || a.borderColor !== b.borderColor
+            || a.textAlign !== b.textAlign || a.alignItems !== b.alignItems
+            || a.backgroundColor !== b.backgroundColor || a.numberFormat !== b.numberFormat
+            || a.filter !== b.filter || a.wrap !== b.wrap
+            || a.letterSpacing !== b.letterSpacing || a.lineSpacing !== b.lineSpacing
+            || a.isEdit !== b.isEdit) {
+            return false;
+        }
+        const charsA = a.chars;
+        const charsB = b.chars;
+        const lenA = charsA ? charsA.length : 0;
+        const lenB = charsB ? charsB.length : 0;
+        if (lenA !== lenB) return false;
+        for (let i = 0; i < lenA; i++) {
+            const x = charsA![i];
+            const y = charsB![i];
+            if (x === y) continue;
+            if (x.char !== y.char || x.fontFamily !== y.fontFamily || x.fontSize !== y.fontSize
+                || x.fontWeight !== y.fontWeight || x.fontStyle !== y.fontStyle
+                || x.fontColor !== y.fontColor || x.underline !== y.underline
+                || x.strikethrough !== y.strikethrough) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 比较两份快照是否等价
+     *
+     * 之所以不用「版本号/脏标记」做判定，是因为单元格存在 `Object.assign`、
+     * `chars.splice` 等绕过 setter 的整体复制/原地修改路径，计数器极易漏记，
+     * 一旦漏记就会出现「改动没进撤销栈」这类隐性缺陷；字段级比较虽然多花
+     * 常数倍时间，但不依赖任何记账约定，行为始终正确。
+     * @private
      */
     private _valuesSnapshotsEqual(a: Cell[], b: Cell[]): boolean {
         if (a === b) return true;
         if (a.length !== b.length) return false;
         for (let i = 0; i < a.length; i++) {
-            if (a[i].toJSON() !== b[i].toJSON()) return false;
+            if (!this._cellsEqual(a[i], b[i])) return false;
+        }
+        return true;
+    }
+
+    /**
+     * 比较两份行列头是否等价（按条比对位置/尺寸/隐藏标记）
+     * @private
+     */
+    private _headersEqual(a: ColHeader[] | RowHeader[], b: ColHeader[] | RowHeader[]): boolean {
+        if (a === b) return true;
+        if (!a || !b || a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            const ha = a[i] as { left?: number, top?: number, width?: number, height?: number, isHidden?: boolean };
+            const hb = b[i] as { left?: number, top?: number, width?: number, height?: number, isHidden?: boolean };
+            if (ha.left !== hb.left || ha.top !== hb.top
+                || ha.width !== hb.width || ha.height !== hb.height
+                || ha.isHidden !== hb.isHidden) return false;
         }
         return true;
     }
@@ -751,14 +1039,25 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
-     * 比较两份全量状态快照是否等价（基于 JSON 字符串）
-     * 用于跳过无实际变化的操作（如取消的 prompt、对已隐藏行列再次取消隐藏），避免撤销栈空操作。
+     * 比较两份全量状态快照是否等价
+     *
+     * 逐字段比对（values 做字段级深比较、行列头逐条比对、其余为标量），
+     * **不再 `JSON.stringify` 整个快照**——那会把整张表（含每个字符的两层 JSON）
+     * 序列化两遍，大表上一次结构操作就能产生数百 MB 的临时字符串，
+     * 是「打开大 Excel 页面崩溃」的直接推手之一。
      * @param {FullStateSnapshot} a - 快照 A
      * @param {FullStateSnapshot} b - 快照 B
      * @returns {boolean} 是否等价
      */
     private _fullStateSnapshotsEqual(a: FullStateSnapshot, b: FullStateSnapshot): boolean {
-        return JSON.stringify(a) === JSON.stringify(b);
+        if (a === b) return true;
+        if (!this._valuesSnapshotsEqual(a.values as Cell[], b.values as Cell[])) return false;
+        if (a.showGridLines !== b.showGridLines) return false;
+        if (a.activedCell !== b.activedCell) return false;
+        if (a.selection !== b.selection) return false;
+        if (!this._headersEqual(a.rowHeaders, b.rowHeaders)) return false;
+        if (!this._headersEqual(a.colHeaders, b.colHeaders)) return false;
+        return JSON.stringify(a.filters) === JSON.stringify(b.filters);
     }
 
     /**
@@ -773,15 +1072,17 @@ export class DataCollection extends EventEmitter {
      * 4. 捕获操作后快照，与操作前不等时推入 undoManager（type: 'fullState'）。
      *
      * 嵌套语义：action 内部再次调用本方法（如取消隐藏行触发筛选条件自动清除）
-     * 时，嵌套层不推入撤销记录，其变更已包含在最外层快照的 after 中，
-     * 整个复合操作折叠为一步撤销。
+     * 时，**嵌套层不捕获任何快照**（其变更已包含在最外层快照的 after 中），
+     * 整个复合操作折叠为一步撤销——同时也避免了对同一份数据重复深拷贝。
      * @param {string} label - 操作标签（用于调试与撤销展示）
      * @param {() => void} action - 实际的变更操作
      * @example
      * data.runWithFullStateUndo('删除行', () => data.deleteRows(2, 3));
      */
     public runWithFullStateUndo(label: string, action: () => void): void {
-        const before = this._captureFullState();
+        const isOutermost = this._fullStateUndoDepth === 0;
+        // 仅最外层需要「变化前」快照；嵌套层复用外层的捕获结果
+        const before = isOutermost ? this._captureFullState() : null;
         const prevSuppress = this._suppressValuesUndo;
         this._suppressValuesUndo = true;
         this._fullStateUndoDepth++;
@@ -791,13 +1092,16 @@ export class DataCollection extends EventEmitter {
             // 操作结束后清扫空单元格（如清除内容后残留的空 Cell），
             // 使「变化后」快照与稳态数据均不残留空单元格
             this._pruneEmptyCells();
-            const after = this._captureFullState();
             this._fullStateUndoDepth--;
             this._suppressValuesUndo = prevSuppress;
+            // 结构操作可能重命名/增删单元格 → 索引与合并缓存失效
+            this.invalidateCellIndex();
             // 仅最外层推入撤销记录；撤销/重做回写期间（_isApplyingUndo）不得入栈
-            if (this._fullStateUndoDepth === 0 && !this._isApplyingUndo
-                && !this._fullStateSnapshotsEqual(before, after)) {
-                this.undoManager.push({ type: 'fullState', data: { before, after }, timestamp: Date.now(), label });
+            if (isOutermost && !this._isApplyingUndo) {
+                const after = this._captureFullState();
+                if (!this._fullStateSnapshotsEqual(before as FullStateSnapshot, after)) {
+                    this.undoManager.push({ type: 'fullState', data: { before, after }, timestamp: Date.now(), label });
+                }
             }
         }
     }
@@ -1194,7 +1498,7 @@ export class DataCollection extends EventEmitter {
         for (let row = minRow; row <= maxRow; row++) {
             for (let col = minCol; col <= maxCol; col++) {
                 const cellName = this.getCellName(col, row);
-                const cell = this.values.find(c => c.cell === cellName);
+                const cell = this.getCellByName(cellName);
                 if (cell && this.hasCellContent(cell)) {
                     return cell;
                 }
@@ -1207,7 +1511,7 @@ export class DataCollection extends EventEmitter {
      * 判断单元格是否有内容
      */
     private hasContent(cellName: string): boolean {
-        const cell = this.values.find(c => c.cell === cellName);
+        const cell = this.getCellByName(cellName);
         return !!(cell && cell.chars && cell.chars.length > 0 && !cell.chars.every(v => v.char === ' '));
     }
 
@@ -1242,10 +1546,10 @@ export class DataCollection extends EventEmitter {
         let height = this.rowHeaders.getAt(realRow - 1).height;
         
         const cellName = this.getCellName(realCol, realRow);
-        const cellIndex = this.values.findIndex(v => v.cell === cellName);
-        if (cellIndex >= 0) {
-            const colspan = this.values[cellIndex].colspan || 1;
-            const rowspan = this.values[cellIndex].rowspan || 1;
+        const cell = this.getCellByName(cellName);
+        if (cell) {
+            const colspan = cell.colspan || 1;
+            const rowspan = cell.rowspan || 1;
             
             if (colspan > 1) {
                 width = 0;
@@ -1271,38 +1575,98 @@ export class DataCollection extends EventEmitter {
 
     /**
      * 获取可见列的起始索引和结束索引，从1开始计数
+     *
+     * 与旧实现（从最后一列向前回扫）结果等价，但改为**从可见起点向后推进**，
+     * 复杂度 O(可见列数) 而非 O(总列数) —— 宽表上后者每帧都要空转上万次。
      * @returns {{startCol: number, endCol: number}} 可见列的起始索引和结束索引
      */
     public getVisibleCols(): {startCol: number, endCol: number} {
         const { startCol } = this.colHeaders.getVisibleStartCol();
-        let endCol = this.colHeaders.length - 1;
+        const len = this.colHeaders.length;
         const viewportRight = this.colHeaders.offsetWidth + this.visibleView.sheetWidth / this.zoom;
-        while (endCol > startCol) {
-            const col = this.colHeaders.getAt(endCol - 1);
+        // 内容窄于视口时，旧实现返回最后一列
+        let endCol = len - 1;
+        for (let i = startCol - 1; i < len - 1; i++) {
+            const col = this.colHeaders.getAt(i);
             if (!col) break;
-            if (col.isHidden) { endCol--; continue; }  // 跳过隐藏列
-            if (col.left + col.width < viewportRight) break;  // 列右边缘进入视口
-            endCol--;
+            if (col.isHidden) continue;  // 跳过隐藏列
+            if (col.left + col.width >= viewportRight) {  // 列右边缘进入视口
+                endCol = i;
+                break;
+            }
         }
         return { startCol, endCol: Math.max(startCol, endCol) };
     }
     
     /**
      * 获取可见行的起始索引和结束索引，从1开始计数
+     *
+     * 与旧实现（从最后一行向前回扫）结果等价，但改为**从可见起点向后推进**，
+     * 复杂度 O(可见行数) 而非 O(总行数) —— 高表上后者每帧都要空转上万次。
      * @returns {{startRow: number, endRow: number}} 可见行的起始索引和结束索引
      */
     public getVisibleRows(): {startRow: number, endRow: number} {
         const { startRow } = this.rowHeaders.getVisibleStartRow();
-        let endRow = this.rowHeaders.length - 1;
+        const len = this.rowHeaders.length;
         const viewportBottom = this.rowHeaders.offsetHeight + this.visibleView.sheetHeight / this.zoom;
-        while (endRow > startRow) {
-            const row = this.rowHeaders.getAt(endRow - 1);
+        let endRow = len - 1;
+        for (let i = startRow - 1; i < len - 1; i++) {
+            const row = this.rowHeaders.getAt(i);
             if (!row) break;
-            if (row.isHidden) { endRow--; continue; }  // 跳过隐藏行
-            if (row.top + row.height < viewportBottom) break;  // 行底边缘进入视口
-            endRow--;
+            if (row.isHidden) continue;  // 跳过隐藏行
+            if (row.top + row.height >= viewportBottom) {  // 行底边缘进入视口
+                endRow = i;
+                break;
+            }
         }
         return { startRow, endRow: Math.max(startRow, endRow) };
+    }
+
+    /**
+     * 获取当前视口内的单元格（视口裁剪的唯一入口）
+     *
+     * 渲染层据此只遍历「真正看得见」的单元格，而不是整张表：
+     * - 视口内的普通单元格按「行 × 列」名称用 O(1) 索引取出；
+     * - 额外补上**左上角在视口外、但合并区域与视口相交**的合并锚点，
+     *   否则滚动到合并区域中部时该区域会被漏画。
+     *
+     * 复杂度 O(可见单元格数 + 合并单元格数)，与表格总规模无关。
+     * @returns {Cell[]} 视口内需要绘制的单元格
+     */
+    public getVisibleCells(): Cell[] {
+        const { startCol, endCol } = this.getVisibleCols();
+        const { startRow, endRow } = this.getVisibleRows();
+        const result: Cell[] = [];
+        const seen = new Set<string>();
+        for (let r = startRow; r <= endRow; r++) {
+            for (let c = startCol; c <= endCol; c++) {
+                const name = this.getCellName(c, r);
+                const cell = this.getCellByName(name);
+                if (cell !== undefined) {
+                    result.push(cell);
+                    seen.add(name);
+                }
+            }
+        }
+        // 合并区域：锚点可能位于视口左上方（如 A1:C3 而视口从 B2 开始）
+        const mergedCells = this.getMergedCells();
+        for (let i = 0; i < mergedCells.length; i++) {
+            const group = mergedCells[i];
+            const sep = group.indexOf(':');
+            const anchorName = group.slice(0, sep);
+            if (seen.has(anchorName)) continue;
+            const endName = group.slice(sep + 1);
+            const startPos = this.getCellColAndRow(anchorName);
+            const endPos = this.getCellColAndRow(endName);
+            if (startPos.row > endRow || endPos.row < startRow) continue;
+            if (startPos.col > endCol || endPos.col < startCol) continue;
+            const anchor = this.getCellByName(anchorName);
+            if (anchor !== undefined) {
+                result.push(anchor);
+                seen.add(anchorName);
+            }
+        }
+        return result;
     }
 
     /**
@@ -1326,14 +1690,14 @@ export class DataCollection extends EventEmitter {
      * 清除单元格值和样式（用于剪切操作）
      */
     private clearCellValue(cell: string): void {
-        const cellIndex = this.values.findIndex(v => v.cell === cell);
-        if (cellIndex >= 0) {
-            this.values[cellIndex].chars = [];
-            this.values[cellIndex].backgroundColor = undefined;
-            this.values[cellIndex].borderTopWidth = undefined;
-            this.values[cellIndex].borderBottomWidth = undefined;
-            this.values[cellIndex].borderLeftWidth = undefined;
-            this.values[cellIndex].borderRightWidth = undefined;
+        const target = this.getCellByName(cell);
+        if (target) {
+            target.chars = [];
+            target.backgroundColor = undefined;
+            target.borderTopWidth = undefined;
+            target.borderBottomWidth = undefined;
+            target.borderLeftWidth = undefined;
+            target.borderRightWidth = undefined;
             this.emit(DataEvents.CELL_CHANGED, cell, { index: 0, changed: ['value', 'background', 'border'], special: {} });
         }
     }
@@ -1372,7 +1736,7 @@ export class DataCollection extends EventEmitter {
             if (mergedCells.find(v => v.includes(startCell))) {
                 return true;
             }
-            const cell = this.values.find(v => v.cell === startCell);
+            const cell = this.getCellByName(startCell);
             if (cell) {
                 return cell.colspan > 1 || cell.rowspan > 1;
             }
@@ -1491,7 +1855,7 @@ export class DataCollection extends EventEmitter {
         if (!this.selection) return;
         const mergedCells = this.getMergedCells();
         const [startCell] = this.selection.split(':');
-        const cell = this.values.find(c => c.cell === startCell);
+        const cell = this.getCellByName(startCell);
         
         let topLeftCell: Cell | null = null;
         let topLeftCol = this.getCellColAndRow(startCell).col;
@@ -1504,7 +1868,7 @@ export class DataCollection extends EventEmitter {
                     const topLeftPos = this.getCellColAndRow(topLeftCellName);
                     topLeftCol = topLeftPos.col;
                     topLeftRow = topLeftPos.row;
-                    topLeftCell = this.values.find(c => c.cell === topLeftCellName) || null;
+                    topLeftCell = this.getCellByName(topLeftCellName) || null;
                     break;
                 }
             }
@@ -1537,7 +1901,7 @@ export class DataCollection extends EventEmitter {
                     const currentCol = topLeftCol + c;
                     const currentRow = topLeftRow + r;
                     const currentCellName = this.getCellName(currentCol, currentRow);
-                    const existingCell = this.values.find(v => v.cell === currentCellName);
+                    const existingCell = this.getCellByName(currentCellName);
                     
                     if (r === 0 && c === 0) {
                         // 左上角单元格：保留内容和所有样式
@@ -1748,20 +2112,19 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
-     * 获取所有合并单元格的名称
+     * 获取所有合并单元格的名称（形如 `A1:C3`）
+     *
+     * 结果来自随单元格索引一并维护的缓存 {@link _mergedCells}，
+     * 复杂度为 O(1)（缓存失效后的首次调用为 O(N)）。
+     * 原先每次调用都要全表扫描，而它又会被「单元格矩形计算」按单元格调用一次，
+     * 构成第二处 O(N²)。
+     *
+     * **返回值是内部缓存数组的只读引用，请勿修改。**
      * @returns {string[]} 合并单元格的名称数组
      */
     public getMergedCells(): string[] {
-        const mergeCells: string[] = [];
-        for (let i = 0; i < this.values.length; i++) {
-            const cell = this.values[i];
-            const colspan = cell.colspan || 1;
-            const rowspan = cell.rowspan || 1;
-            if (colspan === 1 && rowspan === 1) continue;
-            const { col, row } = this.getCellColAndRow(cell.cell);
-            mergeCells.push(`${cell.cell}:${this.getColName(col + colspan - 1)}${row + rowspan - 1}`);
-        }
-        return mergeCells;
+        this._ensureCellIndex();
+        return this._mergedCells;
     }
 
     /**
@@ -1773,7 +2136,7 @@ export class DataCollection extends EventEmitter {
     public getMergeColAndRow(cell: string): { col: number, row: number } {        
         const { col, row } = this.getCellColAndRow(cell);
         // 先直接查找单元格本身
-        const cellData = this.values.find(c => c.cell === cell);
+        const cellData = this.getCellByName(cell);
         if (cellData && (cellData.colspan > 1 || cellData.rowspan > 1)) {
             return { col, row };
         }
@@ -2056,7 +2419,7 @@ export class DataCollection extends EventEmitter {
         const selectedCells: Cell[] = [];
         for (const colOff of visibleColOffsets) {
             for (const rowOff of visibleRowOffsets) {
-                const _cell = this.values.find(c => c.cell === `${this.getColName(colOff + startCol)}${rowOff + startRow}`);
+                const _cell = this.getCellByName(`${this.getColName(colOff + startCol)}${rowOff + startRow}`);
                 if ( _cell ) {
                     _cell.filter = undefined; // 移除筛选条件
                     selectedCells.push(_cell);
@@ -2090,7 +2453,7 @@ export class DataCollection extends EventEmitter {
         const selectedCells: Cell[] = [];
         for (const colOff of visibleColOffsets) {
             for (const rowOff of visibleRowOffsets) {
-                const _cell = this.values.find(c => c.cell === `${this.getColName(colOff + startCol)}${rowOff + startRow}`);
+                const _cell = this.getCellByName(`${this.getColName(colOff + startCol)}${rowOff + startRow}`);
                 if ( _cell ) {
                     this.values.splice(this.values.indexOf(_cell), 1); // 从数据集合中移除选中的单元格
                     selectedCells.push(_cell);
@@ -2151,7 +2514,7 @@ export class DataCollection extends EventEmitter {
                 for (let j = 0; j < rowOffsets.length && j < targetRowOffsets.length; j++) {
                     const tgtCol = activedCol + targetColOffsets[i];
                     const tgtRow = activedRow + targetRowOffsets[j];
-                    const cell = this.values.find(c => c.cell === `${this.getColName(tgtCol)}${tgtRow}`);
+                    const cell = this.getCellByName(`${this.getColName(tgtCol)}${tgtRow}`);
                     const item = clipboard.cells.find(c => c.cell === `${this.getColName(startCol + colOffsets[i])}${startRow + rowOffsets[j]}`);
                     if (item) {
                         if (cell) {
@@ -2215,7 +2578,7 @@ export class DataCollection extends EventEmitter {
                 }
             }
         } else if (clipboard && clipboard.type === 'char' && clipboard.chars) {
-            const cell = this.values.find(c => c.cell === this.activedCell);
+            const cell = this.getCellByName(this.activedCell);
             if (cell){
                 if (cell.isEdit) {
                     cell.chars = clipboard.chars.map(c => {
@@ -2276,7 +2639,7 @@ export class DataCollection extends EventEmitter {
             for (let j = 0; j < rowOffsets.length && j < targetRowOffsets.length; j++) {
                 const tgtCol = activedCol + targetColOffsets[i];
                 const tgtRow = activedRow + targetRowOffsets[j];
-                const cell = this.values.find(c => c.cell === `${this.getColName(tgtCol)}${tgtRow}`);
+                const cell = this.getCellByName(`${this.getColName(tgtCol)}${tgtRow}`);
                 const item = clipboard.cells.find(c => c.cell === `${this.getColName(startCol + colOffsets[i])}${startRow + rowOffsets[j]}`);
                 if (item) {
                     if (cell) {
@@ -2337,7 +2700,7 @@ export class DataCollection extends EventEmitter {
                 for (let j = 0; j < rowOffsets.length && j < targetRowOffsets.length; j++) {
                     const tgtCol = activedCol + targetColOffsets[i];
                     const tgtRow = activedRow + targetRowOffsets[j];
-                    const cell = this.values.find(c => c.cell === `${this.getColName(tgtCol)}${tgtRow}`);
+                    const cell = this.getCellByName(`${this.getColName(tgtCol)}${tgtRow}`);
                     const item = clipboard.cells.find(c => c.cell === `${this.getColName(startCol + colOffsets[i])}${startRow + rowOffsets[j]}`);
                     if (item) {
                         // 只拷贝字符内容，保留目标原有格式
@@ -2358,7 +2721,7 @@ export class DataCollection extends EventEmitter {
                 }
             }
         } else if (clipboard && clipboard.type === 'char' && clipboard.chars) {
-            const cell = this.values.find(c => c.cell === this.activedCell);
+            const cell = this.getCellByName(this.activedCell);
             if (cell) {
                 cell.chars = clipboard.chars.map(c => {
                     const _char = new Char();
@@ -2393,7 +2756,7 @@ export class DataCollection extends EventEmitter {
             for (let j = 0; j < rowOffsets.length && j < targetRowOffsets.length; j++) {
                 const tgtCol = activedCol + targetColOffsets[i];
                 const tgtRow = activedRow + targetRowOffsets[j];
-                const cell = this.values.find(c => c.cell === `${this.getColName(tgtCol)}${tgtRow}`);
+                const cell = this.getCellByName(`${this.getColName(tgtCol)}${tgtRow}`);
                 const item = clipboard.cells.find(c => c.cell === `${this.getColName(startCol + colOffsets[i])}${startRow + rowOffsets[j]}`);
                 if (item) {
                     if (cell) {
@@ -2454,7 +2817,7 @@ export class DataCollection extends EventEmitter {
      * 复制选中的字符内容
      */
     public copyChars(): void {
-        const cell = this.values.find(c => c.cell === this.activedCell);
+        const cell = this.getCellByName(this.activedCell);
         if (!cell) return;
         const startIndex = this.getSelectedCharsStartIndex();
         const endIndex = this.getSelectedCharsEndIndex();
@@ -2469,7 +2832,7 @@ export class DataCollection extends EventEmitter {
      * @returns {number} 剪切完成后光标应处的绝对位置（被删除区间的起点）
      */
     public cutChars(): number {
-        const cell = this.values.find(c => c.cell === this.activedCell);
+        const cell = this.getCellByName(this.activedCell);
         if (!cell) return this.cursorAbsolutePosition;
         const startIndex = this.getSelectedCharsStartIndex();
         const endIndex = this.getSelectedCharsEndIndex();
@@ -2493,7 +2856,7 @@ export class DataCollection extends EventEmitter {
      * @returns {number} 粘贴完成后光标应处的绝对位置（插入起点 + 新增字符数）
      */
     public pasteChars(insertIndex: number, chars: Char[]): number {
-        const cell = this.values.find(c => c.cell === this.activedCell);
+        const cell = this.getCellByName(this.activedCell);
         let caretAbsolutePosition: number;
         if (cell){
             const startIndex = this.getSelectedCharsStartIndex();
@@ -2548,7 +2911,7 @@ export class DataCollection extends EventEmitter {
     public setSelectedCellsFont(fontStyle: FontStyle): void {
         const selectedCells = this.getSelectedCells();
         selectedCells.forEach(_cell => {
-            const cell = this.values.find(c => c.cell === _cell);
+            const cell = this.getCellByName(_cell);
             if (cell) {
                 if(cell.isEdit) {
                     if (fontStyle.fontFamily !== cell.fontFamily && fontStyle.fontFamily !== undefined) cell.fontFamily = fontStyle.fontFamily;
@@ -2594,7 +2957,7 @@ export class DataCollection extends EventEmitter {
     public setSelectedCharsFont(fontStyle: FontStyle): void {
         const startIndex = this.getSelectedCharsStartIndex();
         const endIndex = this.getSelectedCharsEndIndex();
-        const chars = this.values.find(c => c.cell === this.activedCell)?.chars || [];
+        const chars = this.getCellByName(this.activedCell)?.chars || [];
         for (let i = startIndex; i < endIndex; i++) {
             const char = chars[i];
             if (char) {
@@ -2718,7 +3081,7 @@ export class DataCollection extends EventEmitter {
             // （pasteFormatOnly 本身不触碰 chars；commitValues 由它内部自行调用一次）
             this.pasteFormatOnly();
             // 字符级格式补刀（循环取源首格，对应单目标单源最常见的使用路径）
-            const targetCell = this.values.find(c => c.cell === start);
+            const targetCell = this.getCellByName(start);
             const sourceCell = clipboard.cells.find(c => c.cell === `${this.getColName(sStartCol)}${sStartRow}`);
             if (targetCell && sourceCell && targetCell.chars && targetCell.chars.length > 0 && sourceCell.chars && sourceCell.chars.length > 0) {
                 for (let i = 0; i < targetCell.chars.length; i++) {
@@ -2753,7 +3116,7 @@ export class DataCollection extends EventEmitter {
                 // 源偏移位置没有单元格（空格子）则不刷，与 Excel 保持一致
                 if (!sourceCell) continue;
 
-                let targetCell = this.values.find(c => c.cell === targetCellName);
+                let targetCell = this.getCellByName(targetCellName);
                 if (!targetCell) {
                     targetCell = new Cell();
                     targetCell.cell = targetCellName;
@@ -2808,7 +3171,7 @@ export class DataCollection extends EventEmitter {
                 if (endCol === col) borderRightWidth = 1;
             }
 
-            const cell = this.values.find(c => c.cell === _cell);
+            const cell = this.getCellByName(_cell);
             if (cell) {
                 cell.borderTopWidth = borderTopWidth;
                 cell.borderBottomWidth = borderBottomWidth;
@@ -3005,7 +3368,7 @@ export class DataCollection extends EventEmitter {
                 for (let c = startCol - 1; c < endCol; c++) {
                     if (!this.validataColInFilter(c)) continue;
                     const cell = this.getCellName(c + 1, startRow);
-                    const _cell = this.values.find((v: Cell | undefined) => v.cell === cell);
+                    const _cell = this.getCellByName(cell);
                     if (_cell) {
                         _cell.filter = startRow;
                     } else {
@@ -3346,15 +3709,15 @@ export class DataCollection extends EventEmitter {
                 const tgtRank = j + k;
                 if (tgtRank >= m) {
                     // 被推出最右可见列之外：内容丢弃（清空源）
-                    const srcCell = this.values.find(v => v.cell === this.getCellName(srcCol, r));
+                    const srcCell = this.getCellByName(this.getCellName(srcCol, r));
                     if (srcCell) srcCell.reset();
                     continue;
                 }
                 const tgtCol = visCols[tgtRank];
                 const srcName = this.getCellName(srcCol, r);
                 const tgtName = this.getCellName(tgtCol, r);
-                const srcCell = this.values.find(v => v.cell === srcName);
-                const tgtCell = this.values.find(v => v.cell === tgtName);
+                const srcCell = this.getCellByName(srcName);
+                const tgtCell = this.getCellByName(tgtName);
                 if (srcCell) {
                     const charsCopy = srcCell.chars.map(ch => Object.assign(new Char(), ch));
                     if (tgtCell) {
@@ -3400,15 +3763,15 @@ export class DataCollection extends EventEmitter {
                 const srcRow = visRows[j];
                 const tgtRank = j + k;
                 if (tgtRank >= m) {
-                    const srcCell = this.values.find(v => v.cell === this.getCellName(c, srcRow));
+                    const srcCell = this.getCellByName(this.getCellName(c, srcRow));
                     if (srcCell) srcCell.reset();
                     continue;
                 }
                 const tgtRow = visRows[tgtRank];
                 const srcName = this.getCellName(c, srcRow);
                 const tgtName = this.getCellName(c, tgtRow);
-                const srcCell = this.values.find(v => v.cell === srcName);
-                const tgtCell = this.values.find(v => v.cell === tgtName);
+                const srcCell = this.getCellByName(srcName);
+                const tgtCell = this.getCellByName(tgtName);
                 if (srcCell) {
                     const charsCopy = srcCell.chars.map(ch => Object.assign(new Char(), ch));
                     if (tgtCell) {
@@ -3610,7 +3973,7 @@ export class DataCollection extends EventEmitter {
     public clearContents(startCol: number, endCol: number, startRow: number, endRow: number): void {
         for (let r = startRow; r <= endRow; r++) {
             for (let c = startCol; c <= endCol; c++) {
-                const cell = this.values.find(v => v.cell === this.getCellName(c, r));
+                const cell = this.getCellByName(this.getCellName(c, r));
                 if (cell) cell.reset();  // 清空所有内容+格式（保留功能性字段 colspan/rowspan/filter）
             }
         }
@@ -3642,7 +4005,7 @@ export class DataCollection extends EventEmitter {
             // 1. 清空选区内可见列的内容（隐藏列内容与格式保留原位不动）
             for (let c = startCol; c <= endCol; c++) {
                 if (this.colHeaders.getAt(c - 1)?.isHidden) continue;
-                const cell = this.values.find(v => v.cell === this.getCellName(c, r));
+                const cell = this.getCellByName(this.getCellName(c, r));
                 if (cell) cell.reset();
             }
             // 2. 可见单元格向左紧凑补位：写入指针从选区起第一个可见列开始，逐格接收右侧可见列的内容；
@@ -3656,8 +4019,8 @@ export class DataCollection extends EventEmitter {
                 if (writeCol >= c) break;
                 const srcName = this.getCellName(c, r);
                 const tgtName = this.getCellName(writeCol, r);
-                const srcCell = this.values.find(v => v.cell === srcName);
-                const tgtCell = this.values.find(v => v.cell === tgtName);
+                const srcCell = this.getCellByName(srcName);
+                const tgtCell = this.getCellByName(tgtName);
                 if (srcCell) {
                     const charsCopy = srcCell.chars.map(ch => Object.assign(new Char(), ch));
                     if (tgtCell) {
@@ -3701,7 +4064,7 @@ export class DataCollection extends EventEmitter {
             // 1. 清空选区内可见行的内容（隐藏行内容与格式保留原位不动）
             for (let r = startRow; r <= endRow; r++) {
                 if (this.rowHeaders.getAt(r - 1)?.isHidden) continue;
-                const cell = this.values.find(v => v.cell === this.getCellName(c, r));
+                const cell = this.getCellByName(this.getCellName(c, r));
                 if (cell) cell.reset();
             }
             // 2. 可见单元格向上紧凑补位：写入指针从选区起第一个可见行开始，逐格接收下方可见行的内容；
@@ -3715,8 +4078,8 @@ export class DataCollection extends EventEmitter {
                 if (writeRow >= r) break;
                 const srcName = this.getCellName(c, r);
                 const tgtName = this.getCellName(c, writeRow);
-                const srcCell = this.values.find(v => v.cell === srcName);
-                const tgtCell = this.values.find(v => v.cell === tgtName);
+                const srcCell = this.getCellByName(srcName);
+                const tgtCell = this.getCellByName(tgtName);
                 if (srcCell) {
                     const charsCopy = srcCell.chars.map(ch => Object.assign(new Char(), ch));
                     if (tgtCell) {
@@ -3750,7 +4113,7 @@ export class DataCollection extends EventEmitter {
     public setCellsBackgroundColor(startCol: number, endCol: number, startRow: number, endRow: number, color: string): void {
         for (let r = startRow; r <= endRow; r++) {
             for (let c = startCol; c <= endCol; c++) {
-                const cell = this.values.find(v => v.cell === this.getCellName(c, r));
+                const cell = this.getCellByName(this.getCellName(c, r));
                 if (cell) cell.backgroundColor = color;
             }
         }
@@ -3768,7 +4131,7 @@ export class DataCollection extends EventEmitter {
         for (let r = startRow; r <= endRow; r++) {
             for (let c = startCol; c <= endCol; c++) {
                 const cellName = this.getCellName(c, r);
-                let cell = this.values.find(v => v.cell === cellName);
+                let cell = this.getCellByName(cellName);
                 if (cell) {
                     cell.numberFormat = format;
                 } else {
@@ -3792,7 +4155,7 @@ export class DataCollection extends EventEmitter {
     public setCellsBorderColor(startCol: number, endCol: number, startRow: number, endRow: number, color: string): void {
         for (let r = startRow; r <= endRow; r++) {
             for (let c = startCol; c <= endCol; c++) {
-                const cell = this.values.find(v => v.cell === this.getCellName(c, r));
+                const cell = this.getCellByName(this.getCellName(c, r));
                 if (cell) cell.borderColor = color;
             }
         }

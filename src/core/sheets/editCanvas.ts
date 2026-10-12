@@ -414,7 +414,7 @@ export class EditCanvas extends Canvas {
         if (!line) return 0;
         let x = line.editX;
         const baseIndex = this.data.getPreLineCharsLength(lineIndex);
-        const cellObj = this.data.values.find(v => v.cell === this.data.activedCell);
+        const cellObj = this.data.getCellByName(this.data.activedCell);
         const letterSpacing = cellObj?.letterSpacing || 0;
         for (let i = 0; i < charIndex; i++) {
             const { charWidth } = this.calculateCharGeometry(this.data.activedCell, baseIndex + i);
@@ -602,7 +602,7 @@ export class EditCanvas extends Canvas {
                 // 该行起始的全局字符索引
                 let k = this.data.toAbsoluteIndex({ lineIndex, charIndex: 0 });
                 
-                const cellObj = this.data.values.find(v => v.cell === this.data.activedCell);
+                const cellObj = this.data.getCellByName(this.data.activedCell);
                 const letterSpacing = cellObj?.letterSpacing || 0;
                 for (let i = 0; i < currentLine.text.length; i++) {
                     const ch = currentLine.text[i];
@@ -695,9 +695,7 @@ export class EditCanvas extends Canvas {
         const { editLeft, editTop, lines } = this.measureCellText(this.data.activedCell);
         
         const currentCharIndex = this.data.toAbsoluteIndex({ lineIndex, charIndex });
-        const cellValue = this.data.values.find(
-            v => v.cell === this.data.activedCell
-        )?.chars;
+        const cellValue = this.data.getCellByName(this.data.activedCell)?.chars;
         let cursorHeight: number;
         if (cellValue && cellValue.length > 0) {
             // 优先使用当前字符的字体大小，如果 charIndex 超出范围则使用第一个或最后一个字符
@@ -800,7 +798,7 @@ export class EditCanvas extends Canvas {
         if (!cell) return;
         
         // 保存初始值用于撤销记录（在编辑开始时记录整个单元格状态）
-        const cellObj = this.data.values.find(v => v.cell === cell);
+        const cellObj = this.data.getCellByName(cell);
         if (cellObj && refresh && !this.data.isEditting) {  // 刷新单元格内容, 清空所有字符
             cellObj.chars = [];
         }
@@ -1301,7 +1299,7 @@ export class EditCanvas extends Canvas {
      * @private
      */
     private handleDeleteKey(isDelete: boolean) {
-        const cellValue = this.data.values.find(v => v.cell === this.data.activedCell)?.chars;
+        const cellValue = this.data.getCellByName(this.data.activedCell)?.chars;
         if (!cellValue) return;
         // 统一以 cursorAbsolutePosition 为准计算删除区间；有选区时用选区端点。
         const hasSelection = !!this.data.selectionOnEditting;
@@ -1429,7 +1427,7 @@ export class EditCanvas extends Canvas {
      */
     private handleAddChars(): number | null {
         //获取当前单元格的旧值
-        const oldCellObj = this.data.values.find(v => v.cell === this.data.activedCell);
+        const oldCellObj = this.data.getCellByName(this.data.activedCell);
         if (this.newChars.length === 0) {
             return null;
         }

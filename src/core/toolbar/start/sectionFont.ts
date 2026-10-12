@@ -453,7 +453,7 @@ export class SectionFont {
      * @private
      */
     private setToolbarsState() {
-        const cell = this.data.values.find(v => v.cell === this.data.activedCell);
+        const cell = this.data.getCellByName(this.data.activedCell);
         if (this.data.isEditting) {
             const cursorPosition = this.data.cursorAbsolutePosition - 1;
             const char = cell?.chars?.[cursorPosition];

@@ -382,7 +382,7 @@ export class SectionAlign {
      * @private
      */
     private setToolbarsState() {
-        const cell = this.data.values.find(v => v.cell === this.data.activedCell);
+        const cell = this.data.getCellByName(this.data.activedCell);
         if (!this.data.isEditting) {
             this.toolbars.topBtn.setActived(cell?.alignItems === 'top');
             this.toolbars.middleBtn.setActived(cell?.alignItems === 'middle' || cell?.alignItems === undefined);

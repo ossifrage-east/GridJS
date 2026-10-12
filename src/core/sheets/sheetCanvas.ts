@@ -121,7 +121,8 @@ export class SheetCanvas extends Canvas {
      * 设置筛选组件实例, 如果存在筛选组件实例，先移除旧的实例
      */
     private setFilters() {
-        const dataFilters = this.data.values.filter(v => v.filter !== undefined);
+        // 筛选单元格由 DataCollection 随单元格索引一并缓存，避免每帧对整表 filter
+        const dataFilters = this.data.getFilterCells();
         if (dataFilters.length === 0) {  // 如果data中没有筛选数据，则销毁组件实例直接返回
             this.filters.forEach(filter => filter.filter.destroy());
             this.filters = [];
@@ -232,7 +233,7 @@ export class SheetCanvas extends Canvas {
 
         // 读取合并跨度
         const cellName = this.data.getCellName(startCol, startRow);
-        const cell = this.data.values.find(v => v.cell === cellName);
+        const cell = this.data.getCellByName(cellName);
         const colspan = cell?.colspan || 1;
         const rowspan = cell?.rowspan || 1;
 
@@ -280,8 +281,10 @@ export class SheetCanvas extends Canvas {
      * 绘制单元格背景颜色
      */
     private drawCellBgColor() {
-        for (let i = 0; i < this.data.values.length; i++) {
-            const cell = this.data.values[i];
+        // 视口裁剪：只遍历当前可见的单元格，复杂度 O(可见单元格数)，与表格总规模无关
+        const cells = this.data.getVisibleCells();
+        for (let i = 0; i < cells.length; i++) {
+            const cell = cells[i];
             const { col, row } = this.data.getCellColAndRow(cell.cell);
             // 隐藏行列不绘制；合并单元格只绘制可见部分
             const rect = this.getVisibleCellRect(col, row);
@@ -302,8 +305,10 @@ export class SheetCanvas extends Canvas {
      * 绘制单元格边框
      */
     private drawCellBorder() {
-        for (let i = 0; i < this.data.values.length; i++) {
-            const cell = this.data.values[i];
+        // 视口裁剪：只遍历当前可见的单元格
+        const cells = this.data.getVisibleCells();
+        for (let i = 0; i < cells.length; i++) {
+            const cell = cells[i];
             const { col, row } = this.data.getCellColAndRow(cell.cell);
             // 隐藏行列不绘制；合并单元格边框只沿可见部分绘制
             const rect = this.getVisibleCellRect(col, row);
@@ -424,8 +429,11 @@ export class SheetCanvas extends Canvas {
      */
     private drawCellsText() {
         this.ctx.save();
-        for (let i=0; i<this.data.values.length; i++) {
-            const cell = this.data.values[i].cell;
+        // 视口裁剪：只遍历当前可见的单元格
+        const cells = this.data.getVisibleCells();
+        for (let i=0; i<cells.length; i++) {
+            const cellObj = cells[i];
+            const cell = cellObj.cell;
             const { col, row } = this.data.getCellColAndRow(cell);
 
             // 计算考虑隐藏行列后的可见矩形；完全隐藏时跳过绘制
@@ -444,10 +452,8 @@ export class SheetCanvas extends Canvas {
             );
             offscreenCtx.clearRect(0, 0, offscreenCanvas.width, offscreenCanvas.height);
             
-            // 复制主canvas的绘图上下文设置
-            // const wrap = this.data.values[i].wrap || false || lines.length > 1;
-            const letterSpacing = this.data.values[i].letterSpacing || 0;
-            const lineSpacing = this.data.values[i].lineSpacing || 0;
+            const letterSpacing = cellObj.letterSpacing || 0;
+            const lineSpacing = cellObj.lineSpacing || 0;
             offscreenCtx.textAlign = 'left';
             offscreenCtx.textBaseline = 'bottom';
             // 在offscreenCanvas上绘制文本
@@ -536,7 +542,7 @@ export class SheetCanvas extends Canvas {
                                 Math.round(rect.top * this.data.zoom + 1),
                                 Math.round(rect.width * this.data.zoom - 1), 
                                 Math.round(rect.height * this.data.zoom - 1));
-            const backgroundColor = this.data.values.find(cell => cell.cell === startCell)?.backgroundColor || DEFAULT_CELL_BG_COLOR;
+            const backgroundColor = this.data.getCellByName(startCell)?.backgroundColor || DEFAULT_CELL_BG_COLOR;
             this.ctx.fillStyle = backgroundColor;
             this.fillRect(rect.left * this.data.zoom + 1,
                             rect.top * this.data.zoom + 1,
