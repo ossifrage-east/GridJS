@@ -506,7 +506,7 @@ html, body {
   height: 100%;
 }
 .horizontal .split-next {
-  position: relative;
+  position: absolute;
   display: -webkit-box;
   display: -webkit-flex;
   display: -ms-flexbox;
