@@ -13,7 +13,8 @@ import { ColHeader, RowHeader } from "../dataArchitecture/header";
 import { DataCollection } from "../dataArchitecture/dataCollection";
 import { DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH } from "../constant";
 import { stripExtension } from "../../utils/fileName";
-import { SheetParser } from "../../utils/parser/sheetParser";
+import { parseWorkbook } from "../../utils/parser/parserClient";
+import type { ExtractedImage } from "../../utils/parser/sheetParser";
 import { DocumentParser } from "../../utils/parser/documentParser";
 import '../style/fileOpener.scss';
 
@@ -36,6 +37,8 @@ interface OpenedDocument {
     colHeaders: ColHeader[];
     /** 行头尺寸 */
     rowHeaders: RowHeader[];
+    /** 内嵌图片（docx/pptx 等文档类为空数组） */
+    images: ExtractedImage[];
 }
 
 /**
@@ -179,11 +182,19 @@ export class FileOpener {
         }
         const extension = (file.name.toLowerCase().split('.').pop() ?? '') as SupportedExtension;
 
-        // 先异步解析出完整数据，解析成功后再以一次全量状态撤销操作完成装载，
-        // 保证撤销快照的「变化前/变化后」分别对应真实的装载前后状态
+        // 解析 → 装载 → 通知外部登记文件树。
+        //
+        // 【为什么这里不再 `syncValuesToDB()`（性能约定，请勿加回）】
+        // 原先装载完立刻整表序列化 + 写库，对大文件来说等于「刚读完一遍，马上再
+        // 序列化一遍」：40 万格实测约 1.9 秒纯同步耗时、134 MB 临时字符串，
+        // 叠加在打开动作上直接造成「打开即卡死」。
+        // 现在改由装载结束时的 VALUES_CHANGED 触发脏标记 → 防抖 + 空闲时段落库
+        // （见 DataCollection._scheduleAutoSave / _runIdleSave），持久化语义不变：
+        // 导入进来的内容仍会被写回该文件名对应的存档键，只是不再阻塞打开动作。
+        // 而「切换 / 改名 / 复制」这类必须先把旧表无条件固化再操作的流程，
+        // 仍由 syncValuesToDB() 强制落库兜底。
         this.parse(file, extension)
             .then((document) => this.applyDocument(file.name, document))
-            .then(() => this.data.syncValuesToDB())
             .then(() => this.options.onOpened?.(file.name))
             .catch((error: unknown) => {
                 const reason = error instanceof Error ? error.message : String(error);
@@ -200,11 +211,17 @@ export class FileOpener {
      */
     private async parse(file: File, extension: SupportedExtension): Promise<OpenedDocument> {
         if (extension === 'xlsx' || extension === 'xls') {
-            const result = await new SheetParser().parse(file);
+            // Worker 优先：把解压 + XML 扫描移出主线程；不可用时内部自动回退主线程。
+            //
+            // `readImages: true` —— 位图渲染通道已经建好（见 `sheets/sheetImageLayer.ts`），
+            // 图片不再是「读出来没人用」的浪费。**必须在 decode 阶段声明**：
+            // media 条目在解压时就按目录跳过了，之后无从补救。
+            const result = await parseWorkbook(file, { readImages: true });
             return {
                 values: result.values,
                 colHeaders: result.colHeaders,
                 rowHeaders: result.rowHeaders,
+                images: result.images,
             };
         }
 
@@ -220,7 +237,7 @@ export class FileOpener {
             });
             return cell;
         });
-        return { values, colHeaders: [], rowHeaders: [] };
+        return { values, colHeaders: [], rowHeaders: [], images: [] };
     }
 
     /**
@@ -237,6 +254,9 @@ export class FileOpener {
         this.data.runWithFullStateUndo(`打开 ${fileName}`, () => {
             this.data.activedSheetName = sheetName;
             this.applyHeaders(document.colHeaders, document.rowHeaders);
+            // 图片先于 values 赋值：values setter 会广播 VALUES_CHANGED，
+            // 画布在该事件里重绘 —— 先赋值图片才能让「首帧」就带上图
+            this.data.images = document.images;
             this.data.values = document.values;
         });
         // runWithFullStateUndo 抑制了包裹期间的所有广播（避免在撤销栈里产生空操作），
@@ -260,8 +280,14 @@ export class FileOpener {
         const minCols = Math.ceil(visibleView.sheetWidth / DEFAULT_CELL_WIDTH / this.data.zoom) + 2;
         const minRows = Math.ceil(visibleView.sheetHeight / DEFAULT_CELL_HEIGHT / this.data.zoom) + 2;
 
-        const cols = colHeaders.map((header) => ({ left: header.left, width: header.width }));
-        const rows = rowHeaders.map((header) => ({ top: header.top, height: header.height }));
+        // 解析器产出的表头已经是 {left,width}/{top,height} 形状，且其数组是一次性产物；
+        // 仅在「数量不足、需要补足可视区」时才复制一份再扩容，避免对百万行表头做全量克隆。
+        const cols: ColHeader[] = (colHeaders.length >= minCols)
+            ? colHeaders
+            : colHeaders.map((header) => ({ left: header.left, width: header.width }));
+        const rows: RowHeader[] = (rowHeaders.length >= minRows)
+            ? rowHeaders
+            : rowHeaders.map((header) => ({ top: header.top, height: header.height }));
 
         let colLeft = cols.length > 0 ? cols[cols.length - 1].left + cols[cols.length - 1].width : 0;
         for (let c = cols.length; c < minCols; c++) {

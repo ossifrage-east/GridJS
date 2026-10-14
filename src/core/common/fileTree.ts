@@ -408,6 +408,18 @@ export class FileTree {
                 this.applyKeyword();
             }
         });
+
+        // 内容区任意位置右键均可打开菜单：
+        // 节点行上的右键已在 createNode 中 stopPropagation 拦截并自行弹菜单，
+        // 能冒泡到这里的多为空白区域（树主体空隙、工具栏、无匹配提示等）。
+        // 操作目标取当前选中节点；无选中时回落到根节点（「工作区」），
+        // 使「新建 / 粘贴」作用于工作区、其余项随选中状态自然可用或置灰语义一致。
+        this.container.addEventListener('contextmenu', (e: MouseEvent) => {
+            e.preventDefault();
+            const view = this.selected ?? this.rootViews[0];
+            if (!view) return;
+            this.openContextMenu(e, view);
+        });
     }
 
     /**

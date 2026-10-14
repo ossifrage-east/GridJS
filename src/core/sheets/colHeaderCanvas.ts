@@ -116,7 +116,8 @@ export class ColHeaderCanvas extends Canvas {
         const { startCol, endCol } = this.data.getVisibleCols();
         const { startCol: selectedStartCol, endCol: selectedEndCol } = this.getSelectedColsAndRows();
         // 绘制网格的垂直线条
-        for (let c = startCol - 1; c <= endCol; c++) {
+        // 注意 getVisibleCols 返回 1-based 列号（含端点），此处 c 是 0-based 下标
+        for (let c = startCol - 1; c < endCol; c++) {
             if(this.data.colHeaders.getAt(c).isHidden) continue; // 跳过隐藏列
             // left 已由 recalcColPositions 重算为紧凑排列（隐藏列不占位），无需手动补偿
             const x = (this.data.colHeaders.getAt(c).left - this.data.colHeaders.offsetWidth) * this.data.zoom;

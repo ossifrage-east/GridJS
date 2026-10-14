@@ -377,16 +377,15 @@ export class Canvas extends EventEmitter {
         const charObj = cellObj?.chars?.[charIndex];
 
         // 样式继承：字符级样式 → 默认样式
-        const pick = <T>(charVal: T | undefined, defaultVal: T): T =>
-            charVal !== undefined ? charVal : defaultVal;
-
-        const fontColor = pick(charObj?.fontColor, TEXT_COLOR);
-        const fontFamily = pick(charObj?.fontFamily, DEFAULT_FONT_FAMILY);
-        const underline = pick(charObj?.underline, false);
-        const strikethrough = pick(charObj?.strikethrough, false);
-        const fontWeight = pick(charObj?.fontWeight, false) ? 'bold' : '';
-        const fontStyle = pick(charObj?.fontStyle, false) ? 'italic' : '';
-        const fontSize = Math.round(pick(charObj?.fontSize, DEFAULT_FONT_SIZE) * this.data.zoom);
+        // 刻意不抽 `pick` 闭包：本函数在文本绘制里**按字符**调用，
+        // 每字符新建一个闭包纯属浪费（原先每帧上千个）
+        const fontColor = charObj?.fontColor !== undefined ? charObj.fontColor : TEXT_COLOR;
+        const fontFamily = charObj?.fontFamily !== undefined ? charObj.fontFamily : DEFAULT_FONT_FAMILY;
+        const underline = charObj?.underline !== undefined ? charObj.underline : false;
+        const strikethrough = charObj?.strikethrough !== undefined ? charObj.strikethrough : false;
+        const fontWeight = (charObj?.fontWeight !== undefined ? charObj.fontWeight : false) ? 'bold' : '';
+        const fontStyle = (charObj?.fontStyle !== undefined ? charObj.fontStyle : false) ? 'italic' : '';
+        const fontSize = Math.round((charObj?.fontSize !== undefined ? charObj.fontSize : DEFAULT_FONT_SIZE) * this.data.zoom);
 
         // 从 chars 数组读取字符内容，索引越界或换行等关键字不占宽度
         // 若单元格设置了数字格式，则从格式化后的显示文本中取字符进行测量

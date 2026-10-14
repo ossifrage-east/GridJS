@@ -6,6 +6,11 @@ import {
 } from "../constant";
 import { EventEmitter } from "../../utils/eventEmitter";
 
+/** Excel 的行数上限（稀疏编码读回时的防御性上限） */
+export const MAX_ROW_COUNT = 1048576;
+/** Excel 的列数上限（稀疏编码读回时的防御性上限） */
+export const MAX_COL_COUNT = 16384;
+
 /**
  * 列头部数据结构
  * @interface ColHeader
@@ -149,11 +154,7 @@ export class ColHeaders extends EventEmitter {
      * 同时重算可见列宽度总和。
      */
     public recalcColPositions(): void {
-        let left = 0;
-        for (const h of this.colHeaders) {
-            h.left = left;
-            if (!h.isHidden) left += h.width;
-        }
+        applyColPositions(this.colHeaders);
         this.recalcAllColWidth();
     }    
 
@@ -376,11 +377,7 @@ export class RowHeaders extends EventEmitter {
      * 同时重算可见行高度总和。
      */
     public recalcRowPositions(): void {
-        let top = 0;
-        for (const h of this.rowHeaders) {
-            h.top = top;
-            if (!h.isHidden) top += h.height;
-        }
+        applyRowPositions(this.rowHeaders);
         this.recalcAllRowHeight();
     }
     
@@ -471,4 +468,171 @@ export class RowHeaders extends EventEmitter {
         this.rowHeaders = [];
         this._offsetHeight = 0;
     }
+}
+
+// ════════════════════════════════════════════════════════════
+//  稀疏轴编码（存档 v4 用）
+// ════════════════════════════════════════════════════════════
+
+/**
+ * 一个轴（行或列）的稀疏编码
+ *
+ * ## 为什么必须稀疏（性能约定，勿回退为「存整个对象数组」）
+ *
+ * 膨胀维度的工作簿（`maxRow = 1048576`）在内存里就是 104 万个
+ * `{ top, height }` 对象。把这一整串写进存档会凭空多出 **28.6 MB**，
+ * 而其中 104 万行里只有几百行真的被改过尺寸 —— 剩下的全是 `defaultSize`。
+ * 存档变大不是「多占点磁盘」这么轻描淡写：装载路径要先把这段 JSON
+ * `JSON.parse` 出来，实测这一项就要 232 ms 的**整段同步**。
+ *
+ * 稀疏编码只写「例外」：
+ * - `count` —— 轴长度（数量本身必须保留，否则滚动条与可视区计算全错）；
+ * - `defaultSize` —— 绝大多数项的尺寸，不逐项写；
+ * - `sizeFlat` —— 非默认尺寸的 `[索引, 尺寸, 索引, 尺寸, …]` 扁平数组；
+ * - `hidden` —— 隐藏项索引（数量少，单独列）。
+ *
+ * 位置（`top`/`left`）**不存**：它由尺寸累加派生，读回时用同一套规则重算
+ * （{@link applyColPositions} / {@link applyRowPositions}），不会出现
+ * 「位置与尺寸互相矛盾」的存档。
+ */
+export interface SparseAxis {
+    /** 轴长度（列数 / 行数） */
+    count: number;
+    /** 默认尺寸（等于它的项不进 `sizeFlat`） */
+    defaultSize: number;
+    /** 非默认尺寸的 `[索引, 尺寸, …]` 扁平数组 */
+    sizeFlat: number[];
+    /** 隐藏项索引 */
+    hidden: number[];
+}
+
+/** 任一尺寸字段的头部视图 */
+type SizedHeader = { isHidden?: boolean; width?: number; height?: number };
+
+/**
+ * 把一组头部编码成稀疏轴
+ * @param headers - 头部数组（读 `width` 或 `height`，缺失视为默认值）
+ * @param defaultSize - 默认尺寸（列宽 / 行高）
+ * @param sizeKey - 取尺寸的字段名
+ * @param limit - 数量上限（防御性）
+ * @returns {SparseAxis} 稀疏编码
+ */
+function encodeAxis(
+    headers: readonly SizedHeader[],
+    defaultSize: number,
+    sizeKey: 'width' | 'height',
+    limit: number
+): SparseAxis {
+    const count = Math.min(headers.length, limit);
+    const sizeFlat: number[] = [];
+    const hidden: number[] = [];
+    for (let i = 0; i < count; i++) {
+        const h = headers[i];
+        if (!h) continue;
+        const size = h[sizeKey];
+        if (typeof size === 'number' && size !== defaultSize) sizeFlat.push(i, size);
+        if (h.isHidden) hidden.push(i);
+    }
+    return { count, defaultSize, sizeFlat, hidden };
+}
+
+/**
+ * 把稀疏轴解码回头部数组（位置按「跳过隐藏项累加」规则就地算好）
+ *
+ * 读回的是外部数据，先做形状校验：任何非法字段按「该字段缺省」处理，
+ * 并且数量被 Excel 上限截断 —— 一个损坏的 `count: 1e9` 不允许变成内存炸弹。
+ * @param axis - 稀疏编码（可能来自损坏的存档）
+ * @param defaultSize - 默认尺寸（编码中的 `defaultSize` 非法时用它兜底）
+ * @param sizeKey - 写尺寸的字段名
+ * @param limit - 数量上限
+ * @returns {Array} 头部数组（位置已算好）
+ */
+function decodeAxis(
+    axis: unknown,
+    defaultSize: number,
+    sizeKey: 'width' | 'height',
+    limit: number
+): Array<Record<string, number | boolean>> {
+    const raw = (axis ?? {}) as Partial<SparseAxis>;
+    const defaulted = Number.isFinite(raw.defaultSize) ? (raw.defaultSize as number) : defaultSize;
+    const count = Number.isFinite(raw.count)
+        ? Math.max(0, Math.min(Math.floor(raw.count as number), limit))
+        : 0;
+
+    const sizes = new Map<number, number>();
+    const flat = raw.sizeFlat;
+    if (Array.isArray(flat)) {
+        for (let i = 0; i + 1 < flat.length; i += 2) {
+            const index = flat[i];
+            const size = flat[i + 1];
+            if (Number.isFinite(index) && Number.isFinite(size) && index >= 0 && index < count) {
+                sizes.set(index, size);
+            }
+        }
+    }
+    const hidden = new Set<number>();
+    if (Array.isArray(raw.hidden)) {
+        for (const index of raw.hidden) {
+            if (Number.isFinite(index) && index >= 0 && index < count) hidden.add(index);
+        }
+    }
+
+    const posKey = sizeKey === 'width' ? 'left' : 'top';
+    const headers: Array<Record<string, number | boolean>> = new Array(count);
+    let position = 0;
+    for (let i = 0; i < count; i++) {
+        const size = sizes.get(i) ?? defaulted;
+        const isHidden = hidden.has(i);
+        // 位置与 `applyColPositions`/`applyRowPositions` 同规则：
+        // 隐藏项的位置与前一项相同（被后继可见项覆盖），且不计入累加
+        headers[i] = isHidden
+            ? { [posKey]: position, [sizeKey]: size, isHidden: true }
+            : { [posKey]: position, [sizeKey]: size };
+        if (!isHidden) position += size;
+    }
+    return headers;
+}
+
+/**
+ * 重算列位置（`ColHeaders.recalcColPositions` 与稀疏解码共用同一套规则）
+ * @param headers - 列头数组（就地修改 `left`）
+ */
+export function applyColPositions(headers: ColHeader[]): void {
+    let left = 0;
+    for (const h of headers) {
+        h.left = left;
+        if (!h.isHidden) left += h.width;
+    }
+}
+
+/**
+ * 重算行位置（`RowHeaders.recalcRowPositions` 与稀疏解码共用同一套规则）
+ * @param headers - 行头数组（就地修改 `top`）
+ */
+export function applyRowPositions(headers: RowHeader[]): void {
+    let top = 0;
+    for (const h of headers) {
+        h.top = top;
+        if (!h.isHidden) top += h.height;
+    }
+}
+
+/** 列头 → 稀疏轴 */
+export function encodeColAxis(headers: readonly ColHeader[]): SparseAxis {
+    return encodeAxis(headers, DEFAULT_CELL_WIDTH, 'width', MAX_COL_COUNT);
+}
+
+/** 行头 → 稀疏轴 */
+export function encodeRowAxis(headers: readonly RowHeader[]): SparseAxis {
+    return encodeAxis(headers, DEFAULT_CELL_HEIGHT, 'height', MAX_ROW_COUNT);
+}
+
+/** 稀疏轴 → 列头（位置已算好） */
+export function decodeColAxis(axis: unknown): ColHeader[] {
+    return decodeAxis(axis, DEFAULT_CELL_WIDTH, 'width', MAX_COL_COUNT) as unknown as ColHeader[];
+}
+
+/** 稀疏轴 → 行头（位置已算好） */
+export function decodeRowAxis(axis: unknown): RowHeader[] {
+    return decodeAxis(axis, DEFAULT_CELL_HEIGHT, 'height', MAX_ROW_COUNT) as unknown as RowHeader[];
 }

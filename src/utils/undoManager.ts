@@ -56,6 +56,14 @@ export interface ValuesSnapshot {
 export interface FullStateSnapshot {
     /** 单元格数组深拷贝 */
     values: any[];
+    /**
+     * 内嵌图片数组（**浅拷贝**：只拷数组本身，图片对象按引用共享）
+     *
+     * 图片是二进制大块，深拷贝一次 undo 快照就要多留一份几十 MB 的内存；
+     * 而图片对象在本项目里是「只读替换」语义（永不原地修改），共享引用是安全的。
+     * 可选：旧快照没有该字段。
+     */
+    images?: any[];
     /** 行表头数组深拷贝（top / height / isHidden 等） */
     rowHeaders: any[];
     /** 列表头数组深拷贝（left / width / isHidden 等） */

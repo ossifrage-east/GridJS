@@ -124,7 +124,8 @@ export class RowHeaderCanvas extends Canvas {
         const { startRow, endRow } = this.data.getVisibleRows();
         const { startRow: selectedStartRow, endRow: selectedEndRow } = this.getSelectedColsAndRows();
         // 绘制网格的水平线条
-        for (let r = startRow - 1; r <= endRow; r++) {
+        // 注意 getVisibleRows 返回 1-based 行号（含端点），此处 r 是 0-based 下标
+        for (let r = startRow - 1; r < endRow; r++) {
             if(this.data.rowHeaders.getAt(r).isHidden) continue; // 跳过隐藏行
             // top 已由 recalcRowPositions 重算为紧凑排列（隐藏行不占位），无需手动补偿
             const y = (this.data.rowHeaders.getAt(r).top - this.data.rowHeaders.offsetHeight) * this.data.zoom;

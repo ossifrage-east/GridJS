@@ -1,15 +1,27 @@
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 const MiniCssExtractPlugin = require('mini-css-extract-plugin');
 const MiniSVGDataURI = require("mini-svg-data-uri");  // SVG 文件转换为 URI 编码后，与 base64 相比，体积会更小
+const fs = require('fs');
 const { resolve } = require('path')
-module.exports = {
+
+const DIST = resolve(__dirname, './dist');
+
+// 主配置与 Worker 配置都输出到 dist，若各自开 output.clean 会互相删掉对方的产物，
+// 故统一在此处「构建前一次性清空」（dev-server 下不清，避免影响热更新）。
+if (!process.env.WEBPACK_SERVE) {
+  try { fs.rmSync(DIST, { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
+}
+
+// —— 主应用配置 ——
+const mainConfig = {
+  name: 'main',
   mode: "development",   // 指定 development(开发环境) 和 production(生产环境)
   entry: resolve(__dirname, './src/index.ts'),  // 项目入口
   output: {
     filename: '[name].[hash:8].js', // 输出文件名
-    path: resolve(__dirname, './dist'), // 路径
+    path: DIST, // 路径
     assetModuleFilename: 'assets/[hash:10][ext][query]',  // 静态文件打包后的路径及文件名
-    clean: true, // 打包清除缓存
+    clean: false, // 已在上方统一清空，避免与 worker 配置互相删除产物
   },
   plugins: [
     new HtmlWebpackPlugin({
@@ -132,4 +144,39 @@ module.exports = {
       'vm': false
     }
   },
-}
+};
+
+// —— Excel 解析 Worker 配置 ——
+// 只打包 parser.worker.ts 这一个入口，输出为固定文件名 parser.worker.js
+// （parserClient 以相对文档路径 `new Worker('parser.worker.js')` 加载）。
+// target: 'webworker' 让 webpack 按 Worker 环境生成运行时（不注入 document 相关代码）。
+const workerConfig = {
+  name: 'parser-worker',
+  mode: "development",
+  target: 'webworker',
+  entry: resolve(__dirname, './src/utils/parser/parser.worker.ts'),
+  output: {
+    filename: 'parser.worker.js',
+    path: DIST,
+    clean: false, // 与主配置共用 dist，清空已在上方统一完成
+  },
+  module: {
+    rules: [
+      {
+        test: /\.tsx?$/,
+        use: 'ts-loader',
+        exclude: /node_modules/
+      }
+    ]
+  },
+  resolve: {
+    extensions: ['.ts', '.js'],
+    fallback: {
+      'fs': false,
+      'path': false,
+      'vm': false
+    }
+  },
+};
+
+module.exports = [mainConfig, workerConfig];

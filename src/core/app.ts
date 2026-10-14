@@ -513,6 +513,11 @@ export class App {
                 // 源为空表时也写入空白存档（而不是删掉目标键）：目标文件同样是
                 // 「树里有文件、库里就得有存档」，同时顺带清掉目标键上可能存在的旧内容
                 await this.settingsDb.setValue(to, raw && raw !== '{}' ? raw : this.data.blankSnapshot());
+                // 图片与单元格值分库存储，必须同步复制：否则粘贴出来的文件
+                // 要么没有图，要么顶着目标键上残留的旧图
+                const images = await this.settingsDb.getImages(from);
+                if (images.length > 0) await this.settingsDb.setImages(to, images);
+                else await this.settingsDb.deleteImages(to);
             }
         } catch {
             // 存档不可用不影响结构操作：此时粘贴出来的文件按空表处理
@@ -545,6 +550,11 @@ export class App {
                 // 空表也写一份空白存档：改名后「树里有文件、库里就得有存档」，不留空档
                 await this.settingsDb.setValue(to, raw && raw !== '{}' ? raw : this.data.blankSnapshot());
                 await this.settingsDb.deleteValue(from);
+                // 图片记录同样随名字搬迁（键就是文件名）
+                const images = await this.settingsDb.getImages(from);
+                if (images.length > 0) await this.settingsDb.setImages(to, images);
+                else await this.settingsDb.deleteImages(to);
+                await this.settingsDb.deleteImages(from);
 
                 // 被改名的是当前打开的文件：后续自动保存必须写到新键，
                 // 否则编辑内容会被写回旧键（等于没改名的那个文件被悄悄改掉）
@@ -596,7 +606,10 @@ export class App {
             }
 
             // 落库/切换完成后才真正清理存档
-            for (const key of keys) await this.settingsDb.deleteValue(key);
+            for (const key of keys) {
+                await this.settingsDb.deleteValue(key);
+                await this.settingsDb.deleteImages(key);
+            }
 
             if (removingActived) {
                 this.fileHistory = this.fileHistory.filter((item) => !keys.includes(this.toSheetKey(item)));
@@ -678,6 +691,9 @@ export class App {
      * - 补建：树里有文件、库里没有存档 → 写入一份空白快照；
      * - 清理：库里有存档、树里已无该文件 → 删除，但**只删空存档**：
      *   非空却无归属的存档宁可留着，也不冒误删内容的风险。
+     *
+     * 图片记录（独立的 `images` 对象存储）一并按「无归属即删」清理，
+     * 但**不补建**：没有图片的文件本来就不该有图片记录（补一条空记录只会白占空间）。
      */
     private async reconcileValueStore(): Promise<void> {
         try {
@@ -704,6 +720,15 @@ export class App {
                 if (!this.isEmptySnapshot(record.value)) continue;
                 await this.settingsDb.deleteValue(key);
             }
+
+            // 图片记录：无归属的直接删（与「空存档才删」不同 —— 图片是可再生内容，
+            // 留着既占内存又永远不会被读，没有「宁可留着也别误删」的权衡）。
+            // 放在最后：读键失败时不应影响上面已经完成的值对账。
+            const imageKeys = await this.settingsDb.getAllImageKeys();
+            for (const key of imageKeys) {
+                if (!key || owned.has(key.toLowerCase())) continue;
+                await this.settingsDb.deleteImages(key);
+            }
         } catch {
             // 存档不可用（IndexDB 被禁用等）时跳过对账，不影响使用
         }
@@ -712,11 +737,18 @@ export class App {
     /**
      * 判断存档是否为「空表」（没有单元格内容）
      *
+     * 两态兼容：
+     * - v4 对象存档 → 没有分片（或分片全空）即空表；
+     * - v3 及更早的 JSON 字符串 → 解析后 `values` 为空数组即空表。
+     *
      * 解析失败一律按「非空」处理：无法确认内容的一律不删，避免误删数据。
-     * @param raw - 存档原始字符串
+     * @param raw - 存档原始值（v4 对象 / JSON 字符串 / 未知形态）
      * @returns {boolean} 是否为空表
      */
     private isEmptySnapshot(raw: unknown): boolean {
+        if (DataCollection.isV4Snapshot(raw)) {
+            return raw.chunks.every((chunk) => typeof chunk !== 'string' || chunk.length === 0 || chunk === '[]');
+        }
         if (typeof raw !== 'string') return false;
         try {
             const parsed = JSON.parse(raw);

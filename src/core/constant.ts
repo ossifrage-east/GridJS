@@ -91,6 +91,14 @@ export const GRID_LINE_COLOR = '#ccc';
 export const TEXT_COLOR = 'black';
 export const DEFAULT_CELL_HIGHLIGHT_COLOR = '#ffeb3b';
 export const DEFAULT_SELECTED_BG_COLOR = 'rgba(128,128,128, 0.2)';
+/**
+ * EMU（English Metric Unit）与 CSS 像素的换算比
+ *
+ * OOXML 用 EMU 表示长度：1 英寸 = 914400 EMU，而 CSS 以 96 dpi 计，1 英寸 = 96 px，
+ * 故 914400 / 96 = 9525。xlsx drawing 的 `colOff`/`rowOff`/`ext/@cx` 全用这个单位。
+ * 解析侧只如实保存 EMU 原始值，换算发生在渲染侧（见 `sheets/imageLayout.ts`）。
+ */
+export const EMU_PER_PIXEL = 9525;
 export const DEFAULT_SELECTED_BORDER_COLOR = '#4CAF50';
 export const DEFAULT_ANCHOR_SELECTED_BORDER_COLOR = '#A9A9A9';
 export const DEFAULT_SELECTED_BORDER_WIDTH = 3;

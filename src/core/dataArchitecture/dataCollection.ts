@@ -1,5 +1,5 @@
-import { ColHeader, ColHeaders, RowHeader, RowHeaders } from "./header";
-import { Cell, TextAlign, VerticalAlign } from "./cell";
+import { ColHeader, ColHeaders, RowHeader, RowHeaders, encodeColAxis, encodeRowAxis, decodeColAxis, decodeRowAxis, SparseAxis } from "./header";
+import { Cell, CellStyleTable, TextAlign, VerticalAlign } from "./cell";
 import { LineText, SelectionRange, FontStyle, BorderStyle, CellBorderStyle, CursorPosition, } from "./cellContent";
 import { Char } from "./char";
 import { VisibleView } from "./visibleView";
@@ -11,7 +11,86 @@ import { ClipboardManager } from "../../utils/clipboardManager";
 import { MessageBox } from "../common/message";
 import { MatrixSorter, type SortConfig } from "./matrixSorter";
 import { PrinterSetting } from "../../utils/printer";
+import { SliceBudget } from "../../utils/scheduler";
+import type { ExtractedImage } from "../../utils/parser/sheetParser";
 
+
+/**
+ * 合并区域的数值矩形（闭区间，1-based 行列号）
+ *
+ * 由 {@link DataCollection.getMergedCells} 的字符串形式（`A1:C3`）在
+ * 索引重建时换算而来，供渲染热路径做纯整数比较，避免逐次字符串解析。
+ * @interface MergeRect
+ */
+export interface MergeRect {
+    /** 锚点单元格名（合并区域的左上角，如 `A1`） */
+    anchor: string;
+    /** 起始列号（1-based） */
+    startCol: number;
+    /** 起始行号（1-based） */
+    startRow: number;
+    /** 结束列号（1-based，含） */
+    endCol: number;
+    /** 结束行号（1-based，含） */
+    endRow: number;
+}
+
+/**
+ * 工作表存档 v4（**默认落库形态**）
+ *
+ * ## 为什么不再是「一个 JSON 字符串」（性能约定，勿回退）
+ *
+ * v3 时代整份快照是一根字符串，装载时必然要一次 `JSON.parse(整份)`：
+ * 40 万格实测约 140~290 ms、膨胀维度那份 42.3 MB 要 620 ms，而且是
+ * **整段同步、不可让出**的 —— 分片（`SliceBudget`）能解决「解码单元格」
+ * 的成本，解决不了这一次解析。它正是装载路径最后一块不可切分的地板。
+ *
+ * v4 把存档拆成「结构化克隆对象」直存 IndexedDB（不再需要字符串化），
+ * 其中最大的部分 `chunks` 是**分片的 JSON 文本数组**（每片
+ * {@link DataCollection.SNAPSHOT_VALUE_CHUNK} 格），装载时一片一片解析：
+ * 单片最长约 1.8 ms，片间可让出主线程 —— 从「一次 290 ms 的冻结」
+ * 变成「若干次 2 ms 的小块」。
+ *
+ * 实测（40 万格，`test/_bench-snapshot-form.js`）：
+ *
+ * | 存档形态 | 装载耗时 | 最大单次不可分片阻塞 |
+ * | --- | --- | --- |
+ * | v3 整份 JSON 字符串 | 428 ms | **290 ms** |
+ * | 结构化克隆普通对象直存 | 951 ms | 560 ms |
+ * | v4 分片 JSON + 稀疏行列头 | 约 320 ms | 42 ms（IDB 读回）/ 1.8 ms（解析） |
+ *
+ * 「结构化克隆普通对象」那一行说明**不能**天真地把整个 `values` 当对象数组存：
+ * V8 的结构化克隆要逐对象重建，比 `JSON.parse` 还慢一倍。
+ *
+ * `styles` 存**数组**而不是字符串：表项数量是样式种类数（通常几十到几百条），
+ * 直接用结构化克隆比再 `JSON.parse` 一次便宜。
+ */
+export interface SheetSnapshotV4 {
+    /** 格式版本（固定 4，读取侧据此分派） */
+    v: 4;
+    /** 当前选中的单元格 */
+    activedCell: string;
+    /** 选区（如 `A1:C3`） */
+    selection: string;
+    /** 打印设置 */
+    printSetting: PrinterSetting;
+    /** 是否显示网格线 */
+    showGridLines: boolean;
+    /** 缩放比例 */
+    zoom: number;
+    /** 水平滚动偏移 */
+    offsetWidth: number;
+    /** 垂直滚动偏移 */
+    offsetHeight: number;
+    /** 列头（稀疏编码，见 `SparseAxis`） */
+    cols: SparseAxis;
+    /** 行头（稀疏编码，见 `SparseAxis`） */
+    rows: SparseAxis;
+    /** values 的 JSON 文本分片，每片是一个完整的 JSON 数组字符串 */
+    chunks: string[];
+    /** 样式表（`CellStyleTable.entries`） */
+    styles: Array<Record<string, unknown>>;
+}
 
 /**
  * DataCollection 类
@@ -62,17 +141,111 @@ export class DataCollection extends EventEmitter {
      */
     private _mergedCells: string[] = [];
     /**
+     * 合并区域的**数值矩形**缓存（与 {@link _mergedCells} 同源、同时重建）。
+     *
+     * 字符串形式的 `A1:C3` 每次使用都要 `split(':')` + 逐字符解析行列号，
+     * 而合并查找处在「每个可见单元格 × 每帧」的热路径上（主画布的背景/边框/文本
+     * 三遍绘制各查一次），临时字符串与解析开销会被放大成几百万次。
+     * 这里在重建时一次性把行列号算好，热路径只做整数比较。
+     */
+    private _mergeRects: MergeRect[] = [];
+    /**
+     * 「列号 → 覆盖该列的合并区域」倒排索引（1-based 列号）。
+     *
+     * 历史实现按「每个单元格 × 遍历全部合并区域」查找所属合并块，
+     * 复杂度 O(可见单元格数 × 合并数)；合并单元格数以千计时，
+     * 一帧就是上千万次比较 —— 实测 8000 处合并时 `drawAllMergedCellBackground`
+     * 单帧 3.8 秒（渲染彻底卡死）。倒排后单次查找只与「该列上的合并块数」相关。
+     */
+    private _mergeByCol: Map<number, MergeRect[]> = new Map();
+    /**
+     * 跨列数超过 {@link MERGE_COL_INDEX_SPAN_LIMIT} 的合并区域：不铺进列索引，
+     * 查找时单独线性兜底（这类「整行合并」通常只有个位数，代价可忽略）。
+     */
+    private _wideMergeRects: MergeRect[] = [];
+    /**
      * 带筛选标记（`filter !== undefined`）的单元格缓存，随索引一并重建。
      * 供 SheetCanvas 每帧调用 {@link getFilterCells} 取用，
      * 避免原先每帧 `values.filter(...)` 的全表扫描。
      */
     private _filterCells: Cell[] = [];
     /**
+     * 「带筛选标记的单元格」缓存对应的世代（与 {@link _valuesEpoch} 比对判失效）
+     *
+     * 供 {@link invalidateFilterCells} 在**已知有筛选按钮存在**时提前失效缓存，
+     * 使 `SheetCanvas.setFilters()` 能 O(1) 判定「本帧要不要再问一次筛选单元格」
+     * 而无需先重建整份单元格索引。
+     */
+    private _filterCellsEpoch: number = -1;
+    /**
+     * 「列号 → 该列上最后一个**有文本**的行号」缓存（1-based，含）
+     *
+     * 供筛选按钮的显隐判定（{@link hasContentBelow}）做 **O(1)** 查询。
+     *
+     * 历史实现是「每个筛选实例各自扫一遍整表」：`Filter.updateFilterVisibility`
+     * 挂在每个实例的 VALUES_CHANGED 上，F 个按钮就是 **F × O(N)**。
+     * 基准 `node test/_bench-filter-many.js` 实测 4 万格 × 40 个按钮 = **17.6 ms
+     * / 次数据变化**（400 万格量级直接上百毫秒），这就是「筛选按钮一多就卡」的根因。
+     *
+     * **与单元格索引分开、惰性、按世代缓存**：只有筛选按钮会问这个结构，
+     * 而 {@link _rebuildCellIndex} 的重建频率高得多，不该为筛选多付一次整表遍历。
+     * 同一世代内只构建一次，F 个按钮共用同一份结果。
+     */
+    private _colContentBottom: Map<number, number> = new Map();
+    /** {@link _colContentBottom} 所属的世代（与 {@link _valuesEpoch} 比对判失效） */
+    private _colContentEpoch: number = -1;
+    /** 构建 {@link _colContentBottom} 时 `_values` 的长度（长度变化即失效） */
+    private _colContentLength: number = -1;
+    /**
+     * 「有文本单元格覆盖到的最大行号」（1-based；0 = 无内容）
+     * 供筛选下拉清单用它替代 `matrixValues()` 求统计行范围。
+     */
+    private _contentMaxRow: number = 0;
+    /** 「有文本单元格覆盖到的最大列号」（1-based；0 = 无内容） */
+    private _contentMaxCol: number = 0;
+    /**
+     * 「有文本的行」集合（1-based）
+     *
+     * 筛选只可能隐藏**有内容**的行（全空行始终显示），因此判定筛选效果时
+     * 只需在这批行上做，不必逐行扫到 `rowHeaders.length`（大文件下可达百万行）。
+     */
+    private _rowsWithText: Set<number> = new Set();
+    /**
+     * {@link _contentMaxRow} / {@link _contentMaxCol} / {@link _rowsWithText} 所属的世代
+     *
+     * 与 {@link _colContentBottom} **分开缓存**：后者挂在筛选按钮的显隐判定上、
+     * 每次数据变化（含每次按键）都会被问到，必须保持「跳过无文本单元格、不解析名字」的
+     * 廉价路径；而本索引只在**筛选交互**（打开下拉 / 执行筛选 / 清除筛选）时构建，
+     * 因此可以顺带解析全部有文本单元格的名字并建集合。两者混在一起会让每次按键
+     * 都白做一次整表名字解析。
+     */
+    private _filterIndexEpoch: number = -1;
+    /** 构建筛选清单索引时 `_values` 的长度（长度变化即失效） */
+    private _filterIndexLength: number = -1;
+    /**
+     * 「有内容的列」集合（1-based 列号，含合并块覆盖到的列）
+     *
+     * 供 {@link validataColInFilter} 做 **O(1)** 列有效性判定。
+     *
+     * 历史实现是「每列调一次 `matrixValues()`」——后者会分配一张
+     * `maxRow × maxCol` 的**稠密二维数组**并遍历整表两次。选中 200 列时
+     * 等于重建 200 次稠密矩阵：基准 `node test/_bench-filter-add.js`
+     * 实测 6 万格（60 列 × 3000 行）下 200 列 = **1596 ms**，这就是
+     * 「加载筛选按钮时主页面卡顿、取消（清除分支不走这条路径）却很流畅」的根因。
+     *
+     * 与 {@link _rowsWithText} 同一个索引、同一次遍历产出、同一处失效。
+     */
+    private _colsWithContent: Set<number> = new Set();
+    /**
      * 上一次提交时的 this.values 深拷贝快照。
      * 作为下一次变更的「变化前」基准：每次原地修改后调用 commitValues()，
      * 便会以本快照为 before、当前 _values 为 after 记录一条撤销操作。
+     *
+     * **null 表示「无基准」**：大表（见 {@link LARGE_TABLE_UNDO_CELLS}）不做整表
+     * 撤销记账，此时既不为基准做深拷贝、也不入栈。读到 null 的消费点必须
+     * 「重建基准但不入栈」，否则会把空基准当真基准而错误地吞掉一次撤销。
      */
-    private _lastValuesSnapshot: Cell[] = [];
+    private _lastValuesSnapshot: Cell[] | null = null;
     /** 是否正在回写撤销/重做快照（期间禁止再次记录，避免递归入栈） */
     private _isApplyingUndo: boolean = false;
     /** 是否禁止记录撤销（初始从数据库装载时为 true，避免把首次装载误记为一次变更） */
@@ -85,10 +258,58 @@ export class DataCollection extends EventEmitter {
      * 落库时读的是**当下完整快照**，因此本标记只决定「要不要写」，不决定「写什么」。
      */
     private _valuesDirty: boolean = false;
+    /**
+     * 图片是否有未落库改动
+     *
+     * 与 {@link _valuesDirty} 分开记：图片是二进制大块，落库要整块写一遍，
+     * 不能因为「改了某个单元格」就顺手把几十 MB 图片重写一次。
+     * 只有图片集合真正变化（导入文件 / 切换文件 / 显式清空）时才置位。
+     */
+    private _imagesDirty: boolean = false;
+    /**
+     * 当前工作表内嵌图片（`ExtractedImage`，含二进制与锚点）
+     *
+     * 图片与单元格值分库存储（`images` 对象存储，键同为工作表名）：
+     * 值走 JSON 字符串、图走结构化克隆，两者互不拖累。
+     */
+    private _images: ExtractedImage[] = [];
     /** 自动保存防抖定时器（非 null 表示已排期一次落库） */
     private _saveTimer: ReturnType<typeof setTimeout> | null = null;
+    /** 空闲落库句柄（requestIdleCallback 的返回值，非 null 表示已排期下一次空闲执行） */
+    private _idleHandle: number | null = null;
     /** 自动保存防抖窗口（毫秒）：连续输入/拖拽期间合并为一次落库 */
     private static readonly AUTO_SAVE_DEBOUNCE_MS = 500;
+    /** 空闲落库的最迟等待（毫秒）：页面一直不空闲也必须在这个上限内把数据落库 */
+    private static readonly AUTO_SAVE_IDLE_TIMEOUT_MS = 1000;
+    /**
+     * 「大表」阈值（单元格数）
+     *
+     * 超过它就不再为撤销/自动记录做**整表深拷贝**（见 {@link _undoTrackingEnabled}）。
+     * 依据：一次 `cloneValues` 的成本与单元格数成正比，实测约 0.55 ms/千格
+     * （40 万格 ≈ 220 ms、内存上还要多留一整份），而撤销栈每次操作要拷 2~3 份。
+     * 在十万格量级上还感觉不到，到了几十万格，每一次结构操作都会变成肉眼可见的停顿。
+     */
+    private static readonly LARGE_TABLE_UNDO_CELLS = 100000;
+    /**
+     * 合并区域进「列倒排索引」的最大跨列数
+     *
+     * 倒排索引按「合并块覆盖的每一列」各存一份引用，跨列数极大的合并（如整行 A1:XFD1）
+     * 会让索引条目数按列数膨胀。超过本阈值的合并块单独放进
+     * {@link _wideMergeRects} 线性兜底 —— 这类区块在实践中只有个位数，
+     * 线性扫描的代价远低于让索引膨胀上万条。
+     *
+     * 索引总条目数有硬上界：合并块两两不重叠，故
+     * `Σ colspan ≤ Σ (colspan × rowspan) ≤ 单元格总数`，
+     * 即倒排索引最多 N 条引用（40 万格量级约 3MB），不会随合并块数二次膨胀。
+     */
+    private static readonly MERGE_COL_INDEX_SPAN_LIMIT = 64;
+    /**
+     * 快照序列化 / 解码的片段粒度（单元格数）
+     *
+     * 4000 格在 40 万格的实测口径下约合 5 ms，既能让分片版及时让出主线程，
+     * 又不至于把快照切成过多片段而拖慢拼接（`join`/`+=` 的次数）。
+     */
+    private static readonly SNAPSHOT_VALUE_CHUNK = 4000;
     /**
      * 全局筛选条件注册表：列号(1-based) → { anchorRow: 筛选按钮所在行(1-based), keep: 保留内容 }。
      * 注册表随全量状态快照捕获/回写，使筛选操作可整体撤销/重做；
@@ -236,6 +457,9 @@ export class DataCollection extends EventEmitter {
     
     /**
      * 从数据库获取当前选中工作表的所有有内容的单元格数据
+     *
+     * 解码走 {@link DataCollection.fromJSONChunked}（分片让出）：40 万格快照的
+     * 解码实测约 1.4 秒整段同步，而这里正是**刷新页面**时的装载入口。
      */
     public async syncValuesFromDB(): Promise<void> {
         await this.db.getValue(this._activedSheetName).then(async (valueRes) => {
@@ -243,11 +467,14 @@ export class DataCollection extends EventEmitter {
             this._suppressValuesUndo = true;
             try {
                 if(valueRes) {
-                    this._applyLoadedState(DataCollection.fromJSON(valueRes));
+                    this._applyLoadedState(await DataCollection.fromSnapshotChunked(valueRes));
                 }
+                // 图片与值分库：装载顺序无关，但必须在 `_applyLoadedState` 之后
+                // （值装载可能会清空图片集合，见 _clearSheetContent）
+                await this._loadImages(this._activedSheetName);
             } finally {
                 // 同步最新快照基准，解除抑制
-                this._lastValuesSnapshot = this.cloneValues(this._values);
+                this._refreshBaseline();
                 this._suppressValuesUndo = false;
                 this._dataLoadedResolve();
             }
@@ -292,7 +519,7 @@ export class DataCollection extends EventEmitter {
      * 先刷新 `_lastValuesSnapshot` 基准（使后续自动保存与撤销基准对齐），再广播。
      */
     public notifyValuesChanged(): void {
-        this._lastValuesSnapshot = this.cloneValues(this._values);
+        this._refreshBaseline();
         this.emit(DataEvents.VALUES_CHANGED, this._values);
     }
 
@@ -313,7 +540,7 @@ export class DataCollection extends EventEmitter {
         try {
             this._clearSheetContent();
         } finally {
-            this._lastValuesSnapshot = this.cloneValues(this._values);
+            this._refreshBaseline();
             this._suppressValuesUndo = false;
         }
         // 装载期间广播被抑制，此处显式补发一次让主页面重绘为空表
@@ -326,7 +553,7 @@ export class DataCollection extends EventEmitter {
      *
      * 所有会改变 {@link toJSON} 快照内容的状态变更都应走到这里（见构造函数中订阅的事件
      * 与 {@link printSetting} 的 setter）。仅置脏 + 排期，不做任何序列化 ——
-     * 真正的整表 `toJSON()` 只发生在防抖窗口结束时的 {@link syncValuesToDB}。
+     * 真正的整表序列化（{@link toSnapshotChunked}）只发生在防抖窗口结束时的 {@link syncValuesToDB}。
      */
     private _markDirty(): void {
         this._valuesDirty = true;
@@ -341,9 +568,24 @@ export class DataCollection extends EventEmitter {
      */
     private _scheduleAutoSave(): void {
         if (!this._activedSheetName) return;
-        if (this._saveTimer !== null) return;
+        if (this._saveTimer !== null || this._idleHandle !== null) return;
         this._saveTimer = setTimeout(() => {
             this._saveTimer = null;
+            this._runIdleSave();
+        }, DataCollection.AUTO_SAVE_DEBOUNCE_MS);
+    }
+
+    /**
+     * 在浏览器空闲时段执行一次落库
+     *
+     * 整表序列化是**同步**的：大表上一次可能上百毫秒。若让它在防抖窗口
+     * 结束时无条件执行，就可能正好落在「刚打开完文件、用户开始滚动」的当口造成卡顿。
+     * 因此这里用 `requestIdleCallback` 把序列化推到空闲时段，并设 1s 上限保证最终一定执行；
+     * 环境不支持（Node 测试 / 老浏览器）时立即执行，行为与原先一致。
+     * @private
+     */
+    private _runIdleSave(): void {
+        const body = (): void => {
             // 防抖窗口内若已被显式落库（_valuesDirty 被清）则不再重复写
             if (!this._valuesDirty) return;
             // 定时器里失败不应变成未处理的 Promise 拒绝；_writeSnapshot 已交还脏标记，
@@ -351,14 +593,35 @@ export class DataCollection extends EventEmitter {
             void this._writeSnapshot().catch((error) => {
                 console.error('自动保存失败，将在下次变更或页面卸载时重试：', error);
             });
-        }, DataCollection.AUTO_SAVE_DEBOUNCE_MS);
+        };
+        const ric = (globalThis as unknown as {
+            requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+        }).requestIdleCallback;
+        if (typeof ric !== 'function') {
+            body();
+            return;
+        }
+        const handle = ric(() => {
+            // 期间若已被 syncValuesToDB/_cancelPendingSave 取消，本次排期作废
+            if (this._idleHandle !== handle) return;
+            this._idleHandle = null;
+            body();
+        }, { timeout: DataCollection.AUTO_SAVE_IDLE_TIMEOUT_MS });
+        this._idleHandle = handle;
     }
 
-    /** 取消挂起的防抖保存（显式落库 / 强制固化前调用，避免随后又被重复写一遍） */
+    /** 取消挂起的防抖保存 / 空闲落库（显式落库、强制固化前调用，避免随后又被重复写一遍） */
     private _cancelPendingSave(): void {
         if (this._saveTimer !== null) {
             clearTimeout(this._saveTimer);
             this._saveTimer = null;
+        }
+        if (this._idleHandle !== null) {
+            const cic = (globalThis as unknown as {
+                cancelIdleCallback?: (handle: number) => void;
+            }).cancelIdleCallback;
+            if (typeof cic === 'function') cic(this._idleHandle);
+            this._idleHandle = null;
         }
     }
 
@@ -367,17 +630,26 @@ export class DataCollection extends EventEmitter {
      *
      * 先清脏标记再 `await` 写库：写库是异步的，期间若又有新变更会重新置脏并重新排期，
      * 不会因为「这次写库」而丢掉写库期间产生的改动。
+     *
+     * 序列化走 {@link toSnapshotChunked}（分片让出）而非同步 `toSnapshot()`：
+     * 大表快照一次要 500 ms 左右，而它偏偏排在「打开文件」的防抖窗口之后，
+     * 若不切片，用户会在文件已经显示出来之后再卡一下。
      */
     private async _writeSnapshot(): Promise<void> {
         const key = this._activedSheetName;
         if (!key) return;
         this._valuesDirty = false;
+        // 图片只在**自己脏了**才写：它是二进制大块，值的小改动不该顺带重写一遍图片记录
+        const imagesDirty = this._imagesDirty;
+        this._imagesDirty = false;
         try {
-            await this.db.setValue(key, this.toJSON());
+            await this.db.setValue(key, await this.toSnapshotChunked());
+            if (imagesDirty) await this.db.setImages(key, this._images);
         } catch (error) {
             // 写库失败（如配额不足）：交还脏标记，保证后续变更 / 卸载固化 / 下次显式落库还会重试，
             // 不至于把「本次未能持久化的改动」当成已保存而永久丢失
             this._valuesDirty = true;
+            if (imagesDirty) this._imagesDirty = true;
             throw error;
         }
     }
@@ -390,7 +662,7 @@ export class DataCollection extends EventEmitter {
      * - 与自动保存不同，这里**不跳过无改动的写**：它服务于「切换 / 重命名 / 复制 /
      *   打开」等需要「先把内存内容无条件固化再操作」的流程，作为防抖路径之外的安全网
      *   （这些流程本就低频，代价可忽略）；
-     * - 原先 `Sheets.draw()` 每帧调用本方法（每帧整表 `toJSON()` + 写 IndexedDB），
+     * - 原先 `Sheets.draw()` 每帧调用本方法（每帧整表序列化 + 写 IndexedDB），
      *   是打开大文件卡顿/崩溃的成因之一；现已从绘制线程移除，改由防抖自动保存驱动。
      */
     public async syncValuesToDB(): Promise<void> {
@@ -402,14 +674,25 @@ export class DataCollection extends EventEmitter {
     /**
      * 同步（不 await）固化未落库改动，用于页面卸载等无法等待异步完成的场景
      *
-     * 仅在「确有未落库改动」时写：`toJSON()` 是同步的，先把快照取好，
-     * 再把写库请求交给 IndexedDB 异步完成 —— 即便随后页面被销毁，数据也已被捕获。
+     * 仅在「确有未落库改动」时写：快照必须**同步**取到（这里刻意走 {@link toSnapshot}
+     * 而非分片的 {@link toSnapshotChunked} —— 页面即将销毁，没有让出的机会；
+     * 先把字符串拿在手里，再把写库请求交给 IndexedDB 异步完成，
+     * 即便随后页面被销毁，数据也已被捕获）。
      */
     public flushPendingSave(): void {
         this._cancelPendingSave();
-        if (!this._activedSheetName || !this._valuesDirty) return;
-        // 卸载路径无法等待/恢复：失败也无处重试，吞掉拒绝避免控制台报未处理 Promise
-        void this._writeSnapshot().catch(() => {});
+        if (!this._activedSheetName || (!this._valuesDirty && !this._imagesDirty)) return;
+        const key = this._activedSheetName;
+        const imagesDirty = this._imagesDirty;
+        this._valuesDirty = false;
+        this._imagesDirty = false;
+        // 卸载路径无法等待/恢复：失败也只把脏标记交还，不抛出（避免未处理的 Promise 拒绝）
+        void this.db.setValue(key, this.toSnapshot()).catch(() => { this._valuesDirty = true; });
+        if (imagesDirty) {
+            // 图片本身已在内存里是最终对象，IndexedDB 在收到请求瞬间就完成结构化克隆，
+            // 因此调用完即可返回，不依赖后续事件循环
+            void this.db.setImages(key, this._images).catch(() => { this._imagesDirty = true; });
+        }
     }
 
     /**
@@ -439,13 +722,17 @@ export class DataCollection extends EventEmitter {
 
         this._suppressValuesUndo = true;
         try {
-            if (saved && saved !== '{}') {
-                this._applyLoadedState(DataCollection.fromJSON(saved));
+            if (saved) {
+                // 分片解码：双击树节点切换文件时，大表快照不再造成一至两秒的假死
+                // （形态分派见 fromSnapshotChunked：v4 对象 / v3 字符串都能读）
+                this._applyLoadedState(await DataCollection.fromSnapshotChunked(saved));
             } else {
                 this._clearSheetContent();
             }
+            // 图片跟着目标文件走：不清空就会把上一个文件的图片留在新文件上
+            await this._loadImages(target);
         } finally {
-            this._lastValuesSnapshot = this.cloneValues(this._values);
+            this._refreshBaseline();
             this._suppressValuesUndo = false;
         }
 
@@ -465,6 +752,10 @@ export class DataCollection extends EventEmitter {
         this._activedCell = 'A1';
         this._selection = 'A1:A1';
         this._anchorSelection = null;
+        // 图片与单元格内容同属「文件内容」：清空内容必须连图片一起清，
+        // 否则新文件会顶着上一个文件的图片（且下一次落库会把它们写到新键上）
+        this._images = [];
+        this._imagesDirty = false;
         // values setter 会广播 VALUES_CHANGED → 主页面重绘为空表
         this.values = [];
     }
@@ -636,6 +927,89 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 获取当前工作表的内嵌图片（活引用，调用方只读）
+     * @returns {ExtractedImage[]} 图片数组
+     */
+    get images(): ExtractedImage[] {
+        return this._images;
+    }
+
+    /**
+     * 设置当前工作表的内嵌图片
+     *
+     * 图片与单元格值共用「工作表名」作为存档键，但落在**独立的对象存储**里
+     * （见 {@link IndexDB.setImages}）：值走 JSON 字符串、图走结构化克隆。
+     *
+     * 广播 `VALUES_CHANGED` 而非新增事件：图片是工作表内容的一部分，
+     * 画布必须重绘才能显示它们，而该事件正是「重绘」的既有触发点；
+     * 新增一个事件则要求所有订阅方（画布、筛选、文件树…）逐个适配，
+     * 收益为零而漏改风险不为零。
+     * @param {ExtractedImage[]} value - 新的图片数组
+     */
+    set images(value: ExtractedImage[]) {
+        this._images = Array.isArray(value) ? value : [];
+        this._imagesDirty = true;
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
+    }
+
+    /**
+     * 从数据库装载当前工作表的图片（无记录时按「没有图片」处理）
+     *
+     * 读回的是外部数据，必须先做形状校验（见 {@link sanitizeImages}）：
+     * 损坏的图片记录不允许把装载流程带崩。
+     * @param {string} sheetName - 工作表名（存档键）
+     * @returns {Promise<void>} 装载完成的 Promise
+     * @private
+     */
+    private async _loadImages(sheetName: string): Promise<void> {
+        let raw: unknown[] = [];
+        try {
+            raw = await this.db.getImages(sheetName);
+        } catch {
+            // 图片库不可用（老库未升级 / 配额问题）不应影响工作表装载：按无图片处理
+            raw = [];
+        }
+        this._images = DataCollection.sanitizeImages(raw);
+        this._imagesDirty = false;
+    }
+
+    /**
+     * 校验并规范化从数据库读回的图片记录
+     *
+     * 只做「形状」校验（丢弃不合法项），不做任何解码：
+     * - 二进制必须是 `Uint8Array`（结构化克隆保留类型）；
+     * - 锚点必须存在且四个字段都是有限数。
+     * 其余可选字段（`to`/`ext`/`name`）缺失时按缺省处理 —— 渲染侧本就有回落路径。
+     * @param raw - 数据库读回的原始值
+     * @returns {ExtractedImage[]} 可安全送入渲染层的图片数组
+     */
+    private static sanitizeImages(raw: unknown[]): ExtractedImage[] {
+        if (!Array.isArray(raw)) return [];
+        const result: ExtractedImage[] = [];
+        for (const item of raw) {
+            if (!item || typeof item !== 'object') continue;
+            const candidate = item as Partial<ExtractedImage>;
+            if (!(candidate.data instanceof Uint8Array) || candidate.data.length === 0) continue;
+            if (typeof candidate.mimeType !== 'string') continue;
+            const anchor = candidate.anchor;
+            if (!anchor || !Number.isFinite(anchor.col) || !Number.isFinite(anchor.row)
+                || !Number.isFinite(anchor.colOffset) || !Number.isFinite(anchor.rowOffset)) continue;
+            result.push({
+                data: candidate.data,
+                mimeType: candidate.mimeType,
+                anchor: {
+                    col: anchor.col, row: anchor.row,
+                    colOffset: anchor.colOffset, rowOffset: anchor.rowOffset,
+                },
+                to: candidate.to,
+                ext: candidate.ext,
+                name: candidate.name,
+            });
+        }
+        return result;
+    }
+
+    /**
      * 使「名 → 单元格」索引失效（下次查找时按需重建）
      *
      * 任何会改变单元格名集合或名→对象映射的操作都必须调用：整体替换 values、
@@ -650,12 +1024,18 @@ export class DataCollection extends EventEmitter {
     /**
      * 重建稀疏单元格索引与合并单元格缓存
      * 仅在索引失效后的首次查找时触发，稳态下为 O(1)。
+     *
+     * 同时重建合并区域的**数值矩形**与**列倒排索引**（见 {@link _mergeRects}、
+     * {@link _mergeByCol}）：渲染热路径上对合并块的每次查找都靠它们降到近似 O(1)。
      * @private
      */
     private _rebuildCellIndex(): void {
         const index = new Map<string, Cell>();
         const merged: string[] = [];
         const filterCells: Cell[] = [];
+        const mergeRects: MergeRect[] = [];
+        const mergeByCol = new Map<number, MergeRect[]>();
+        const wideMergeRects: MergeRect[] = [];
         const values = this._values;
         for (let i = 0; i < values.length; i++) {
             const cell = values[i];
@@ -665,11 +1045,28 @@ export class DataCollection extends EventEmitter {
             const rowspan = cell.rowspan || 1;
             if (colspan === 1 && rowspan === 1) continue;
             const { col, row } = this.getCellColAndRow(cell.cell);
-            merged.push(`${cell.cell}:${this.getColName(col + colspan - 1)}${row + rowspan - 1}`);
+            const endCol = col + colspan - 1;
+            const endRow = row + rowspan - 1;
+            merged.push(`${cell.cell}:${this.getColName(endCol)}${endRow}`);
+            const rect: MergeRect = { anchor: cell.cell, startCol: col, startRow: row, endCol, endRow };
+            mergeRects.push(rect);
+            if (colspan <= DataCollection.MERGE_COL_INDEX_SPAN_LIMIT) {
+                for (let c = col; c <= endCol; c++) {
+                    const list = mergeByCol.get(c);
+                    if (list === undefined) mergeByCol.set(c, [rect]);
+                    else list.push(rect);
+                }
+            } else {
+                wideMergeRects.push(rect);
+            }
         }
         this._cellIndex = index;
         this._mergedCells = merged;
+        this._mergeRects = mergeRects;
+        this._mergeByCol = mergeByCol;
+        this._wideMergeRects = wideMergeRects;
         this._filterCells = filterCells;
+        this._filterCellsEpoch = this._valuesEpoch;
         this._indexedLength = values.length;
         this._indexEpoch = this._valuesEpoch;
     }
@@ -691,6 +1088,218 @@ export class DataCollection extends EventEmitter {
     public getFilterCells(): Cell[] {
         this._ensureCellIndex();
         return this._filterCells;
+    }
+
+    /**
+     * 「本世代是否存在筛选按钮」的廉价判定 —— 供每帧热路径提前退出（O(1)）
+     *
+     * `SheetCanvas.setFilters()` 每帧都要知道「这帧要不要处理筛选按钮」。
+     * 历史实现先调 {@link getFilterCells}，而它会 `_ensureCellIndex()`：
+     * 一旦世代失效（删除行/列、排序、改名、装载…）就**先重建整份单元格索引**
+     * （遍历全部单元格 + 建 Map + 建合并倒排）才回答「其实一个筛选按钮都没有」。
+     *
+     * 这里用 {@link _filterCellsEpoch} 记录「上次数出 0 个按钮」的世代：
+     * 同一世代内重复询问直接返回 false，不触发任何索引重建。
+     * 世代失效即返回 true（保守：宁可让调用方去问一次，也不能漏掉新加的按钮）。
+     * @returns {boolean} 本世代是否可能存在筛选按钮（false = 一定没有）
+     */
+    public hasFilterCells(): boolean {
+        return this._filterCellsEpoch !== this._valuesEpoch || this._filterCells.length > 0;
+    }
+
+    /**
+     * 标记「筛选标记集合」已变化，使 {@link hasFilterCells} 与 {@link getFilterCells}
+     * 下次都重新判定
+     *
+     * 增删筛选标记既不改 `values.length`、也不一定改 `_valuesEpoch`
+     * （如给已存在的单元格挂 `filter`），若不显式调用：
+     * - {@link hasFilterCells} 会一直沿用上一次「没有按钮」的结论；
+     * - {@link getFilterCells} 里 `_ensureCellIndex()` 会认为索引仍是最新的，
+     *   直接返回**不含新按钮**的旧缓存数组 —— 按钮就再也建不出来了。
+     *
+     * 因此这里让 {@link _filterCellsEpoch} 与 {@link _ensureCellIndex} 的失效条件
+     * **对齐**（都置为 -1）：一次显式失效同时覆盖「要不要问」与「问出来是什么」两个入口。
+     * 注意**不要**在这里自增 `_valuesEpoch` —— 那会让整个单元格索引（含合并倒排）
+     * 一并失效重建，代价远大于收益。
+     */
+    public invalidateFilterCells(): void {
+        this._filterCellsEpoch = -1;
+        this._indexEpoch = -1;
+    }
+
+    /**
+     * 判定「某列在给定行**以下**是否还有内容」（O(1)）
+     *
+     * 语义与 `Filter.updateFilterVisibility` 原先的整表遍历**完全一致**：
+     * 存在一个「覆盖了该列、且下边缘在 `row` 之下、且文本非空」的单元格。
+     * 合并单元格按其覆盖的全部列计入（跨本列的合并块也算本列有内容），
+     * 文本判定只看是否存在非空字符（不产生中间字符串）。
+     *
+     * 「覆盖本列」用 `colspan`（缺省 1，`0` 视为不覆盖任何列，与历史实现一致）、
+     * 「下边缘」用 `row + rowspan - 1`，都不含筛选行自身——Excel 的筛选行
+     * （表头）不计入「以下的内容」。
+     *
+     * @param {number} col - 列号（1-based）
+     * @param {number} row - 行号（1-based）；筛选按钮所在行，该行及以上不计入
+     * @returns {boolean} 该列在 `row` 之下是否还有内容
+     */
+    public hasContentBelow(col: number, row: number): boolean {
+        this._ensureColContentIndex();
+        const bottom = this._colContentBottom.get(col);
+        return bottom !== undefined && bottom > row;
+    }
+
+    /**
+     * 按需构建 {@link _colContentBottom}（同一世代只构建一次）
+     * @private
+     */
+    private _ensureColContentIndex(): void {
+        if (this._colContentEpoch === this._valuesEpoch
+            && this._colContentLength === this._values.length) {
+            return;
+        }
+        const bottom = new Map<number, number>();
+        const values = this._values;
+        for (let i = 0; i < values.length; i++) {
+            const cell = values[i];
+            // 先做最便宜的非空文本判定（首字符即命中，通常 1 次比较就返回），
+            // 再解析单元格名 —— 大表里这一句就省掉绝大多数格子的名字解析
+            if (!DataCollection.hasAnyText(cell)) continue;
+            const { col, row } = this.getCellColAndRow(cell.cell);
+            const endCol = col + (cell.colspan === undefined ? 1 : cell.colspan) - 1;
+            const lastRow = row + (cell.rowspan === undefined ? 1 : cell.rowspan) - 1;
+            for (let c = col; c <= endCol; c++) {
+                const prev = bottom.get(c);
+                if (prev === undefined || lastRow > prev) bottom.set(c, lastRow);
+            }
+        }
+        this._colContentBottom = bottom;
+        this._colContentEpoch = this._valuesEpoch;
+        this._colContentLength = this._values.length;
+    }
+
+    /**
+     * 单元格是否含非空字符（不拼接字符串、不产生中间数组）
+     * @param {Cell} cell - 单元格
+     * @returns {boolean} 是否存在非空字符
+     * @private
+     */
+    private static hasAnyText(cell: Cell): boolean {
+        const chars = cell.chars;
+        if (!chars) return false;
+        for (let i = 0; i < chars.length; i++) {
+            const ch = chars[i].char;
+            if (ch != null && ch !== '') return true;
+        }
+        return false;
+    }
+
+    /**
+     * 确保「筛选清单索引」处于最新状态（同一世代只构建一次）
+     *
+     * 产出三样东西，供筛选交互共用：
+     * - {@link _contentMaxRow} / {@link _contentMaxCol}：内容范围。筛选下拉原先用
+     *   `matrixValues()` 求「统计到第几行」—— 那会**分配一个 maxRow × maxCol 的稠密二维数组**
+     *   （10 万行 × 50 列 ≈ 500 万个 `undefined` 槽位、几十 MB 临时内存），
+     *   而调用方只需要一个行号上界。改为随本索引一次算出。
+     * - {@link _rowsWithText}：筛选只可能隐藏有内容的行，用它把「逐行扫到总行数」
+     *   收敛成「只扫有内容的行」。
+     * - {@link _colsWithContent}：添加筛选按钮时要逐列判断「该列是否有内容」，
+     *   用它把「每列重建一次稠密矩阵」收敛成 O(1) 查表（见该字段注释）。
+     * @private
+     */
+    private _ensureFilterIndex(): void {
+        if (this._filterIndexEpoch === this._valuesEpoch
+            && this._filterIndexLength === this._values.length) {
+            return;
+        }
+        const values = this._values;
+        const rowsWithText = new Set<number>();
+        const colsWithContent = new Set<number>();
+        let maxRow = 0;
+        let maxCol = 0;
+        for (let i = 0; i < values.length; i++) {
+            const cell = values[i];
+            // 无文本的单元格不计入内容范围（与「筛选只讨论内容」的语义一致），
+            // 也省掉一次名字解析
+            if (!DataCollection.hasAnyText(cell)) continue;
+            const { col, row } = this.getCellColAndRow(cell.cell);
+            const endCol = col + (cell.colspan === undefined ? 1 : cell.colspan) - 1;
+            const endRow = row + (cell.rowspan === undefined ? 1 : cell.rowspan) - 1;
+            if (endRow > maxRow) maxRow = endRow;
+            if (endCol > maxCol) maxCol = endCol;
+            for (let r = row; r <= endRow; r++) rowsWithText.add(r);
+            // 合并块覆盖到的每一列都算「有内容」——与历史 validataColInFilter
+            // 「矩阵里该列任一格非 undefined」的口径一致
+            for (let c = col; c <= endCol; c++) colsWithContent.add(c);
+        }
+        this._contentMaxRow = maxRow;
+        this._contentMaxCol = maxCol;
+        this._rowsWithText = rowsWithText;
+        this._colsWithContent = colsWithContent;
+        this._filterIndexEpoch = this._valuesEpoch;
+        this._filterIndexLength = values.length;
+    }
+
+    /**
+     * 取「有内容的列」集合（只读引用，请勿修改）
+     *
+     * 与 {@link getRowsWithText} 同源同世代，供添加筛选按钮时逐列 O(1) 判定。
+     * @returns {Set<number>} 列号集合（1-based）
+     */
+    public getColsWithContent(): Set<number> {
+        this._ensureFilterIndex();
+        return this._colsWithContent;
+    }
+
+    /**
+     * 取「已用内容范围」：有文本单元格覆盖到的最大行列号（1-based）
+     *
+     * 是 `matrixValues()` 的**零分配**替代品 —— 筛选下拉只需要「统计到第几行」，
+     * 不需要那张稠密矩阵（见 {@link _ensureFilterIndex}）。
+     * 口径差异：只看有文本的单元格，仅有样式的单元格不会扩大范围。
+     * @returns {{maxRow: number, maxCol: number}} 最大行/列号；无内容时为 0
+     */
+    public getContentBounds(): { maxRow: number; maxCol: number } {
+        this._ensureFilterIndex();
+        return { maxRow: this._contentMaxRow, maxCol: this._contentMaxCol };
+    }
+
+    /**
+     * 取「有文本的行」集合（只读引用，请勿修改）
+     * @returns {Set<number>} 行号集合（1-based）
+     */
+    public getRowsWithText(): Set<number> {
+        this._ensureFilterIndex();
+        return this._rowsWithText;
+    }
+
+    /**
+     * 取某位置上「视觉上生效」的单元格 —— 合并区域内返回覆盖该位置的**锚点**单元格（O(1)）
+     *
+     * 是筛选侧 `buildAnchorMap()` 的替代品。历史实现每次打开下拉 / 每次执行筛选都要
+     * 遍历整张表、为**每个被合并覆盖的位置**塞一条 `${row}:${col}` 字符串键
+     * （400 万格量级直接上百毫秒）。这里改为「按需 O(1) 查一次」：
+     * 先走合并倒排索引 {@link findMergeRect}（O(该列合并块数)），未命中则取本格。
+     * @param {number} row - 行号（1-based）
+     * @param {number} col - 列号（1-based）
+     * @returns {Cell | undefined} 覆盖该位置的单元格；该位置为空时为 undefined
+     */
+    public getEffectiveCellAt(row: number, col: number): Cell | undefined {
+        const rect = this.findMergeRect(col, row);
+        if (rect !== null) return this.getCellByName(this.getCellName(rect.startCol, rect.startRow));
+        return this.getCellByName(this.getCellName(col, row));
+    }
+
+    /**
+     * 取某位置上视觉生效的文本（合并区域内为锚点文本）
+     * @param {number} row - 行号（1-based）
+     * @param {number} col - 列号（1-based）
+     * @returns {string} 该位置的文本；为空时返回空字符串
+     */
+    public getEffectiveTextAt(row: number, col: number): string {
+        const cell = this.getEffectiveCellAt(row, col);
+        return cell === undefined ? '' : cell.getText();
     }
 
     /**
@@ -727,6 +1336,31 @@ export class DataCollection extends EventEmitter {
      */
     private cloneValues(cells: Cell[]): Cell[] {
         return cells.map((c: Cell) => c.clone());
+    }
+
+    /**
+     * 当前是否启用「整表撤销记账」
+     *
+     * 超过 {@link LARGE_TABLE_UNDO_CELLS} 的大表**关闭**逐次操作的整表撤销记账：
+     * 撤销栈的每一条记录都要深拷贝整表（一次操作常需 2~3 份），
+     * 几十万格时单次就上百毫秒、并让常驻内存翻倍，代价远大于收益。
+     * 大表下：装载、删除行列、排序、格式刷等操作**不可撤销**（属文档级操作），
+     * 编辑内容仍会正常保存与渲染，只是不进撤销栈。
+     * @returns {boolean} true = 正常记账；false = 大表，跳过记账
+     */
+    private _undoTrackingEnabled(): boolean {
+        return this._values.length < DataCollection.LARGE_TABLE_UNDO_CELLS;
+    }
+
+    /**
+     * 刷新「变化前」基准快照
+     *
+     * 大表下**不做深拷贝**，直接置 null（无基准）：此时撤销记账已整体关闭，
+     * 基准的唯一用途就是撤销记账，拷贝它纯属浪费内存与时间。
+     * @private
+     */
+    private _refreshBaseline(): void {
+        this._lastValuesSnapshot = this._undoTrackingEnabled() ? this.cloneValues(this._values) : null;
     }
 
     /**
@@ -837,11 +1471,25 @@ export class DataCollection extends EventEmitter {
      * 满足条件时推入撤销栈，随后刷新 _lastValuesSnapshot 基准并触发 VALUES_CHANGED。
      * - 装载期间（_suppressValuesUndo）：仅刷新基准、不广播、不入栈。
      * - 撤销/重做回写期间（_isApplyingUndo）：仅刷新基准并广播，不入栈。
-     * @param {Cell[]} before - 变更前的快照基准
+     * - 大表（见 {@link _undoTrackingEnabled}）/ 无基准（before 为 null）：
+     *   仅重建基准并广播，不入栈。
+     *
+     * 注意：**抑制分支不能省掉基准重建**。`_lastValuesSnapshot` 的消费方是
+     * `commitValues()`，它把基准当作「变化前」；若这里只挂引用不拷贝，
+     * 后续任意一次原地修改（`values.push/splice`、就地改 cell 字段）都会把
+     * 基准与实时数据一起改掉，导致 `_valuesSnapshotsEqual` 恒真 → **静默丢撤销**。
+     * 单元格对象在工具栏/编辑画布里被大量就地修改，故深拷贝不可省。
+     * @param {Cell[] | null} before - 变更前的快照基准；null 表示无基准
      */
-    private _recordValuesChange(before: Cell[]): void {
+    private _recordValuesChange(before: Cell[] | null): void {
         if (this._suppressValuesUndo) {
-            this._lastValuesSnapshot = this.cloneValues(this._values);
+            this._refreshBaseline();
+            return;
+        }
+        // 大表或不记账：不做「变化后」深拷贝，也不入栈
+        if (before === null || !this._undoTrackingEnabled()) {
+            this._refreshBaseline();
+            this.emit(DataEvents.VALUES_CHANGED, this._values);
             return;
         }
         const after = this.cloneValues(this._values);
@@ -861,9 +1509,16 @@ export class DataCollection extends EventEmitter {
      * - 非编辑期间：先清扫空单元格（编辑期间不清扫，避免编辑内撤销栈快照
      *   与光标索引所依赖的单元格布局错位），再以 _lastValuesSnapshot 为「变化前」基准、
      *   当前 _values 为「变化后」记录撤销操作，并广播 VALUES_CHANGED。
+     * - 大表：两处都不做深拷贝（编辑内逐字快照会让每次按键都拷贝整表，
+     *   几万格以上直接不可交互），只清扫 + 广播。
      */
     public commitValues(): void {
         if (this.isEditting) {
+            if (!this._undoTrackingEnabled()) {
+                // 大表：不记编辑内快照，仅广播（撤销记账整体关闭）
+                this.emit(DataEvents.VALUES_CHANGED, this._values);
+                return;
+            }
             const current = this.cloneValues(this._values);
             const last = this._editUndoStack[this._editUndoStack.length - 1];
             // 仅在内容确实变化时入栈，跳过无变化的提交，避免撤销栈产生空操作
@@ -883,9 +1538,13 @@ export class DataCollection extends EventEmitter {
      * 进入编辑会话
      * 捕获编辑前的 values 快照与光标位置作为编辑内撤销栈的基准（栈底 index 0），
      * 并清空编辑内重做栈。应在 isEditting 置为 true 时调用。
+     * 大表下不建立基准（栈为空）：编辑内逐字撤销对几十万格的表代价过高，
+     * 且 `_undoEditStep` 会因栈深不足直接返回 false，行为一致。
      */
     public beginEditSession(): void {
-        this._editUndoStack = [{ values: this.cloneValues(this._values), cursor: this.cursorAbsolutePosition }];
+        this._editUndoStack = this._undoTrackingEnabled()
+            ? [{ values: this.cloneValues(this._values), cursor: this.cursorAbsolutePosition }]
+            : [];
         this._editRedoStack = [];
     }
 
@@ -896,17 +1555,18 @@ export class DataCollection extends EventEmitter {
      * 应在 isEditting 置为 false 时调用。
      */
     public endEditSession(): void {
+        // 编辑过程中不做清扫（保护编辑内撤销栈快照与光标索引的布局一致性），
+        // 结束时统一清扫，使折叠入撤销栈的「最终值」与快照基准均不含空单元格。
+        // 大表（栈为空）同样要清扫，否则空壳 Cell 会随编辑不断累积。
+        this._pruneEmptyCells();
         if (this._editUndoStack.length > 0) {
-            // 编辑过程中不做清扫（保护编辑内撤销栈快照与光标索引的布局一致性），
-            // 结束时统一清扫，使折叠入撤销栈的「最终值」与快照基准均不含空单元格
-            this._pruneEmptyCells();
             const preEdit = this._editUndoStack[0].values;
             const final = this.cloneValues(this._values);
             if (!this._valuesSnapshotsEqual(preEdit, final)) {
                 this.undoManager.pushValuesSnapshot(this.cloneValues(preEdit), final);
             }
-            this._lastValuesSnapshot = this.cloneValues(this._values);
         }
+        this._refreshBaseline();
         this._editUndoStack = [];
         this._editRedoStack = [];
     }
@@ -1001,6 +1661,8 @@ export class DataCollection extends EventEmitter {
     private _captureFullState(): FullStateSnapshot {
         return {
             values: this.cloneValues(this._values),
+            // 图片只做浅拷贝：对象本身是只读替换语义，深拷一份几十 MB 不值得
+            images: this._images.slice(),
             rowHeaders: this.rowHeaders.rowHeaders.map(rh => ({ ...rh })),
             colHeaders: this.colHeaders.colHeaders.map(ch => ({ ...ch })),
             showGridLines: this._showGridLines,
@@ -1008,6 +1670,27 @@ export class DataCollection extends EventEmitter {
             selection: this._selection,
             filters: this._serializeFilterConditions(),
         };
+    }
+
+    /**
+     * 比较两份快照的图片集合
+     *
+     * 只比「长度 + 逐项引用」：图片对象在项目内是只读替换语义，
+     * 引用相同即内容相同；引用不同即换过图（如打开文件）—— 这正是需要记入撤销的变更。
+     * @param a - 快照 A 的图片数组（旧快照可能没有该字段）
+     * @param b - 快照 B 的图片数组
+     * @returns {boolean} 是否相同
+     * @private
+     */
+    private static _imagesEqual(a: unknown[] | undefined, b: unknown[] | undefined): boolean {
+        if (a === b) return true;
+        const left = a ?? [];
+        const right = b ?? [];
+        if (left.length !== right.length) return false;
+        for (let i = 0; i < left.length; i++) {
+            if (left[i] !== right[i]) return false;
+        }
+        return true;
     }
 
     /**
@@ -1052,6 +1735,7 @@ export class DataCollection extends EventEmitter {
     private _fullStateSnapshotsEqual(a: FullStateSnapshot, b: FullStateSnapshot): boolean {
         if (a === b) return true;
         if (!this._valuesSnapshotsEqual(a.values as Cell[], b.values as Cell[])) return false;
+        if (!DataCollection._imagesEqual(a.images, b.images)) return false;
         if (a.showGridLines !== b.showGridLines) return false;
         if (a.activedCell !== b.activedCell) return false;
         if (a.selection !== b.selection) return false;
@@ -1074,6 +1758,11 @@ export class DataCollection extends EventEmitter {
      * 嵌套语义：action 内部再次调用本方法（如取消隐藏行触发筛选条件自动清除）
      * 时，**嵌套层不捕获任何快照**（其变更已包含在最外层快照的 after 中），
      * 整个复合操作折叠为一步撤销——同时也避免了对同一份数据重复深拷贝。
+     *
+     * 大表语义（见 {@link LARGE_TABLE_UNDO_CELLS}）：操作前**或**操作后的表格超过阈值时
+     * 完全不捕获快照，该操作不入撤销栈（视为文档级操作）。
+     * 前后都要判断：装载第二个大文件时「操作前」就已经是大表，
+     * 只判「操作后」仍会在捕获 before 时白拷一份整表。
      * @param {string} label - 操作标签（用于调试与撤销展示）
      * @param {() => void} action - 实际的变更操作
      * @example
@@ -1082,7 +1771,7 @@ export class DataCollection extends EventEmitter {
     public runWithFullStateUndo(label: string, action: () => void): void {
         const isOutermost = this._fullStateUndoDepth === 0;
         // 仅最外层需要「变化前」快照；嵌套层复用外层的捕获结果
-        const before = isOutermost ? this._captureFullState() : null;
+        const before = (isOutermost && this._undoTrackingEnabled()) ? this._captureFullState() : null;
         const prevSuppress = this._suppressValuesUndo;
         this._suppressValuesUndo = true;
         this._fullStateUndoDepth++;
@@ -1096,10 +1785,11 @@ export class DataCollection extends EventEmitter {
             this._suppressValuesUndo = prevSuppress;
             // 结构操作可能重命名/增删单元格 → 索引与合并缓存失效
             this.invalidateCellIndex();
-            // 仅最外层推入撤销记录；撤销/重做回写期间（_isApplyingUndo）不得入栈
-            if (isOutermost && !this._isApplyingUndo) {
+            // 仅最外层推入撤销记录；撤销/重做回写期间（_isApplyingUndo）不得入栈；
+            // 「变化后」超过阈值时同样跳过（如把空表装载成几十万格）
+            if (before !== null && this._undoTrackingEnabled() && !this._isApplyingUndo) {
                 const after = this._captureFullState();
-                if (!this._fullStateSnapshotsEqual(before as FullStateSnapshot, after)) {
+                if (!this._fullStateSnapshotsEqual(before, after)) {
                     this.undoManager.push({ type: 'fullState', data: { before, after }, timestamp: Date.now(), label });
                 }
             }
@@ -1110,23 +1800,29 @@ export class DataCollection extends EventEmitter {
      * 开始一次跨事件的连续操作撤销捕获（如拖拽调整行高/列宽）
      * 立即捕获全量状态快照作为「变化前」基准，并抑制 values setter 的自动快照记录，
      * 直到调用 {@link endContinuousUndo} 提交。两次调用必须成对出现。
-     * @returns {FullStateSnapshot} 操作前全量状态快照
+     * 大表下返回 null（不捕获基准、不入栈），但仍保持抑制标记，
+     * 由 {@link endContinuousUndo} 在 finally 中恢复。
+     * @returns {FullStateSnapshot | null} 操作前全量状态快照；大表时为 null
      */
-    public beginContinuousUndo(): FullStateSnapshot {
+    public beginContinuousUndo(): FullStateSnapshot | null {
         this._suppressValuesUndo = true;
-        return this._captureFullState();
+        return this._undoTrackingEnabled() ? this._captureFullState() : null;
     }
 
     /**
      * 结束连续操作并提交撤销记录
      * 捕获当前全量状态为「变化后」快照，与 before 不同时推入 undoManager（type: 'fullState'），
      * 并恢复 values setter 的自动记录。整个拖拽手势折叠为一条撤销记录。
-     * @param {FullStateSnapshot | null} before - {@link beginContinuousUndo} 返回的快照；为 null 时忽略
+     *
+     * `before` 为 null（大表 / 调用方未持有基准）时也必须走完 finally 恢复抑制标记：
+     * 早期实现在 try 之外提前 return，会让 `_suppressValuesUndo` 永久停在 true，
+     * 此后所有变更都不再记账 —— 故此处刻意把早退放进 try 内。
+     * @param {FullStateSnapshot | null} before - {@link beginContinuousUndo} 返回的快照；为 null 时仅恢复抑制标记
      * @param {string} label - 操作标签
      */
     public endContinuousUndo(before: FullStateSnapshot | null, label: string): void {
-        if (!before) return;
         try {
+            if (!before || !this._undoTrackingEnabled()) return;
             const after = this._captureFullState();
             if (!this._fullStateSnapshotsEqual(before, after)) {
                 this.undoManager.push({ type: 'fullState', data: { before, after }, timestamp: Date.now(), label });
@@ -1139,7 +1835,7 @@ export class DataCollection extends EventEmitter {
     /**
      * 回写全量状态快照（撤销/重做恢复）
      * 依次恢复筛选条件注册表、values（走 values setter，回写期间抑制自动记录并广播
-     * VALUES_CHANGED）、行/列表头（重算行列总尺寸）、网格线开关、活动单元格与选区；
+     * VALUES_CHANGED）、图片、行/列表头（重算行列总尺寸）、网格线开关、活动单元格与选区；
      * 最后再次广播 VALUES_CHANGED，驱动筛选按钮外观等派生 UI 与恢复后的完整状态同步。
      * @param {FullStateSnapshot} snapshot - 待恢复的快照
      */
@@ -1156,6 +1852,13 @@ export class DataCollection extends EventEmitter {
             this.showGridLines = snapshot.showGridLines;
             this.activedCell = snapshot.activedCell;
             this.selection = snapshot.selection;
+            // 图片随快照一起回写（「打开文件」是可撤销的全量操作，
+            // 只回写单元格会让撤销后的文件顶着另一个文件的图）。
+            // 旧快照没有 images 字段时保持现状，不做「清空」这种破坏性推断。
+            if (Array.isArray(snapshot.images)) {
+                this._images = snapshot.images.slice();
+                this._imagesDirty = true;
+            }
             // 全部字段恢复完毕后广播一次，确保派生 UI（如筛选按钮激活色）与最终状态一致
             this.emit(DataEvents.VALUES_CHANGED, this._values);
         } finally {
@@ -1354,13 +2057,30 @@ export class DataCollection extends EventEmitter {
 
     /**
      * 获取单元格对应的列号和行号
+     *
+     * 单趟扫描实现（性能约定）：旧写法是两次正则 `replace` + `split('')` + `reduce`，
+     * 每次调用都要新建两个字符串、一个字符数组，并按幂次逐个累加。本函数处在
+     * 渲染、筛选、命中测试等**按单元格调用**的热路径上，几十万格时这些临时分配
+     * 本身就是可观的开销，故改为一次遍历直接累加。
+     * 语义与旧实现保持一致：只认大写字母作列（`/[^A-Z]/`）、只认 ASCII 数字作行
+     * （`/[^\d]/`）；没有任何数字时行号为 `NaN`（对齐 `parseInt('')`）。
      * @param {string} cell - 单元格名称
      * @returns {{ col: number, row: number }} 包含列号和行号的对象
      */
     public getCellColAndRow(cell: string): { col: number, row: number } {
-        const col = this.getColNumber(cell.replace(/[^A-Z]/g, ''));
-        const row = parseInt(cell.replace(/[^\d]/g, ''));
-        return { col, row };
+        let col = 0;
+        let row = 0;
+        let hasRowDigit = false;
+        for (let i = 0; i < cell.length; i++) {
+            const code = cell.charCodeAt(i);
+            if (code >= 65 && code <= 90) {
+                col = col * 26 + (code - 64);
+            } else if (code >= 48 && code <= 57) {
+                row = row * 10 + (code - 48);
+                hasRowDigit = true;
+            }
+        }
+        return { col, row: hasRowDigit ? row : NaN };
     }
 
     /**
@@ -1526,18 +2246,11 @@ export class DataCollection extends EventEmitter {
         const maxRow = Math.max(1, this.rowHeaders.length);
         let realCol = Math.min(col, maxCol);
         let realRow = Math.min(row, maxRow);
-        const mergedCells = this.getMergedCells();
-        for (let i = 0; i < mergedCells.length; i++) {
-            const startCell = mergedCells[i].split(':')[0];
-            const endCell = mergedCells[i].split(':')[1];
-            const { col: startCol, row: startRow } = this.getCellColAndRow(startCell);
-            const { col: endCol, row: endRow } = this.getCellColAndRow(endCell);
-
-            if (col >= startCol && col <= endCol && row >= startRow && row <= endRow) {
-                realCol = startCol;
-                realRow = startRow;
-                break;
-            }
+        // 合并展开：命中合并区域则取左上角（O(1) 索引查找，见 findMergeRect）
+        const mergeRect = this.findMergeRect(col, row);
+        if (mergeRect !== null) {
+            realCol = mergeRect.startCol;
+            realRow = mergeRect.startRow;
         }
         
         const left = this.colHeaders.getAt(realCol - 1).left - this.colHeaders.offsetWidth;
@@ -1578,20 +2291,29 @@ export class DataCollection extends EventEmitter {
      *
      * 与旧实现（从最后一列向前回扫）结果等价，但改为**从可见起点向后推进**，
      * 复杂度 O(可见列数) 而非 O(总列数) —— 宽表上后者每帧都要空转上万次。
-     * @returns {{startCol: number, endCol: number}} 可见列的起始索引和结束索引
+     *
+     * 【约定，勿改回「下标」语义】`startCol` / `endCol` 都是 **1-based 列号**，
+     * 且 `endCol` **包含「右边缘只露出一部分」的那一列**：视口右边界通常落在某列中间，
+     * 该列必须参与绘制（内容会被画布边缘自然裁掉），否则右侧会缺一整列的文本/背景/边框。
+     *
+     * 历史实现把循环下标 `i`（0-based）直接写进了 `endCol`，而调用方全部按
+     * 1-based 列号消费（`getCellName(c, r)` / `getVisibleMergeRects`），
+     * 于是**视口最右一列永远不被返回**：它的内容、背景、边框都不绘制，
+     * 只剩网格线 —— 表现为「右侧被裁一半的列没有内容」。
+     * @returns {{startCol: number, endCol: number}} 可见列的起止列号（1-based，含端点）
      */
     public getVisibleCols(): {startCol: number, endCol: number} {
         const { startCol } = this.colHeaders.getVisibleStartCol();
         const len = this.colHeaders.length;
         const viewportRight = this.colHeaders.offsetWidth + this.visibleView.sheetWidth / this.zoom;
-        // 内容窄于视口时，旧实现返回最后一列
-        let endCol = len - 1;
+        // 内容窄于视口时（循环不中断）视口覆盖整张表 → 结束列就是最后一列的列号
+        let endCol = len;
         for (let i = startCol - 1; i < len - 1; i++) {
             const col = this.colHeaders.getAt(i);
             if (!col) break;
             if (col.isHidden) continue;  // 跳过隐藏列
-            if (col.left + col.width >= viewportRight) {  // 列右边缘进入视口
-                endCol = i;
+            if (col.left + col.width >= viewportRight) {  // 列右边缘到达视口右边（含只露出一部分的列）
+                endCol = i + 1;   // 下标 → 1-based 列号
                 break;
             }
         }
@@ -1603,19 +2325,23 @@ export class DataCollection extends EventEmitter {
      *
      * 与旧实现（从最后一行向前回扫）结果等价，但改为**从可见起点向后推进**，
      * 复杂度 O(可见行数) 而非 O(总行数) —— 高表上后者每帧都要空转上万次。
-     * @returns {{startRow: number, endRow: number}} 可见行的起始索引和结束索引
+     *
+     * 语义与 {@link getVisibleCols} 完全对称：`startRow` / `endRow` 都是
+     * **1-based 行号**，`endRow` **包含「下边缘只露出一部分」的那一行**。
+     * @returns {{startRow: number, endRow: number}} 可见行的起止行号（1-based，含端点）
      */
     public getVisibleRows(): {startRow: number, endRow: number} {
         const { startRow } = this.rowHeaders.getVisibleStartRow();
         const len = this.rowHeaders.length;
         const viewportBottom = this.rowHeaders.offsetHeight + this.visibleView.sheetHeight / this.zoom;
-        let endRow = len - 1;
+        // 内容矮于视口时（循环不中断）视口覆盖整张表 → 结束行就是最后一行的行号
+        let endRow = len;
         for (let i = startRow - 1; i < len - 1; i++) {
             const row = this.rowHeaders.getAt(i);
             if (!row) break;
             if (row.isHidden) continue;  // 跳过隐藏行
-            if (row.top + row.height >= viewportBottom) {  // 行底边缘进入视口
-                endRow = i;
+            if (row.top + row.height >= viewportBottom) {  // 行底边缘到达视口下边（含只露出一部分的行）
+                endRow = i + 1;   // 下标 → 1-based 行号
                 break;
             }
         }
@@ -1649,17 +2375,11 @@ export class DataCollection extends EventEmitter {
             }
         }
         // 合并区域：锚点可能位于视口左上方（如 A1:C3 而视口从 B2 开始）
-        const mergedCells = this.getMergedCells();
-        for (let i = 0; i < mergedCells.length; i++) {
-            const group = mergedCells[i];
-            const sep = group.indexOf(':');
-            const anchorName = group.slice(0, sep);
+        // 走列倒排索引 + 数值裁剪（不再对每个合并块做字符串 split/解析）
+        const mergeRects = this.getVisibleMergeRects(startCol, endCol, startRow, endRow);
+        for (let i = 0; i < mergeRects.length; i++) {
+            const anchorName = mergeRects[i].anchor;
             if (seen.has(anchorName)) continue;
-            const endName = group.slice(sep + 1);
-            const startPos = this.getCellColAndRow(anchorName);
-            const endPos = this.getCellColAndRow(endName);
-            if (startPos.row > endRow || endPos.row < startRow) continue;
-            if (startPos.col > endCol || endPos.col < startCol) continue;
             const anchor = this.getCellByName(anchorName);
             if (anchor !== undefined) {
                 result.push(anchor);
@@ -2128,6 +2848,84 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 获取全部合并区域的数值矩形（只读引用，请勿修改）
+     *
+     * 与 {@link getMergedCells} 同源（同一次索引重建产出），但已是行列号，
+     * 供需要「遍历所有合并块并做数值裁剪」的调用方使用（如合并背景按视口绘制）。
+     * @returns {MergeRect[]} 合并区域矩形数组
+     */
+    public getMergeRects(): MergeRect[] {
+        this._ensureCellIndex();
+        return this._mergeRects;
+    }
+
+    /**
+     * 查找覆盖指定位置的合并区域
+     *
+     * 复杂度 O(该列上的合并块数)（跨列极大的整行合并另走 {@link _wideMergeRects} 线性兜底），
+     * 与合并总数基本无关；相比「遍历全部合并块 + 字符串 split + 逐字符解析」的旧写法，
+     * 这是 8000 处合并时主画布卡死的直接解药。
+     * @param {number} col - 列号（1-based）
+     * @param {number} row - 行号（1-based）
+     * @returns {MergeRect | null} 覆盖该位置的合并区域；不在任何合并区域内时 null
+     */
+    public findMergeRect(col: number, row: number): MergeRect | null {
+        this._ensureCellIndex();
+        const list = this._mergeByCol.get(col);
+        if (list !== undefined) {
+            for (let i = 0; i < list.length; i++) {
+                const rect = list[i];
+                if (row >= rect.startRow && row <= rect.endRow) return rect;
+            }
+        }
+        const wide = this._wideMergeRects;
+        for (let i = 0; i < wide.length; i++) {
+            const rect = wide[i];
+            if (col >= rect.startCol && col <= rect.endCol
+                && row >= rect.startRow && row <= rect.endRow) return rect;
+        }
+        return null;
+    }
+
+    /**
+     * 取出与给定视口矩形相交的合并区域（供按视口绘制合并背景使用）
+     *
+     * 走列倒排索引：只遍历**可见列**上挂着的合并块，复杂度
+     * O(可见列数 × 每列合并块数) —— 与「全表合并块数」无关。
+     * 历史实现在这里对每个合并块调用一次含全量合并扫描的矩形计算，
+     * 构成 O(合并数²)：8000 处合并时单帧 3.8 秒。
+     * @param {number} startCol - 视口起始列号（1-based，含）
+     * @param {number} endCol - 视口结束列号（1-based，含）
+     * @param {number} startRow - 视口起始行号（1-based，含）
+     * @param {number} endRow - 视口结束行号（1-based，含）
+     * @returns {MergeRect[]} 与视口相交的合并区域（按锚点去重）
+     */
+    public getVisibleMergeRects(startCol: number, endCol: number, startRow: number, endRow: number): MergeRect[] {
+        this._ensureCellIndex();
+        const result: MergeRect[] = [];
+        const seen = new Set<string>();
+        const consider = (rect: MergeRect): void => {
+            if (rect.endRow < startRow || rect.startRow > endRow) return;   // 行向不相交
+            if (seen.has(rect.anchor)) return;
+            seen.add(rect.anchor);
+            result.push(rect);
+        };
+        for (let c = startCol; c <= endCol; c++) {
+            const list = this._mergeByCol.get(c);
+            if (list === undefined) continue;
+            for (let i = 0; i < list.length; i++) consider(list[i]);
+        }
+        // 整行级合并块：列索引里没有它，单独按列区间判断
+        const wide = this._wideMergeRects;
+        for (let i = 0; i < wide.length; i++) {
+            const rect = wide[i];
+            if (rect.endCol < startCol || rect.startCol > endCol) continue;
+            consider(rect);
+        }
+        return result;
+    }
+
+    /**
      * 获取单元格的合并后的列号和行号
      * 若请求的单元格在合并区域内（非左上角），返回左上角单元格的列号和行号
      * @param {string} cell - 单元格名称
@@ -2141,19 +2939,10 @@ export class DataCollection extends EventEmitter {
             return { col, row };
         }
 
-        // 若不在合并单元格中，检查是否位于某个合并区域内
-        const mergedCells = this.getMergedCells();
-        for (const merged of mergedCells) {
-            const [startCell, endCell] = merged.split(':');
-            const { col: startCol, row: startRow } = this.getCellColAndRow(startCell);
-            const { col: endCol, row: endRow } = this.getCellColAndRow(endCell);
-            if (col >= startCol && col <= endCol && row >= startRow && row <= endRow) {
-                const { col: topLeftCol, row: topLeftRow } = this.getCellColAndRow(startCell);
-                return {
-                    col: topLeftCol,
-                    row: topLeftRow
-                };
-            }
+        // 若不在合并单元格中，检查是否位于某个合并区域内（O(1) 索引查找）
+        const mergeRect = this.findMergeRect(col, row);
+        if (mergeRect !== null) {
+            return { col: mergeRect.startCol, row: mergeRect.startRow };
         }
         return { col, row };
     }
@@ -2240,24 +3029,16 @@ export class DataCollection extends EventEmitter {
         let minCol = Math.min(startCol, endCol);
         let maxRow = Math.max(startRow, endRow);
         let minRow = Math.min(startRow, endRow);
-        const mergedCells = this.getMergedCells();
-        for (const mergedCell of mergedCells) {
-            const startCell = mergedCell.split(':')[0];
-            const { col: col0, row: row0 } = this.getCellColAndRow(startCell);
-            const endCell = mergedCell.split(':')[1];
-            const { col: col1, row: row1 } = this.getCellColAndRow(endCell);
-            loop:
-            for (let c = col0; c <= col1; c++) {
-                for (let r = row0; r <= row1; r++) {
-                    if (c >= minCol && c <= maxCol && r >= minRow && r <= maxRow) {
-                        minCol = Math.min(minCol, col0);
-                        minRow = Math.min(minRow, row0);
-                        maxCol = Math.max(maxCol, col1);
-                        maxRow = Math.max(maxRow, row1);
-                        break loop;
-                    }
-                }
-            }         
+        const mergeRects = this.getMergeRects();
+        for (let i = 0; i < mergeRects.length; i++) {
+            const rect = mergeRects[i];
+            // 矩形相交即说明合并区域落在选区内（数值比较，不再逐格试探）
+            if (rect.endCol < minCol || rect.startCol > maxCol) continue;
+            if (rect.endRow < minRow || rect.startRow > maxRow) continue;
+            if (rect.startCol < minCol) minCol = rect.startCol;
+            if (rect.startRow < minRow) minRow = rect.startRow;
+            if (rect.endCol > maxCol) maxCol = rect.endCol;
+            if (rect.endRow > maxRow) maxRow = rect.endRow;
         }
         if (this.startLocation !== MouseLocation.IN_ANCHOR) {
             this.selection = `${this.getColName(minCol)}${minRow}:${this.getColName(maxCol)}${maxRow}`;
@@ -3274,7 +4055,7 @@ export class DataCollection extends EventEmitter {
             this.cloneValues(this.values),
             ascending ? '升序排序' : '降序排序'
         );
-        this._lastValuesSnapshot = this.cloneValues(this.values);
+        this._refreshBaseline();
         this.emit(DataEvents.VALUES_CHANGED, this._values);
     }
 
@@ -3346,12 +4127,22 @@ export class DataCollection extends EventEmitter {
         if (!this.activedCell) return;
 
         // 已存在筛选按钮 → 清除全部按钮（一步撤销）
-        const hasFilters = this.values.some((v: Cell | undefined) => v?.filter !== undefined);
-        if (hasFilters) {
+        // 判定走世代缓存（O(1)）而不是整表 values.some(...)：本方法每次点击都会走
+        // 这一行，大表下整表遍历一次实测 0.83 ms（基准 test/_bench-filter-add.js）。
+        if (this.validataFilter()) {
             this.runWithFullStateUndo('清除筛选按钮', () => {
+                // 必须在清条件**之前**算：被筛选隐藏的行要靠「当前条件重放」才认得出来
+                const filterHidden = this.computeFilterHiddenRows();
+                // 清除筛选按钮标记
                 for (const cell of this.values) {
                     if (cell.filter !== undefined) cell.filter = undefined;
                 }
+                this.invalidateFilterCells();
+                // 清除筛选条件注册表（按钮实例销毁时也会逐列清理，这里一次性清干净）
+                this.clearAllFilterConditions();
+                // 取消筛选 = 同时把被筛选隐藏的行恢复显示。
+                // **只恢复「因筛选而隐藏」的行**：手动隐藏的行不在 filterHidden 中，保持隐藏。
+                this.restoreRowsHiddenByFilter(filterHidden);
                 this.emit(DataEvents.VALUES_CHANGED, this._values);
             });
             return;
@@ -3360,9 +4151,18 @@ export class DataCollection extends EventEmitter {
         const [start, end] = this._selection.split(':');
         const { col: startCol, row: startRow } = this.getCellColAndRow(start);
         const { col: endCol, row: endRow } = this.getCellColAndRow(end);
-        const matrix = this.matrixValues();
-        const rows = matrix[startRow - 1];
-        if (start !== end && startCol !== endCol && startRow === endRow && rows.some((v: Cell | undefined) => v !== undefined)) {
+        // 只需知道「选中行这一行有没有内容」，不必为它建整张稠密矩阵：
+        // 历史实现 `const rows = matrix[startRow - 1]` 只为拿到这一行，
+        // 却先付了一次 O(maxRow × maxCol) 的矩阵分配（6 万格实测 8.9 ms）。
+        // 改为在选中列范围内逐格 O(1) 查名索引。
+        let rowHasContent = false;
+        for (let c = startCol; c <= endCol; c++) {
+            if (this.getCellByName(this.getCellName(c, startRow)) !== undefined) {
+                rowHasContent = true;
+                break;
+            }
+        }
+        if (start !== end && startCol !== endCol && startRow === endRow && rowHasContent) {
             // 为选中行范围内的有效列逐列添加筛选按钮（一步撤销）
             this.runWithFullStateUndo('添加筛选按钮', () => {
                 for (let c = startCol - 1; c < endCol; c++) {
@@ -3378,6 +4178,7 @@ export class DataCollection extends EventEmitter {
                         this.values.push(newCell);
                     }
                 }
+                this.invalidateFilterCells();
                 this.emit(DataEvents.VALUES_CHANGED, this._values);
             });
         } else {
@@ -3389,6 +4190,43 @@ export class DataCollection extends EventEmitter {
                 }
             );
         }
+    }
+
+    /**
+     * 恢复「被筛选隐藏」的行（取消筛选时调用）
+     *
+     * 连续行合并成一段调用 {@link setRowsHidden} —— 统一入口自带
+     * 可见位置重算 / 滚动偏移 clamp / 尾部补足与收缩 / 广播，
+     * **不要绕过它直接改 `isHidden`**（否则行位置与总高会和隐藏状态脱节）。
+     * 已处于显示状态的行直接跳过，避免无谓的重算。
+     * @param {Set<number>} rows - 因筛选而隐藏的行号（1-based）
+     * @private
+     */
+    private restoreRowsHiddenByFilter(rows: Set<number>): void {
+        if (rows.size === 0) return;
+        const sorted = Array.from(rows).sort((a, b) => a - b);
+        let segStart = -1;
+        let segEnd = -1;
+        const flush = (): void => {
+            if (segStart >= 0) this.setRowsHidden(segStart, segEnd, false);
+            segStart = -1;
+            segEnd = -1;
+        };
+        for (let i = 0; i < sorted.length; i++) {
+            const r = sorted[i];
+            if (this.rowHeaders.getAt(r - 1)?.isHidden !== true) continue;  // 已显示：无需恢复
+            if (segStart < 0) {
+                segStart = r;
+                segEnd = r;
+            } else if (r === segEnd + 1) {
+                segEnd = r;   // 与上一行连续 → 并入同一段
+            } else {
+                flush();
+                segStart = r;
+                segEnd = r;
+            }
+        }
+        flush();
     }
 
     /**
@@ -3432,33 +4270,102 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
-     * 验证列是否有效
-     * @param {number} col - 列索引
-     * @returns {boolean} 是否有效
+     * 清除全部筛选条件（清空注册表与操作顺序表）
      */
-    private validataColInFilter(col: number): boolean {
-        const matrix = this.matrixValues();
-        if (col < 0 || col >= matrix[0].length) return false;
-        if (this.colHeaders.getAt(col).isHidden) return false; // 跳过隐藏列
-        const cols = [];
-        for (let r = 0; r < matrix.length; r++) {
-            const row = matrix[r];
-            if (row) {
-                if (row[col] !== undefined) cols.push(row[col]);
-            }
-        }
-        if (cols.length > 0) return true;
-        return false;
+    public clearAllFilterConditions(): void {
+        if (this._filterConditions.size === 0 && this._filterOrder.length === 0) return;
+        this._filterConditions = new Map();
+        this._filterOrder = [];
     }
 
     /**
-     * 验证过滤范围是否有效
-     * @returns {boolean} 是否有效
+     * 按**当前筛选条件注册表**重放，算出「应当因筛选而隐藏的行」（1-based）
+     *
+     * 「执行筛选」与「清除筛选（恢复隐藏行）」两侧共用这一份判定，避免出现
+     * 两份相似但不一致的实现（漂移的后果是「取消筛选后有些行再也回不来」）。
+     *
+     * 规则（与 Excel 筛选一致）：
+     * - 只可能隐藏**有内容**的行（全空行始终显示）；
+     * - 某列的约束只作用于「该列筛选行**以下**」的行（筛选行及其以上不受约束）；
+     * - 跨越某列筛选行的合并块覆盖的行不受该列约束（合并块整体显示）；
+     * - 行内容取「视觉生效」的文本：合并区域内取锚点文本（{@link getEffectiveTextAt}）。
+     *
+     * 复杂度 O(有内容的行 × 已筛选列)，与「总行数」无关 —— 大文件中总行数可达百万行，
+     * 而真正有内容的往往只有几千行。
+     * @returns {Set<number>} 应隐藏的行号集合（1-based）
+     */
+    public computeFilterHiddenRows(): Set<number> {
+        const hidden = new Set<number>();
+        if (this._filterConditions.size === 0) return hidden;
+        const rowsWithText = this.getRowsWithText();
+        if (rowsWithText.size === 0) return hidden;
+        const totalRows = this.rowHeaders.length;
+        // 各列约束只作用于自己的筛选行以下 → 全部筛选行之前的行不可能被隐藏
+        let firstAnchor = Infinity;
+        this._filterConditions.forEach((cond) => {
+            if (cond.anchorRow < firstAnchor) firstAnchor = cond.anchorRow;
+        });
+        const order = this._filterOrder;
+        rowsWithText.forEach((r) => {
+            if (r <= firstAnchor || r > totalRows) return;
+            for (let k = 0; k < order.length; k++) {
+                const c = order[k];
+                const cond = this._filterConditions.get(c);
+                if (!cond || r <= cond.anchorRow) continue;   // 该列筛选行及以上不受此条件约束
+                const cell = this.getEffectiveCellAt(r, c);
+                if (cell !== undefined && this.getCellColAndRow(cell.cell).row <= cond.anchorRow) continue;  // 跨筛选行的合并块
+                const text = cell === undefined ? '' : cell.getText();
+                if (!cond.keep.has(text)) {
+                    hidden.add(r);
+                    return;
+                }
+            }
+        });
+        return hidden;
+    }
+
+    /**
+     * 验证列是否有效（该列是否有内容且未隐藏）—— O(1)
+     *
+     * 历史实现对每一列都调用 `matrixValues()`，那会**分配整张 `maxRow × maxCol`
+     * 稠密二维数组**并遍历全表两次；添加筛选按钮时它在逐列循环里被调用，
+     * 于是「选中 N 列 = 重建 N 次稠密矩阵」（实测 6 万格下 200 列 = 1596 ms）。
+     * 现在改为查 {@link _colsWithContent}（一次遍历、按世代缓存）。
+     *
+     * 语义与历史实现保持一致：
+     * - `col` 越界（负数 / 超过内容最大列）→ false；
+     * - 该列被隐藏 → false（不给隐藏列加筛选按钮）；
+     * - 该列没有任何单元格（含被合并块覆盖的情况）→ false。
+     * @param {number} col - 列索引（0-based）
+     * @returns {boolean} 该列是否可加筛选按钮
+     * @private
+     */
+    private validataColInFilter(col: number): boolean {
+        if (col < 0) return false;
+        const colNo = col + 1; // 内部索引 1-based，与 _colsWithContent 口径一致
+        if (colNo > this.getContentBounds().maxCol) return false;
+        if (this.colHeaders.getAt(col)?.isHidden === true) return false; // 跳过隐藏列
+        return this.getColsWithContent().has(colNo);
+    }
+
+    /**
+     * 验证「当前是否存在筛选按钮」
+     *
+     * 该接口被 `sectionProcess.setToolbarsState()` 挂在**每次 VALUES_CHANGED** 上
+     * （含每次按键、每次滚动触发的广播），因此必须是 O(1)。
+     * 历史实现 `this.values.filter(...)` 是整表遍历 + 建临时数组：
+     * 基准 `test/_bench-filter-add.js` 实测 6 万格下 0.74 ms/次。
+     *
+     * 改用与 {@link hasFilterCells} 同一套世代缓存：同一世代内先问
+     * `_filterCellsEpoch === _valuesEpoch`（不重建任何索引即可回答），
+     * 世代失效才走一次 `getFilterCells()`（顺带产出后续渲染要用的缓存）。
+     * @returns {boolean} 是否存在筛选按钮
      */
     public validataFilter(): boolean {
-        const filters = this.values.filter((v: Cell | undefined) => v.filter !== undefined);
-        if (filters.length > 0) return true;
-        return false;
+        if (this._filterCellsEpoch === this._valuesEpoch && this._values.length === this._indexedLength) {
+            return this._filterCells.length > 0;
+        }
+        return this.getFilterCells().length > 0;
     }
 
     /**
@@ -4162,28 +5069,192 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
-     * 将数据集合转换为JSON表示
-     * @returns {string} 数据集合的JSON表示
+     * 生成快照的 JSON 文本片段（**同步与分片两条路径共用的唯一实现**）
+     *
+     * 逐段 yields 而非一次 `JSON.stringify(整个对象)`，是为了让
+     * {@link toSnapshotChunked} 能在片段之间让出主线程：几十万格的快照序列化
+     * 原本是一段**不可中断**的同步任务（40 万格实测约 500 ms，且正好落在
+     * 「刚打开完文件」的防抖落库时刻），是打开大文件后仍会卡顿的最后一环。
+     *
+     * 片段粒度按 {@link DataCollection.SNAPSHOT_VALUE_CHUNK} 划分（4000 格 ≈ 5 ms），
+     * 保证分片版既能及时让出，又不会因为片段过多而拖慢拼接。
+     *
+     * ## 输出格式 v3：样式表
+     *
+     * 单元格不再逐格内联样式字段，而是写样式表编号 `s`；表项集中在尾部
+     * `styles` 数组。样式在真实表格里重复度极高，而装载路径的 `JSON.parse`
+     * 是整段同步的 —— 快照小一倍，卡顿就少一半（详见 `CellStyleTable`）。
+     * 槽位稳定：即使表为空也输出 `"styles":[]`，读回侧无需特判。
+     *
+     * {@link toJSON} 只是把这些片段直接拼起来（同步、与历史语义一致）。
+     * @returns {Generator<string>} JSON 文本片段
+     * @private
      */
-    public toJSON(): string {
-        return JSON.stringify({
-            activedCell: this.activedCell,
-            selection: this._selection,
-            printSetting: this._printSetting,
-            colHeaders: this.colHeaders.colHeaders,
-            offsetWidth: this.colHeaders.offsetWidth,
-            allColWidth: this.colHeaders.allColWidth,
-            rowHeaders: this.rowHeaders.rowHeaders,
-            offsetHeight: this.rowHeaders.offsetHeight,
-            allRowHeight: this.rowHeaders.allRowHeight,
-            showGridLines: this.showGridLines,
-            zoom: this.zoom,
-            values: this.values.map((v: Cell) => v.toJSON()),
-        });
+    private *_snapshotParts(): Generator<string> {
+        yield '{"v":3';
+        yield ',"activedCell":' + JSON.stringify(this.activedCell);
+        yield ',"selection":' + JSON.stringify(this._selection);
+        yield ',"printSetting":' + JSON.stringify(this._printSetting);
+        yield ',"colHeaders":' + JSON.stringify(this.colHeaders.colHeaders);
+        yield ',"offsetWidth":' + JSON.stringify(this.colHeaders.offsetWidth);
+        yield ',"allColWidth":' + JSON.stringify(this.colHeaders.allColWidth);
+        yield ',"rowHeaders":' + JSON.stringify(this.rowHeaders.rowHeaders);
+        yield ',"offsetHeight":' + JSON.stringify(this.rowHeaders.offsetHeight);
+        yield ',"allRowHeight":' + JSON.stringify(this.rowHeaders.allRowHeight);
+        yield ',"showGridLines":' + JSON.stringify(this.showGridLines);
+        yield ',"zoom":' + JSON.stringify(this.zoom);
+        yield ',"values":[';
+
+        // 样式表：随 values 一起逐格填充，写入快照尾部（读回时已整份 JSON.parse，
+        // 键序不影响语义，故可以放在 values 之后，省掉一次预扫描）
+        const styles = new CellStyleTable();
+        let first = true;
+        for (const part of this._valueChunkParts(styles)) {
+            yield (first ? '' : ',') + part;
+            first = false;
+        }
+        yield ']';
+        yield ',"styles":' + JSON.stringify(styles.entries);
+        yield '}';
     }
 
     /**
-     * 空白工作表快照（内容为空，视图设置沿用当前会话）
+     * 逐片生成 `values` 的单元格 JSON 片段（**单元格序列化的唯一实现**）
+     *
+     * 每片产出「不含外层方括号、不含分隔逗号」的片段，形如
+     * `{"c":"A1","t":"x"},{"c":"A2","s":3}`。两条落库路径共用它：
+     * - v3 文本存档（{@link _snapshotParts}）把片段用逗号拼进 `"values":[…]`；
+     * - v4 对象存档（{@link toSnapshotChunked}）把每片各自包成 `[…]`，
+     *   于是「每片都是一份可独立 `JSON.parse` 的数组」。
+     *
+     * 之所以做成生成器：分片版可以在片与片之间 `await` 让出主线程，
+     * 而同步版（页面卸载）直接一次跑完。
+     * @param {CellStyleTable} styles - 样式表（逐格填充，由调用方负责写出）
+     * @returns {Generator<string>} 每片一段 JSON 文本
+     * @private
+     */
+    private *_valueChunkParts(styles: CellStyleTable): Generator<string> {
+        const values = this._values;
+        for (let i = 0; i < values.length; i += DataCollection.SNAPSHOT_VALUE_CHUNK) {
+            const end = Math.min(i + DataCollection.SNAPSHOT_VALUE_CHUNK, values.length);
+            const parts: string[] = new Array(end - i);
+            for (let k = i; k < end; k++) {
+                parts[k - i] = JSON.stringify(values[k].toCompact(styles));
+            }
+            yield parts.join(',');
+        }
+    }
+
+    /**
+     * 生成 v4 存档（**同步**，页面卸载等无法等待的场景用）
+     *
+     * 与 {@link toSnapshotChunked} 输出完全相同（共用 {@link _valueChunkParts}）。
+     * 后台落库走分片版；本方法只在 `pagehide`/`visibilitychange` 这类
+     * 「必须立刻把快照拿到手」的时刻调用。
+     * @returns {SheetSnapshotV4} 存档对象（可直接交给 {@link IndexDB.setValue}）
+     */
+    public toSnapshot(): SheetSnapshotV4 {
+        const styles = new CellStyleTable();
+        const chunks: string[] = [];
+        for (const part of this._valueChunkParts(styles)) chunks.push('[' + part + ']');
+        return { ...this._snapshotEnvelope(), chunks, styles: styles.entries };
+    }
+
+    /**
+     * 生成 v4 存档（**分片让出**，常规落库用）
+     *
+     * 与 {@link toSnapshot} 输出完全相同，区别是每片之间 `await` 让出一次：
+     * 40 万格的单元格序列化原本是约 310 ms 的整段同步任务。
+     * @returns {Promise<SheetSnapshotV4>} 存档对象
+     */
+    public async toSnapshotChunked(): Promise<SheetSnapshotV4> {
+        const styles = new CellStyleTable();
+        const chunks: string[] = [];
+        const slice = new SliceBudget();
+        for (const part of this._valueChunkParts(styles)) {
+            chunks.push('[' + part + ']');
+            if (slice.expired()) await slice.yieldNow();
+        }
+        return { ...this._snapshotEnvelope(), chunks, styles: styles.entries };
+    }
+
+    /**
+     * 生成 v4 存档的「元信息 + 稀疏行列头」部分
+     * @returns {Omit<SheetSnapshotV4, 'chunks' | 'styles'>} 不含单元格数据的部分
+     * @private
+     */
+    private _snapshotEnvelope(): Omit<SheetSnapshotV4, 'chunks' | 'styles'> {
+        return {
+            v: 4,
+            activedCell: this.activedCell,
+            selection: this._selection,
+            printSetting: this._printSetting,
+            showGridLines: this.showGridLines,
+            zoom: this.zoom,
+            offsetWidth: this.colHeaders.offsetWidth,
+            offsetHeight: this.rowHeaders.offsetHeight,
+            cols: encodeColAxis(this.colHeaders.colHeaders),
+            rows: encodeRowAxis(this.rowHeaders.rowHeaders),
+        };
+    }
+
+    /**
+     * 将数据集合转换为JSON表示（**紧凑格式 v3**）
+     *
+     * ## 为什么不再 `values.map(v => v.toJSON())`（性能约定，请勿回退）
+     * 历史实现是「每个 Cell 先 `JSON.stringify` 成字符串，再把这些字符串放进
+     * 数组整体 `JSON.stringify` 一次」。这是**双层编码**：第二层会把第一层里
+     * 每一个引号都转义一次，而 `Cell` 内部的 `chars` 又是「每字符一串 JSON」的
+     * 字符串 —— 于是一个 6 字符的单元格能膨胀到约 690 字节。
+     * 实测 40 万格 ⇒ 134 MB 临时字符串、约 1.9 秒纯主线程同步耗时，
+     * 且紧随打开文件之后（打开即回写）立刻发生，是「大文件打开卡死」的主因之一。
+     *
+     * 现在改为：`Cell.toCompact()` 产出**普通对象**（省略默认值 + 统一样式的字符
+     * 合并为「文本 + 共享字体」），交给序列化一次性写出。
+     * 同样 6 字符的单元格只剩约 40~110 字节，单格体积降到约 1/6~1/17。
+     *
+     * 样式字段进一步抽成 **v3 样式表**（`CellStyleTable`）：单元格只写编号
+     * `s`，表项集中在尾部的 `styles` 数组。样式在真实表格里重复度极高
+     * （400 行加粗背景同一种样式），而装载路径的 `JSON.parse` 是整段同步的 ——
+     * 实测 20 万格带样式：快照 30.0 MB → 7.4 MB，`JSON.parse` 388 ms → 138 ms。
+     *
+     * 版本标记由 {@link DataCollection.fromJSON} 分派解码路径：
+     * `v:3` 读样式表、`v:2` 读内联样式、无 `v`（历史存档）走遗留双层解码，
+     * 三种存档**永远都能读回**。
+     *
+     * 本方法保持**同步**（既有调用方与测试依赖同步语义）。后台落库走
+     * {@link toSnapshotText}（分片让出）；页面卸载走本方法（必须同步取到快照）。
+     * **注意：v4 起常规落库不再走本方法**（见 {@link toSnapshot}），
+     * 它保留为「v3 文本格式」的写入端，供测试与旧格式兼容。
+     * @returns {string} 数据集合的JSON表示
+     */
+    public toJSON(): string {
+        let text = '';
+        for (const part of this._snapshotParts()) text += part;
+        return text;
+    }
+
+    /**
+     * 分片生成同一份快照文本，期间让出主线程
+     *
+     * 与 {@link toJSON} 输出**完全相同**（共用 {@link _snapshotParts}），
+     * 区别是每片之间 `await` 让出一次，浏览器得以处理输入与渲染。
+     * 自动保存与显式落库都走这里：40 万格快照原本是约 500 ms 的整段同步任务，
+     * 且恰好紧跟在「打开文件」的防抖窗口之后，是打开大文件后仍会卡一下的元凶。
+     * @returns {Promise<string>} 数据集合的JSON表示
+     */
+    public async toSnapshotText(): Promise<string> {
+        const parts: string[] = [];
+        const slice = new SliceBudget();
+        for (const part of this._snapshotParts()) {
+            parts.push(part);
+            if (slice.expired()) await slice.yieldNow();
+        }
+        return parts.join('');
+    }
+
+    /**
+     * 空白工作表存档（内容为空，视图设置沿用当前会话）
      *
      * 供「新建文件」时写入数据库：让「文件树里有这个文件」与「`values` 库里
      * 有这个文件的存档」始终一一对应（见 app.ts 的内容桥）。
@@ -4192,22 +5263,101 @@ export class DataCollection extends EventEmitter {
      * 打开一个尚无内容的文件时 {@link switchToSheet} 走的是 {@link _clearSheetContent}，
      * 本来就保留当前行列头尺寸；若这里写入空的行列头，重新打开该文件会得到
      * `allColWidth = 0`，滚动条与画布都会异常。
-     * @returns {string} 空白工作表快照（可直接交给 {@link IndexDB.setValue}）
+     *
+     * 形态是 {@link SheetSnapshotV4}（与常规落库一致）：`chunks` 为空数组
+     * 即代表「没有单元格」，{@link isV4Snapshot} + app.ts 的 `isEmptySnapshot`
+     * 都据此判空。
+     * @returns {SheetSnapshotV4} 空白工作表存档（可直接交给 {@link IndexDB.setValue}）
      */
-    public blankSnapshot(): string {
-        const snapshot = JSON.parse(this.toJSON());
+    public blankSnapshot(): SheetSnapshotV4 {
+        const snapshot = this.toSnapshot();
         snapshot.activedCell = 'A1';
         snapshot.selection = 'A1:A1';
-        snapshot.values = [];
-        return JSON.stringify(snapshot);
+        snapshot.chunks = [];
+        // 内容清空后样式表随之作废（留着只会让每个空白存档多背一份无用数据）
+        snapshot.styles = [];
+        return snapshot;
+    }
+
+    /**
+     * 判断一个存档值是否为 v4 形态
+     *
+     * `chunks` 必须是数组：缺了它就没有单元格数据可言，
+     * 按「不是 v4」处理会走回字符串分支（`typeof raw === 'string'` 不成立）
+     * 而落到空表兜底 —— 这正是我们想要的保守行为。
+     * @param raw - 存档值（来自 IndexedDB，形态未知）
+     * @returns {boolean} 是否为 v4 存档
+     */
+    public static isV4Snapshot(raw: unknown): raw is SheetSnapshotV4 {
+        return !!raw && typeof raw === 'object'
+            && (raw as { v?: unknown }).v === 4
+            && Array.isArray((raw as { chunks?: unknown }).chunks);
+    }
+
+    /**
+     * 从**任意形态**的存档值装载（v4 对象 / v3 字符串 / v2 与遗留字符串）
+     *
+     * 分派规则：
+     * - `string` → {@link fromJSONChunked}（v3 样式表 / v2 内联样式 / 无版本标记的遗留双层编码，
+     *   三种历史存档**永远都能读回**）；
+     * - v4 对象 → 逐片 `JSON.parse` + 解码，片间让出主线程；
+     * - 其它（空对象、损坏值）→ 按空表处理，不让损坏存档带崩装载流程。
+     *
+     * 这是装载路径的**唯一入口**（{@link syncValuesFromDB} 与 {@link switchToSheet} 都走它）。
+     * @param raw - 存档值
+     * @returns {Promise} 解码后的各部分（与 {@link fromJSON} 结构一致）
+     */
+    public static async fromSnapshotChunked(raw: unknown): Promise<ReturnType<typeof DataCollection.fromJSON>> {
+        if (typeof raw === 'string') return DataCollection.fromJSONChunked(raw);
+        if (!DataCollection.isV4Snapshot(raw)) {
+            return DataCollection._assembleSnapshot({}, []);
+        }
+
+        const chunks = raw.chunks;
+        const styles = Array.isArray(raw.styles) ? raw.styles : [];
+        const values: Cell[] = [];
+        const slice = new SliceBudget();
+        for (const chunk of chunks) {
+            if (typeof chunk !== 'string' || chunk.length === 0) continue;
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(chunk);
+            } catch {
+                // 单片损坏不该拖垮整份存档：跳过该片，其余内容照常装载
+                continue;
+            }
+            if (!Array.isArray(parsed) || parsed.length === 0) continue;
+            // 每片是各自解析出来的独立数组：源下标从 0 起，用 destOffset 映射回整表绝对位置
+            const base = values.length;
+            values.length = base + parsed.length;
+            DataCollection._decodeValueRange(parsed, values, 0, parsed.length, styles, base);
+            if (slice.expired()) await slice.yieldNow();
+        }
+
+        return DataCollection._assembleSnapshot({
+            activedCell: raw.activedCell,
+            selection: raw.selection,
+            printSetting: raw.printSetting,
+            colHeaders: decodeColAxis(raw.cols),
+            offsetWidth: raw.offsetWidth,
+            rowHeaders: decodeRowAxis(raw.rows),
+            offsetHeight: raw.offsetHeight,
+            showGridLines: raw.showGridLines,
+            zoom: raw.zoom,
+        }, values);
     }
 
     /**
      * 从JSON表示创建数据集合
+     *
+     * 保持**同步**（历史 API，测试与若干调用方依赖同步语义）。
+     * 从数据库装载大表请用 {@link fromJSONChunked}：它会分片让出主线程，
+     * 避免刷新页面 / 切换文件时卡住一至两秒。
      * @param {string} json - 数据集合的JSON表示
-     * @returns {Cell[]} 创建单元格实例数组
+     * @returns 解码后的各部分（values 为 `Cell` 实例数组）
      */
-    public static fromJSON(json: string): {activedCell: string,
+    public static fromJSON(json: string): {
+        activedCell: string,
         selection: string,
         printSetting: PrinterSetting,
         colHeaders: ColHeader[],
@@ -4219,7 +5369,106 @@ export class DataCollection extends EventEmitter {
         showGridLines: boolean,
         zoom: number,
         values: Cell[]} {
-            const parsed = JSON.parse(json);
+        const parsed = JSON.parse(json);
+        const rawValues: any[] = parsed.values || [];
+        const values: Cell[] = new Array(rawValues.length);
+        DataCollection._decodeValueRange(rawValues, values, 0, rawValues.length, parsed.styles);
+        return DataCollection._assembleSnapshot(parsed, values);
+    }
+
+    /**
+     * 分片解码快照文本（装载大表用）
+     *
+     * 与 {@link fromJSON} 解码结果**完全相同**（共用 {@link _decodeValueRange}），
+     * 区别是每解码一段就让出一次主线程。40 万格的快照解码实测约 1.4 秒整段同步，
+     * 而这段代码正跑在「刷新页面」与「双击树节点切换文件」的路径上 ——
+     * 分片后期间窗口可响应，不再出现切文件即假死。
+     *
+     * 注意：`JSON.parse` 本身仍是**不可分片**的一次调用（大快照约数百毫秒），
+     * 这是继续压缩装载耗时的下一步方向（见项目记忆「待办」）。
+     * @param {string} json - 数据集合的JSON表示
+     * @returns {Promise} 解码后的各部分
+     */
+    public static async fromJSONChunked(json: string): Promise<{
+        activedCell: string,
+        selection: string,
+        printSetting: PrinterSetting,
+        colHeaders: ColHeader[],
+        offsetWidth: number,
+        allColWidth: number,
+        rowHeaders: RowHeader[],
+        offsetHeight: number,
+        allRowHeight: number,
+        showGridLines: boolean,
+        zoom: number,
+        values: Cell[]}> {
+        const parsed = JSON.parse(json);
+        const rawValues: any[] = parsed.values || [];
+        const values: Cell[] = new Array(rawValues.length);
+        const slice = new SliceBudget();
+        for (let i = 0; i < rawValues.length; i += DataCollection.SNAPSHOT_VALUE_CHUNK) {
+            const end = Math.min(i + DataCollection.SNAPSHOT_VALUE_CHUNK, rawValues.length);
+            DataCollection._decodeValueRange(rawValues, values, i, end, parsed.styles);
+            if (slice.expired()) await slice.yieldNow();
+        }
+        return DataCollection._assembleSnapshot(parsed, values);
+    }
+
+    /**
+     * 解码 `values` 的 `[from, to)` 区间（**同步与分片两条路径共用的唯一实现**）
+     *
+     * 逐格分派：v3/v2 紧凑对象走 `Cell.fromCompact`，遗留格式（`values[i]` 是字符串）
+     * 走双层解码。刻意做成「按区间」而非「整表」，分片路径才能把同一份逻辑
+     * 拆成多段执行，不会出现两份实现行为漂移。
+     * **源区间与目标位置必须分开**：v3 文本存档里 `rawValues` 就是整张表
+     * （源下标 = 目标下标），而 v4 存档的**每一片是各自 `JSON.parse` 出来的
+     * 独立数组**（源下标从 0 起），要靠 `destOffset` 映射回整表的绝对位置。
+     * 历史上这里只按「源下标 = 目标下标」写，于是 v4 装载时第 2 片起全部
+     * 读到越界下标 → 解出空单元格（多片存档丢内容）。见 `test-snapshot-v4.js`。
+     * @param {any[]} rawValues - 源数组（整表，或 v4 的**单片**）
+     * @param {Cell[]} values - 输出数组（按绝对下标填充）
+     * @param {number} from - 源起始下标（含）
+     * @param {number} to - 源结束下标（不含）
+     * @param {any[]} [styles] - v3 样式表（`values[i].s` 是它的下标）；v2 / 遗留存档为 undefined
+     * @param {number} [destOffset=from] - 目标起始下标；默认与 `from` 相同（v3 场景源/目标同下标）
+     * @private
+     */
+    private static _decodeValueRange(
+        rawValues: any[],
+        values: Cell[],
+        from: number,
+        to: number,
+        styles?: any[],
+        destOffset: number = from
+    ): void {
+        for (let i = from; i < to; i++) {
+            const raw = rawValues[i];
+            values[destOffset + (i - from)] = (typeof raw === 'string')
+                ? DataCollection.decodeLegacyCell(raw)
+                : Cell.fromCompact(raw, styles);
+        }
+    }
+
+    /**
+     * 把解码好的 values 与快照其余字段组装成统一结构
+     * @param {any} parsed - `JSON.parse` 的原始结果
+     * @param {Cell[]} values - 已解码的单元格数组
+     * @returns 组装结果
+     * @private
+     */
+    private static _assembleSnapshot(parsed: any, values: Cell[]): {
+        activedCell: string,
+        selection: string,
+        printSetting: PrinterSetting,
+        colHeaders: ColHeader[],
+        offsetWidth: number,
+        allColWidth: number,
+        rowHeaders: RowHeader[],
+        offsetHeight: number,
+        allRowHeight: number,
+        showGridLines: boolean,
+        zoom: number,
+        values: Cell[]} {
         return {
             activedCell: parsed.activedCell || 'A1',
             selection: parsed.selection || `${parsed.activedCell || 'A1'}:${parsed.activedCell || 'A1'}`,
@@ -4232,48 +5481,46 @@ export class DataCollection extends EventEmitter {
             allRowHeight: parsed.allRowHeight || 0,
             showGridLines: parsed.showGridLines || true,
             zoom: parsed.zoom || 1,
-            values: (parsed.values || []).map((itemJSON: any) => {
-                const item = JSON.parse(itemJSON);
-                const cell = new Cell();
-                cell.cell = item.cell || '';
-                cell.isEdit = item.isEdit || false;
-                cell.colspan = item.colspan;
-                cell.rowspan = item.rowspan;
-                cell.fontFamily = item.fontFamily;
-                cell.fontSize = item.fontSize;
-                cell.fontWeight = item.fontWeight;
-                cell.fontStyle = item.fontStyle;
-                cell.fontColor = item.fontColor;
-                cell.underline = item.underline;
-                cell.strikethrough = item.strikethrough;
-                cell.borderTopWidth = item.borderTopWidth;
-                cell.borderBottomWidth = item.borderBottomWidth;
-                cell.borderLeftWidth = item.borderLeftWidth;
-                cell.borderRightWidth = item.borderRightWidth;
-                cell.textAlign = item.textAlign;
-                cell.alignItems = item.alignItems;
-                cell.backgroundColor = item.backgroundColor;
-                cell.filter = item.filter;
-                cell.wrap = item.wrap;
-                cell.letterSpacing = item.letterSpacing;
-                cell.lineSpacing = item.lineSpacing;
-                const chars = JSON.parse(item.chars || '[]');
-                cell.chars = chars.map((charItemJSON: any) => {
-                    const charItem = JSON.parse(charItemJSON);
-                    const char = new Char();
-                    char.char = charItem.char || charItem._char || '';
-                    char.fontFamily = charItem.fontFamily;
-                    char.fontSize = charItem.fontSize;
-                    char.fontWeight = charItem.fontWeight;
-                    char.fontStyle = charItem.fontStyle;
-                    char.fontColor = charItem.fontColor;
-                    char.underline = charItem.underline;
-                    char.strikethrough = charItem.strikethrough;
-                    return char;
-                });
-                return cell;
-            })
+            values
         }
+    }
+
+    /**
+     * 解码遗留格式（双层编码）的单个单元格
+     *
+     * 历史存档里 `values[i]` 是「Cell 的 JSON 字符串」，其 `chars` 字段又是
+     * 「每字符一串 JSON」的字符串数组 —— 必须解析两层才能拿到字符。
+     * 字符还原走 `Char.fromRaw`（稀疏复制）：逐字段无条件赋值会把 7 个样式
+     * 字段全部物化成自有属性，大表装载时白白抬高内存。
+     * @param {string} itemJSON - 单元格的 JSON 字符串
+     * @returns {Cell} 单元格实例
+     * @private
+     */
+    private static decodeLegacyCell(itemJSON: string): Cell {
+        const item = JSON.parse(itemJSON);
+        const cell = new Cell();
+        cell.cell = item.cell || '';
+        cell.isEdit = item.isEdit || false;
+        cell.colspan = item.colspan;
+        cell.rowspan = item.rowspan;
+        cell.borderTopWidth = item.borderTopWidth;
+        cell.borderBottomWidth = item.borderBottomWidth;
+        cell.borderLeftWidth = item.borderLeftWidth;
+        cell.borderRightWidth = item.borderRightWidth;
+        cell.textAlign = item.textAlign;
+        cell.alignItems = item.alignItems;
+        cell.backgroundColor = item.backgroundColor;
+        cell.numberFormat = item.numberFormat;
+        cell.borderColor = item.borderColor;
+        cell.filter = item.filter;
+        cell.wrap = item.wrap;
+        cell.letterSpacing = item.letterSpacing;
+        cell.lineSpacing = item.lineSpacing;
+        const chars = JSON.parse(item.chars || '[]');
+        cell.chars = chars.map((charItem: any) => Char.fromRaw(
+            typeof charItem === 'string' ? JSON.parse(charItem) : charItem
+        ));
+        return cell;
     }
     
     /**

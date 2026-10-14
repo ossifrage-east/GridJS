@@ -11,15 +11,29 @@ import { CELL_PADDING, DEFAULT_ANCHOR_SELECTED_BORDER_COLOR, DEFAULT_CELL_BG_COL
     SHEETS_NAME,
     MouseLocation} from "../constant";
 import { Canvas, CanvasOptions } from "./canvas";
+import { Cell } from "../dataArchitecture/cell";
 import { Filter } from "../assistant/filter";
+import { layoutVisibleImages, type ImageLayoutGrid } from "./imageLayout";
+import { SheetImageLayer } from "./sheetImageLayer";
 
 export class SheetCanvas extends Canvas {
-    private filters: {cellName: string, filter: Filter}[] = [];
+    /** 筛选按钮实例：单元格名 → Filter（每帧按名字定位，避免数组 find 的 O(F²)） */
+    private filters: Map<string, Filter> = new Map();
+    /**
+     * 图片绘制层：负责位图异步解码缓存与绘制
+     *
+     * 图片解码是异步的，首次绘制那一帧拿不到位图，解码完成后需要再画一帧
+     * （见 {@link scheduleImageRedraw}）。
+     */
+    private readonly imageLayer: SheetImageLayer;
+    /** 是否已排期一次「图片解码完成」的重绘（合并同一批解码的多次回调） */
+    private imageRedrawScheduled: boolean = false;
     constructor(options: CanvasOptions) {
         super(options);
         this.parentElement = options.parentElement;
         this.data = options.data;
         this.menu = options.menu;
+        this.imageLayer = new SheetImageLayer({ requestRedraw: () => this.scheduleImageRedraw() });
         this.setupContextMenu();
         this.init();
     }
@@ -105,10 +119,18 @@ export class SheetCanvas extends Canvas {
         this.ctx.save();
         this.clear();
         this.drawGridLines();
-        this.drawCellBgColor();
-        this.drawAllMergedCellBackground();
-        this.drawCellsText();
-        this.drawCellBorder();
+        // 视口内的单元格集合 + 可见行列范围：一帧只算一次，供下面几遍绘制共用。
+        // （历史实现让每遍绘制各自调用 getVisibleCells()，一帧算三遍，
+        //   每遍都要新建上千个单元格名字符串并遍历合并区域。）
+        const cells = this.data.getVisibleCells();
+        const { startCol, endCol } = this.data.getVisibleCols();
+        const { startRow, endRow } = this.data.getVisibleRows();
+        this.drawCellBgColor(cells);
+        this.drawAllMergedCellBackground(startCol, endCol, startRow, endRow);
+        this.drawCellsText(cells);
+        this.drawCellBorder(cells);
+        // 图片是浮动对象：画在网格内容之上、选区框之下（否则选中框会被图盖住看不见）
+        this.drawImages();
         if (this.data.startLocation === MouseLocation.IN_ANCHOR) {
             this.drawAnchorSelcetedRect();
         }
@@ -118,35 +140,114 @@ export class SheetCanvas extends Canvas {
     }
 
     /**
+     * 绘制当前工作表内嵌的图片
+     *
+     * 【性能约定，勿回退】先把矩形按**视口裁剪**（{@link layoutVisibleImages}），
+     * 再交给绘制层：代价只与「屏上图片数」相关，与工作簿图片总数无关。
+     * 无图片时（绝大多数表格）这里在第一行就返回，不产生任何分配。
+     */
+    private drawImages(): void {
+        const images = this.data.images;
+        if (images.length === 0) return;
+
+        const { colHeaders, rowHeaders, visibleView } = this.data;
+        // 表头几何按需查询：隐藏列在 recalcColPositions 后已被压成零视觉宽度，
+        // 因此这里的 left/top 累计值天然避开了隐藏行列
+        const grid: ImageLayoutGrid = {
+            colLeft: (col) => colHeaders.getAt(col)?.left ?? 0,
+            colWidth: (col) => colHeaders.getAt(col)?.width ?? DEFAULT_CELL_WIDTH,
+            rowTop: (row) => rowHeaders.getAt(row)?.top ?? 0,
+            rowHeight: (row) => rowHeaders.getAt(row)?.height ?? DEFAULT_CELL_HEIGHT,
+        };
+        const placed = layoutVisibleImages(images, grid, {
+            left: colHeaders.offsetWidth,
+            top: rowHeaders.offsetHeight,
+            width: visibleView.sheetWidth,
+            height: visibleView.sheetHeight,
+        });
+        this.imageLayer.draw(this.ctx, placed, this.data.zoom, window.devicePixelRatio);
+    }
+
+    /**
+     * 排期一次「图片解码完成」的重绘（同一帧内的多次解码回调合并为一次）
+     *
+     * 解码完成时图片还没被画出来，不重绘就要等到用户滚动/点击才突然出现。
+     * 但一批图会先后解码完（每次回调都重绘等于白画十几帧），故用一个标记合并。
+     * `requestAnimationFrame` 不可用时回落 `setTimeout`（Node 测试环境）。
+     * @private
+     */
+    private scheduleImageRedraw(): void {
+        if (this.imageRedrawScheduled) return;
+        this.imageRedrawScheduled = true;
+        const repaint = (): void => {
+            this.imageRedrawScheduled = false;
+            void this.draw();
+        };
+        if (typeof requestAnimationFrame === 'function') requestAnimationFrame(repaint);
+        else setTimeout(repaint, 16);
+    }
+
+    /**
      * 设置筛选组件实例, 如果存在筛选组件实例，先移除旧的实例
+     *
+     * 【性能约定，勿回退为「每帧先问一遍筛选单元格」】
+     * 本方法每帧执行，而「本帧有没有筛选按钮」必须 O(1) 回答：
+     * `getFilterCells()` 内部会 `_ensureCellIndex()`，一旦世代失效
+     * （删除行/列、排序、改名、装载…）就**先重建整份单元格索引**
+     * （遍历全部单元格 + 建 Map + 建合并倒排）才回答「其实一个都没有」。
+     * 于是「表里根本没有筛选按钮」的绝大多数帧，也在为筛选白付一次索引重建。
+     * {@link DataCollection.hasFilterCells} 按世代缓存了「上次数出 0 个」这一结论，
+     * 同一世代内重复询问零成本。
+     *
+     * 【性能约定，勿回退为数组 + find】
+     * 按钮数量为 F 时数组写法是 O(F²)（每个按钮都要 `find` 一遍现有实例与缓存列表）；
+     * 改为按单元格名索引后为 O(F)。
+     * 另外 {@link Filter.setPosition} 内部已做「位置未变则零 DOM 写入」，
+     * 因此稳态帧不会产生强制同步布局。
      */
     private setFilters() {
+        // O(1) 提前退出：本世代确定没有任何筛选按钮时，连索引都不必重建。
+        // 首次调用必然为 true（_filterCellsEpoch 初始为 -1），不会漏掉已有按钮。
+        if (!this.data.hasFilterCells()) {
+            if (this.filters.size > 0) {
+                this.filters.forEach(filter => filter.destroy());
+                this.filters.clear();
+            }
+            return;
+        }
         // 筛选单元格由 DataCollection 随单元格索引一并缓存，避免每帧对整表 filter
         const dataFilters = this.data.getFilterCells();
         if (dataFilters.length === 0) {  // 如果data中没有筛选数据，则销毁组件实例直接返回
-            this.filters.forEach(filter => filter.filter.destroy());
-            this.filters = [];
+            this.filters.forEach(filter => filter.destroy());
+            this.filters.clear();
             return;
         }
         // 反向清理：cell 已被删除（如删除行/列）的 filter 实例需销毁，
-        // 否则按钮 DOM 拖留、停留在旧位置显示
-        this.filters = this.filters.filter(f => {
-            if (!dataFilters.find(c => c.cell === f.cellName)) {
-                f.filter.destroy();
-                return false;
-            }
-            return true;
-        });
+        // 否则按钮 DOM 拖留、停留在旧位置显示。
+        // 用 Set 做成员判定（O(F)），不要再写「对每个实例再遍历一遍筛选数组」
+        // 的数组套数组写法 —— 那是 O(F²)，F 到几十上百时每帧都会白烧 CPU。
+        if (this.filters.size > 0) {
+            const live = new Set<string>();
+            for (let i = 0; i < dataFilters.length; i++) live.add(dataFilters[i].cell);
+            const stale: string[] = [];
+            this.filters.forEach((filter, cellName) => {
+                if (!live.has(cellName)) {
+                    filter.destroy();
+                    stale.push(cellName);
+                }
+            });
+            for (const cellName of stale) this.filters.delete(cellName);
+        }
 
         for (const cell of dataFilters) {
-            const filter = this.filters.find(f => f.cellName === cell.cell);
+            const filter = this.filters.get(cell.cell);
             if (filter) { // 如果存在筛选组件实例，直接设置位置
-                filter.filter.setPosition(cell);
+                filter.setPosition(cell);
                 continue;
             }
             const _filter = new Filter({parentElement: this.parentElement, data: this.data, menu: this.menu});
             _filter.setPosition(cell);
-            this.filters.push({cellName: cell.cell, filter: _filter});
+            this.filters.set(cell.cell, _filter);
         }
     }
     
@@ -159,8 +260,9 @@ export class SheetCanvas extends Canvas {
         this.ctx.strokeStyle = GRID_LINE_COLOR;
 
         // 绘制网格的垂直线条（跳过隐藏列）
+        // 注意 getVisibleCols 返回的是 1-based 列号（含端点），这里的 c 是 0-based 下标
         const { startCol, endCol } = this.data.getVisibleCols();
-        for (let c = startCol - 1; c <= endCol; c++) {
+        for (let c = startCol - 1; c < endCol; c++) {
             if (this.data.colHeaders.getAt(c).isHidden) continue;
             this.setLineWidth(1);  // 使用 CSS 像素，内部自动转换为物理像素
             const x = (this.data.colHeaders.getAt(c).left - this.data.colHeaders.offsetWidth) * this.data.zoom;
@@ -168,8 +270,9 @@ export class SheetCanvas extends Canvas {
         }
         
         // 绘制网格的水平线条（跳过隐藏行）
+        // 注意 getVisibleRows 返回的是 1-based 行号（含端点），这里的 r 是 0-based 下标
         const { startRow, endRow } = this.data.getVisibleRows();
-        for (let r = startRow - 1; r <= endRow; r++) {
+        for (let r = startRow - 1; r < endRow; r++) {
             if (this.data.rowHeaders.getAt(r).isHidden) continue;
             this.setLineWidth(1);  // 使用 CSS 像素，内部自动转换为物理像素
             const y = (this.data.rowHeaders.getAt(r).top - this.data.rowHeaders.offsetHeight) * this.data.zoom;
@@ -217,18 +320,16 @@ export class SheetCanvas extends Canvas {
      * @private
      */
     private getVisibleCellRect(col: number, row: number): { left: number, top: number, width: number, height: number } | null {
-        // 合并展开：命中合并区域时取左上角起点
+        // 合并展开：命中合并区域时取左上角起点。
+        // 走 DataCollection 的合并倒排索引（O(该列合并块数)）—— 历史实现对本函数
+        // 的**每次**调用都要遍历整张表的全部合并块并逐个 split(':') 解析行列号，
+        // 而本函数又被「每个可见单元格 × 三遍绘制」调用，合并块上千时单帧上千万次比较。
         let startCol = col;
         let startRow = row;
-        for (const mergedCell of this.data.getMergedCells()) {
-            const [startCell, endCell] = mergedCell.split(':');
-            const start = this.data.getCellColAndRow(startCell);
-            const end = this.data.getCellColAndRow(endCell);
-            if (col >= start.col && col <= end.col && row >= start.row && row <= end.row) {
-                startCol = start.col;
-                startRow = start.row;
-                break;
-            }
+        const mergeRect = this.data.findMergeRect(col, row);
+        if (mergeRect !== null) {
+            startCol = mergeRect.startCol;
+            startRow = mergeRect.startRow;
         }
 
         // 读取合并跨度
@@ -279,12 +380,15 @@ export class SheetCanvas extends Canvas {
 
     /**
      * 绘制单元格背景颜色
+     * @param {Cell[]} cells - 视口内的单元格（由 draw() 统一计算，避免每遍遍历重复取数）
      */
-    private drawCellBgColor() {
+    private drawCellBgColor(cells: Cell[]) {
         // 视口裁剪：只遍历当前可见的单元格，复杂度 O(可见单元格数)，与表格总规模无关
-        const cells = this.data.getVisibleCells();
         for (let i = 0; i < cells.length; i++) {
             const cell = cells[i];
+            // 无背景色直接跳过：矩形计算（隐藏行列/合并展开）比一次判空贵得多，
+            // 而大表里绝大多数单元格本就没有填充色，先判空能省掉大部分矩形计算
+            if (!cell.backgroundColor) continue;
             const { col, row } = this.data.getCellColAndRow(cell.cell);
             // 隐藏行列不绘制；合并单元格只绘制可见部分
             const rect = this.getVisibleCellRect(col, row);
@@ -293,7 +397,6 @@ export class SheetCanvas extends Canvas {
             const cellTop = (rect.top + 1) * this.data.zoom;
             const cellWidth = (rect.width - 1) * this.data.zoom;
             const cellHeight = (rect.height - 1) * this.data.zoom;
-            if (!cell.backgroundColor) continue;
             this.ctx.save();
             this.ctx.fillStyle = cell.backgroundColor;
             this.fillRect(cellLeft, cellTop, cellWidth, cellHeight);
@@ -303,12 +406,15 @@ export class SheetCanvas extends Canvas {
     
     /**
      * 绘制单元格边框
+     * @param {Cell[]} cells - 视口内的单元格（由 draw() 统一计算）
      */
-    private drawCellBorder() {
+    private drawCellBorder(cells: Cell[]) {
         // 视口裁剪：只遍历当前可见的单元格
-        const cells = this.data.getVisibleCells();
         for (let i = 0; i < cells.length; i++) {
             const cell = cells[i];
+            // 四边都无边框的单元格直接跳过（网格线由 drawGridLines 负责，
+            // 这里画不出任何东西，却会白做一次矩形计算与一次 ctx.save/restore）
+            if (!cell.borderTopWidth && !cell.borderLeftWidth && !cell.borderRightWidth && !cell.borderBottomWidth) continue;
             const { col, row } = this.data.getCellColAndRow(cell.cell);
             // 隐藏行列不绘制；合并单元格边框只沿可见部分绘制
             const rect = this.getVisibleCellRect(col, row);
@@ -426,14 +532,27 @@ export class SheetCanvas extends Canvas {
 
     /**
      * 绘制单元格内容
+     *
+     * 【性能约定，勿回退】
+     * 一帧内每个可见单元格都要走一遍，因此这里刻意做了三件事：
+     * 1. 空文本单元格直接跳过（大表里空格子占多数，省掉一次离屏取用 + 一次合成）；
+     * 2. **不再逐字符 `ctx.save()/restore()`**：只有下划线/删除线才需要临时改
+     *    strokeStyle/lineWidth，用完就地复位即可；
+     * 3. **`font` / `fillStyle` 只在样式真正变化时赋值**：赋值本身会触发浏览器
+     *    重新解析字体串、作废文本度量缓存，是文本绘制里最贵的一次「状态抖动」。
+     *    历史实现每个字符都赋一遍（实测 1500 格视口 = 4214 次/帧）。
+     * @param {Cell[]} cells - 视口内的单元格（由 draw() 统一计算）
      */
-    private drawCellsText() {
+    private drawCellsText(cells: Cell[]) {
         this.ctx.save();
         // 视口裁剪：只遍历当前可见的单元格
-        const cells = this.data.getVisibleCells();
         for (let i=0; i<cells.length; i++) {
             const cellObj = cells[i];
             const cell = cellObj.cell;
+            // 无文本的单元格不产生任何绘制指令，跳过（字符经 chars 数组承载；
+            // 只有样式的单元格 chars 为空/未定义，同样无需走一遍离屏合成）
+            const chars = cellObj.chars;
+            if (!chars || chars.length === 0) continue;
             const { col, row } = this.data.getCellColAndRow(cell);
 
             // 计算考虑隐藏行列后的可见矩形；完全隐藏时跳过绘制
@@ -456,9 +575,16 @@ export class SheetCanvas extends Canvas {
             const lineSpacing = cellObj.lineSpacing || 0;
             offscreenCtx.textAlign = 'left';
             offscreenCtx.textBaseline = 'bottom';
+            // 连续相同样式的字符共享同一次 ctx 状态赋值（见方法注释第 3 条）
+            let lastFontStyle: string | null = null;
+            let lastFontWeight = '';
+            let lastFontSize = -1;
+            let lastFontFamily = '';
+            let lastFillColor = '';
             // 在offscreenCanvas上绘制文本
             let k = 0; // 特殊字符索引
             for (let line of lines) {
+                if (line.text.length === 0) continue;
                 let currentX = line.x;
                 let currentY = line.y + line.lineHeight - lineSpacing;
                 for (let j=0; j < line.text.length; j++) {
@@ -473,40 +599,46 @@ export class SheetCanvas extends Canvas {
                         underline,
                         strikethrough 
                     } = this.calculateCharGeometry(cell, k);
-                    
-                    offscreenCtx.save();
-                    offscreenCtx.fillStyle = `${fontColor}`;
-                    const fontParts = [];
-                    if (fontStyle) fontParts.push(fontStyle);
-                    if (fontWeight) fontParts.push(fontWeight);
-                    fontParts.push(`${Math.round(fontSize * window.devicePixelRatio)}px`);
-                    fontParts.push(fontFamily);
-                    offscreenCtx.font = fontParts.join(' ');
+
+                    if (fontColor !== lastFillColor) {
+                        offscreenCtx.fillStyle = fontColor;
+                        lastFillColor = fontColor;
+                    }
+                    if (fontStyle !== lastFontStyle || fontWeight !== lastFontWeight
+                        || fontSize !== lastFontSize || fontFamily !== lastFontFamily) {
+                        const fontParts = [];
+                        if (fontStyle) fontParts.push(fontStyle);
+                        if (fontWeight) fontParts.push(fontWeight);
+                        fontParts.push(`${Math.round(fontSize * window.devicePixelRatio)}px`);
+                        fontParts.push(fontFamily);
+                        offscreenCtx.font = fontParts.join(' ');
+                        lastFontStyle = fontStyle;
+                        lastFontWeight = fontWeight;
+                        lastFontSize = fontSize;
+                        lastFontFamily = fontFamily;
+                    }
                     offscreenCtx.fillText(char, Math.round(currentX * window.devicePixelRatio), Math.round(currentY * window.devicePixelRatio));
                     
-                    // 绘制下划线
-                    if (underline) {
+                    // 绘制下划线 / 删除线：临时改描边参数，画完就地复位（无需 save/restore）
+                    if (underline || strikethrough) {
                         offscreenCtx.strokeStyle = fontColor;
                         offscreenCtx.lineWidth = Math.max(1, Math.round(fontSize / 10 * window.devicePixelRatio));
-                        const underlineY = Math.round(currentY * window.devicePixelRatio - 1);
-                        offscreenCtx.beginPath();
-                        offscreenCtx.moveTo(Math.round(currentX * window.devicePixelRatio), underlineY);
-                        offscreenCtx.lineTo(Math.round((currentX + charWidth) * window.devicePixelRatio), underlineY);
-                        offscreenCtx.stroke();
+                        if (underline) {
+                            const underlineY = Math.round(currentY * window.devicePixelRatio - 1);
+                            offscreenCtx.beginPath();
+                            offscreenCtx.moveTo(Math.round(currentX * window.devicePixelRatio), underlineY);
+                            offscreenCtx.lineTo(Math.round((currentX + charWidth) * window.devicePixelRatio), underlineY);
+                            offscreenCtx.stroke();
+                        }
+                        if (strikethrough) {
+                            const strikethroughY = Math.round((currentY - fontSize * 0.48) * window.devicePixelRatio);
+                            offscreenCtx.beginPath();
+                            offscreenCtx.moveTo(Math.round(currentX * window.devicePixelRatio), strikethroughY);
+                            offscreenCtx.lineTo(Math.round((currentX + charWidth) * window.devicePixelRatio), strikethroughY);
+                            offscreenCtx.stroke();
+                        }
                     }
                     
-                    // 绘制删除线
-                    if (strikethrough) {
-                        offscreenCtx.strokeStyle = fontColor;
-                        offscreenCtx.lineWidth = Math.max(1, Math.round(fontSize / 10 * window.devicePixelRatio));
-                        const strikethroughY = Math.round((currentY - fontSize * 0.48) * window.devicePixelRatio);
-                        offscreenCtx.beginPath();
-                        offscreenCtx.moveTo(Math.round(currentX * window.devicePixelRatio), strikethroughY);
-                        offscreenCtx.lineTo(Math.round((currentX + charWidth) * window.devicePixelRatio), strikethroughY);
-                        offscreenCtx.stroke();
-                    }
-                    
-                    offscreenCtx.restore();
                     k += 1;
                     currentX += charWidth + (j < line.text.length - 1 ? letterSpacing : 0);
                 }
@@ -527,14 +659,21 @@ export class SheetCanvas extends Canvas {
      * 绘制所有合并单元格背景
      *
      * 隐藏行列不绘制；合并单元格跨越隐藏列/行时只绘制可见部分。
+     *
+     * 【性能约定，勿回退】只处理与视口相交的合并区域（走列倒排索引），
+     * 不要再对「全表所有合并块」逐个调用矩形计算 —— 那会退化成 O(合并数²)，
+     * 实测 8000 处合并时单帧 3.8 秒。
+     * @param {number} startCol - 视口起始列号（1-based）
+     * @param {number} endCol - 视口结束列号（1-based）
+     * @param {number} startRow - 视口起始行号（1-based）
+     * @param {number} endRow - 视口结束行号（1-based）
      */
-    public drawAllMergedCellBackground() {
-        const MergedCells = this.data.getMergedCells();
+    public drawAllMergedCellBackground(startCol: number, endCol: number, startRow: number, endRow: number) {
+        const MergedCells = this.data.getVisibleMergeRects(startCol, endCol, startRow, endRow);
         for (const mergedCell of MergedCells) {
-            const [ startCell ] = mergedCell.split(':');  // 获取左上角单元格地址
-            const { col, row } = this.data.getCellColAndRow(startCell);
+            const startCell = mergedCell.anchor;  // 获取左上角单元格地址
             // 隐藏行列不绘制；跨隐藏列/行时只取可见部分
-            const rect = this.getVisibleCellRect(col, row);
+            const rect = this.getVisibleCellRect(mergedCell.startCol, mergedCell.startRow);
             if (!rect) continue;
             // 绘制合并单元格背景
             this.ctx.save();

@@ -260,13 +260,26 @@ export class BiffParser {
     public workbook: BiffWorkbook;
     /** SST 记录头偏移（供第一轮扫描定位 CONTINUE 链） */
     private sstHeaderPos: number = -1;
+    /**
+     * 是否解析内嵌图片（Escher BLIP）
+     *
+     * 默认 false：`xl`/`xls` 的图片读取在本项目里没有消费方（见
+     * `SheetParserOptions.readImages`），而 .xls 的图片字节是逐张
+     * **复制**出来的（{@link parseBlip} 里的 `new Uint8Array(...)`）。
+     * 一个含上千张图的 .xls 会白复制上百 MB 字节并常驻内存 —— 打开即卡死。
+     * 只有调用方显式要求时才置 true。
+     */
+    private readImages: boolean = false;
 
     /**
      * @param {Uint8Array} data - Workbook 流的完整字节数据
+     * @param {object} [options] - 解析选项
+     * @param {boolean} [options.readImages=false] - 是否解析内嵌图片（默认 false，见 {@link readImages}）
      */
-    constructor(data: Uint8Array) {
+    constructor(data: Uint8Array, options: { readImages?: boolean } = {}) {
         this.data = data;
         this.view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        this.readImages = options.readImages === true;
         this.workbook = {
             sheets: [],
             fonts: [],
@@ -1152,7 +1165,10 @@ export class BiffParser {
                 }
 
                 case REC.drawing: {
-                    // Escher 绘制对象，提取内嵌图片
+                    // Escher 绘制对象，提取内嵌图片。
+                    // 未请求图片时**整段跳过**：BLIP 解析会把每张图的字节复制一份
+                    // （见 parseBlip），含上千张图的 .xls 会凭空白拷上百 MB。
+                    if (!this.readImages) break;
                     const sheetImages = this.parseDrawing(dataStart, length);
                     for (const img of sheetImages) {
                         images.push(img);

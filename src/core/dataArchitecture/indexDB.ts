@@ -1,7 +1,7 @@
 /**
  * IndexDB 数据库操作类
  * 使用浏览器原生 IndexDB API 实现数据持久化存储
- * 支持 2 种对象存储：settings, values
+ * 支持 3 种对象存储：settings, values, images
  * 
  * @class IndexDB
  * @example
@@ -17,12 +17,17 @@
  * // values: 工作表值存储 (sheetName, value)
  * await db.setValue('Sheet1', JSON.stringify(data));
  * const sheetData = await db.getValue('Sheet1');
+ * 
+ * // images: 工作表图片存储 (sheetName, images)，结构化克隆直存 Uint8Array
+ * await db.setImages('Sheet1', images);
+ * const images = await db.getImages('Sheet1');
  */
 
 /** 对象存储名称常量 */
 const STORE_NAMES = {
     SETTINGS: 'settings',
     VALUES: 'values',
+    IMAGES: 'images',
 } as const;
 
 /** 对象存储名称类型 */
@@ -32,6 +37,7 @@ export type StoreName = typeof STORE_NAMES[keyof typeof STORE_NAMES];
 const OBJECT_STORE_CONFIG: Record<StoreName, IDBObjectStoreParameters> = {
     [STORE_NAMES.SETTINGS]: { keyPath: 'key', autoIncrement: false },
     [STORE_NAMES.VALUES]: { keyPath: 'sheetName', autoIncrement: false },
+    [STORE_NAMES.IMAGES]: { keyPath: 'sheetName', autoIncrement: false },
 };
 
 /** 对象存储索引配置 */
@@ -41,6 +47,9 @@ const OBJECT_STORE_INDEXES: Record<StoreName, Array<{ name: string; keyPath: str
         { name: 'key', keyPath: 'key', unique: true },
     ],
     [STORE_NAMES.VALUES]: [
+        { name: 'sheetName', keyPath: 'sheetName', unique: true },
+    ],
+    [STORE_NAMES.IMAGES]: [
         { name: 'sheetName', keyPath: 'sheetName', unique: true },
     ],
 };
@@ -59,8 +68,26 @@ export interface SettingRecord {
 export interface ValueRecord {
     /** 工作表名称 */
     sheetName: string;
-    /** 工作表值（JSON字符串） */
-    value: string;
+    /**
+     * 工作表存档
+     *
+     * v4 起是**结构化克隆对象**（`SheetSnapshotV4`，含分片 JSON 文本与稀疏行列头）；
+     * v3 及更早是 JSON 字符串。读取侧必须两态兼容（见 `DataCollection.fromSnapshotChunked`）。
+     */
+    value: unknown;
+}
+
+/**
+ * Images 存储记录接口
+ *
+ * 图片是二进制大块，塞进 `values` 的 JSON 字符串里要过一遍 base64（体积 +33% 且
+ * 多一次全量字符串拼接），故单独一个对象存储按工作表名归档，走结构化克隆直存。
+ */
+export interface ImageRecord {
+    /** 工作表名称（与 values 库同键） */
+    sheetName: string;
+    /** 图片数组（`ExtractedImage[]`；以结构化克隆落库，Uint8Array 原样保留） */
+    images: unknown[];
 }
 
 export class IndexDB {
@@ -68,8 +95,13 @@ export class IndexDB {
     private db: IDBDatabase | null = null;
     /** 数据库名称 */
     private readonly DB_NAME: string = 'silkspaces';
-    /** 数据库版本号 */
-    private readonly DB_VERSION: number = 1;
+    /**
+     * 数据库版本号
+     *
+     * v2 起新增 `images` 对象存储（图片与单元格值分开存，见 {@link ImageRecord}）。
+     * `onupgradeneeded` 里的建表逻辑是「缺哪个建哪个」，因此升级不会被旧库结构卡住。
+     */
+    private readonly DB_VERSION: number = 2;
     /** 是否已初始化 */
     private initialized: boolean = false;
 
@@ -122,6 +154,7 @@ export class IndexDB {
         const storeNames: StoreName[] = [
             STORE_NAMES.SETTINGS,
             STORE_NAMES.VALUES,
+            STORE_NAMES.IMAGES,
         ];
 
         storeNames.forEach(storeName => {
@@ -266,12 +299,16 @@ export class IndexDB {
     // ==================== Values 相关方法 ====================
 
     /**
-     * 设置工作表值（如果已存在则更新）
+     * 设置工作表存档（如果已存在则更新）
+     *
+     * 走结构化克隆：v4 存档对象（含 `string[]` 分片与 typed array 行列头）直存，
+     * **不要再 JSON.stringify**（那是 v3 的老形态，装载时必然要一次不可分片的
+     * 整份 `JSON.parse`）。
      * @param {string} sheetName - 工作表名称
-     * @param {string} value - 工作表值（JSON字符串）
+     * @param {unknown} value - 工作表存档（`SheetSnapshotV4` 对象，或历史 JSON 字符串）
      * @returns {Promise<void>} 操作成功的 Promise
      */
-    public async setValue(sheetName: string, value: string): Promise<void> {
+    public async setValue(sheetName: string, value: unknown): Promise<void> {
         await this.ensureInitialized();
         const transaction = this.getTransaction('readwrite', STORE_NAMES.VALUES);
         const store = this.getObjectStore(transaction, STORE_NAMES.VALUES);
@@ -280,11 +317,11 @@ export class IndexDB {
     }
 
     /**
-     * 获取工作表值
+     * 获取工作表存档
      * @param {string} sheetName - 工作表名称
-     * @returns {Promise<string>} 工作表值或 '{}'
+     * @returns {Promise<unknown>} 存档值（v4 对象 / 历史 JSON 字符串）；无记录时返回 `'{}'`
      */
-    public async getValue(sheetName: string): Promise<string> {
+    public async getValue(sheetName: string): Promise<unknown> {
         await this.ensureInitialized();
         const transaction = this.getTransaction('readonly', STORE_NAMES.VALUES);
         const store = this.getObjectStore(transaction, STORE_NAMES.VALUES);
@@ -318,6 +355,79 @@ export class IndexDB {
         return this.wrapRequest<ValueRecord[]>(store.getAll());
     }
 
+    // ==================== Images 相关方法 ====================
+
+    /**
+     * 写入某工作表的图片（已存在则整条替换）
+     *
+     * 走结构化克隆：`Uint8Array` 原样落库，无需 base64，也不产生中间字符串。
+     * @param {string} sheetName - 工作表名称（与 values 库同键）
+     * @param {unknown[]} images - 图片数组（`ExtractedImage[]`）
+     * @returns {Promise<void>} 操作成功的 Promise
+     */
+    public async setImages(sheetName: string, images: unknown[]): Promise<void> {
+        await this.ensureInitialized();
+        const transaction = this.getTransaction('readwrite', STORE_NAMES.IMAGES);
+        const store = this.getObjectStore(transaction, STORE_NAMES.IMAGES);
+
+        return this.wrapRequest<void>(store.put({ sheetName, images }));
+    }
+
+    /**
+     * 读取某工作表的图片
+     * @param {string} sheetName - 工作表名称
+     * @returns {Promise<unknown[]>} 图片数组；无记录时为**空数组**（调用方无需再判 undefined）
+     */
+    public async getImages(sheetName: string): Promise<unknown[]> {
+        await this.ensureInitialized();
+        const transaction = this.getTransaction('readonly', STORE_NAMES.IMAGES);
+        const store = this.getObjectStore(transaction, STORE_NAMES.IMAGES);
+
+        const result = await this.wrapRequest<ImageRecord | undefined>(store.get(sheetName));
+        return result && Array.isArray(result.images) ? result.images : [];
+    }
+
+    /**
+     * 删除某工作表的图片
+     * @param {string} sheetName - 工作表名称
+     * @returns {Promise<void>} 操作成功的 Promise
+     */
+    public async deleteImages(sheetName: string): Promise<void> {
+        await this.ensureInitialized();
+        const transaction = this.getTransaction('readwrite', STORE_NAMES.IMAGES);
+        const store = this.getObjectStore(transaction, STORE_NAMES.IMAGES);
+
+        return this.wrapRequest<void>(store.delete(sheetName));
+    }
+
+    /**
+     * 获取所有图片记录
+     * @returns {Promise<ImageRecord[]>} 全部图片记录（含二进制，慎用于启动路径）
+     */
+    public async getAllImages(): Promise<ImageRecord[]> {
+        await this.ensureInitialized();
+        const transaction = this.getTransaction('readonly', STORE_NAMES.IMAGES);
+        const store = this.getObjectStore(transaction, STORE_NAMES.IMAGES);
+
+        return this.wrapRequest<ImageRecord[]>(store.getAll());
+    }
+
+    /**
+     * 获取所有图片记录的键（工作表名）
+     *
+     * 只取键不取值：启动对账只需要知道「哪些名字有图片记录」，
+     * 用 `getAllImages()` 会把全部图片二进制读进内存（可能上百 MB）。
+     * @returns {Promise<string[]>} 工作表名数组
+     */
+    public async getAllImageKeys(): Promise<string[]> {
+        await this.ensureInitialized();
+        const transaction = this.getTransaction('readonly', STORE_NAMES.IMAGES);
+        const store = this.getObjectStore(transaction, STORE_NAMES.IMAGES);
+
+        const keys = await this.wrapRequest<IDBValidKey[]>(store.getAllKeys());
+        return keys.map((key) => String(key));
+    }
+
     // ==================== 通用方法 ====================
 
     /**
@@ -341,6 +451,7 @@ export class IndexDB {
         const storeNames: StoreName[] = [
             STORE_NAMES.SETTINGS,
             STORE_NAMES.VALUES,
+            STORE_NAMES.IMAGES,
         ];
 
         for (const storeName of storeNames) {
