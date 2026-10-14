@@ -1215,6 +1215,362 @@ containerPathOf(view) = 把节点当目录用（供「粘贴/拖到该目录下�
 
 ---
 
+### 12.10 第十轮：打开 .xls 整表中文乱码 —— 4 类字节级根因
+
+本轮要求（用户原话）：
+> 请解决打开 xls 文件是乱码的问题，请使用 test 目录下的 xls 文件进行测试。
+
+#### 症状
+
+打开 `test/test_sample.xls`（BIFF8 / OLE2，单表「测试表」）后，**所有中文字符串变成
+`\u0000\u0007…` 之类控制字符**，数值全部变成 `1e-315` 量级的非规格化垃圾值。
+
+#### 根因（4 个独立缺陷，缺一不可）
+
+**① `parseSst` 的数据区结束偏移少 4 字节（尾部被截断）**
+
+```ts
+// ❌ 旧：length 是**数据区**长度，不含 4 字节记录头
+const end = pos + length;
+// ✅ 新：必须由数据区起点推出
+const start = pos + 4;
+const end = start + length;
+```
+
+实测 `pos=14975, length=57`：正确数据区是 `[14979, 15036)`，旧写法得 `15032` —— **尾部 4 字节丢失**。
+
+**② `readSstString` 无条件读取 `cRun` / `cbExtRst`（字符串整体错位）**
+
+旧代码写成 `if (isUnicode) { cRun = readBytes(2); … cbExtRst = readBytes(4); … }`。
+但这两个字段**只在 grbit 对应标志置位时才存在**：
+
+| grbit 位 | 含义 | 条件字段 |
+|---|---|---|
+| bit0 `0x01` | fHighByte：1=UTF-16LE，0=压缩单字节 | — |
+| bit2 `0x04` | fExtSt：有 phonetic 扩展 | `cbExtRst`(i32) |
+| bit3 `0x08` | fRichSt：有富文本运行 | `cRun`(u16) |
+
+夹具首个字符串 `cch=2, grbit=0x01`，字节流是 `02 00 01 | d3 59 0d 54 …`；
+旧代码把 `d3 59`（汉字「姓」）当成了 `cRun=22995`，于是**每个字符串都错位**。
+
+**③ 跨 CONTINUE 用「逐字节拼接」（段边界把记录头当数据）**
+
+BIFF 规范明文：**`cch`(u16) 与 `grbit`(u8) 永不被拆分到两个记录**；
+只有**字符数据**允许跨段，且**跨段后段首必须重读一个新的 grbit**（编码可能切换）。
+旧实现用「`curPos >= end` 就切段」的逐字节推进，段边界会把 CONTINUE 记录头 `3C 00 …` 当数据读，
+且从不重读 grbit。新实现改为「段内快照读 + 只有字符数据可跨段 + 跨段重读 grbit」。
+
+**④ `decodeRK` 把 30 位写进了 double 的低 4 字节（字节序反了）**
+
+```ts
+// ❌ 旧：写低 4 字节 → 得到 denormal 垃圾
+dv.setUint32(0, rk & 0xFFFFFFFC, true); dv.setUint32(4, 0, true);
+// ✅ 新：RK 的 30 位是 double 的**高** 4 字节，低 4 字节补 0
+dv.setUint32(0, 0, true); dv.setUint32(4, rk & 0xFFFFFFFC, true);
+```
+
+实测 `rk=0x403c0000` 旧解 = `5.32441693e-315`，正确 = `28`。修复后 6 个数值全部正确：
+28 / 92.5 / 34 / 78.25 / 25 / 85。
+
+#### 附带修复
+
+| 项 | 问题 | 修法 |
+|---|---|---|
+| `MULBLANK`(0x00BE) | 尾部另有 2 字节 `lastCol` 未扣除 → 多造空单元格 | 样式项数 = `(length - 6) / 2` |
+| `MERGEDCELLS`(0x00E5) | 逆序区域未规范化 → 渲染端得负宽高矩形 | 交换逆序的 r/c；丢弃零面积区域 |
+
+#### 守卫（`test/test-biff.js` 69 → **83/83**）
+
+| 节 | 覆盖 |
+|---|---|
+| `[2]` SST | 7 个中文串逐个精确匹配 + **无 C0 控制字符**守卫 |
+| `[3]` 数值 | 7 项 `close()` + **无 1e-315 量级破损值**守卫 |
+| `[5]` MULBLANK | `R7 空单元格 3 个（1+2，不是 4）` |
+| `[6]` MERGEDCELLS | 合并[1] 左上 = `(1,3)`（原字节行序反，已规范化） |
+| `[9]` 端到端 | `SheetParser.decode → extract` 14 项，含**端到端无乱码字符串**守卫 |
+| `[10]` **跨 CONTINUE**（新增） | 内存合成 4 种跨段形态：UTF-16 长串跨 5 段 / **UTF-16→压缩 8 位**中途切换 / 压缩 8 位长串跨段 / **压缩 8 位→UTF-16** 中途切换；另加「无控制字符」「拼接后 502 字全等」两条守卫 |
+
+> ⚠️ **合成夹具本身也必须合规，否则会冤枉解析器**。本轮在造夹具时踩了三次坑：
+> ① 盲目按字节切分，把 `cch`/`grbit` 切到两个记录里；② 切片阶段与装配阶段**各写一次** grbit，
+> 段首出现两个 grbit 字节；③ 续段 grbit 写死 `1`，导致压缩 8 位字符串在续段被误判成 UTF-16。
+> 现约定：**切片阶段只写 cch/grbit/字符数据，「续段 grbit」一律由装配阶段注入，
+> 且注入值必须等于该字符串当前的编码位**。
+
+#### 顺带修正的陈旧测试（非本轮引入）
+
+| 测试 | 问题 | 修法 |
+|---|---|---|
+| `test-sheetparser.js` 31/36 → **49/49** | ① 硬编码 `values 共 16 个 / colHeaders 共 4 个 / rowHeaders 共 4 个`，与夹具实际（40/5/18）不符；② 断言 `readStyles:false` 与开样式时**格数相同**，但关掉样式后空白格（MULBLANK）本就不输出（40 → 28，语义正确）；③ 夹具路径 `ROOT/test_style.xlsx` 在仓库根目录不存在 | ① 期望值对齐夹具；② 改为断言「仍可解析 + 表头形状不变 + 文本仍正确」；③ 夹具按「根目录 `test_style.xlsx` → `test/test_sample.xlsx`」逐级回退，现在真的跑到了 xlsx 解包路径（解出 11 个条目） |
+| `test-zip.js` exit=1 → **0** | 同样找 `../test_style.xlsx`，缺失即崩 | 同样的回退链；确实没有时打印「跳过」并 `exit 0` |
+| `test-cfb.js` exit=1 → **0** | `require('xlsx-js-style')` 未安装即崩（该库只是交叉验证用的可选项） | `try/catch` 包住，未安装则打印「跳过」 |
+
+#### 全量校验结果
+
+```
+23 个测试文件，全部 exit=0
+  test-biff.js           通过 83 / 83      ← 本轮 69 → 83
+  test-sheetparser.js    通过 49 / 49      ← 31/36 → 49/49
+  test-xlsx-parse.js     通过 99 / 99
+  test-file-switch.js    通过 154 / 154
+  test-zip.js / test-cfb.js               exit=0
+  …（其余略）
+npx tsc --noEmit 干净；npm run build 成功（main.de680bfd.js + parser.worker.js 338 KiB）
+端到端确认：A1="姓名" B1="年龄" C1="分数" D1="日期" A2="张三" B2="28" C2="92.5"
+            ✓ 全部文本正常，无乱码
+```
+
+---
+
+### 12.11 第十二轮：.xls 样式解析不准（合并/边框/底色/文字色/字号）—— XF 字节布局 + 内置调色板
+
+> **现象**：`.xls` 打开后文字不乱码了，但**合并单元格、边框、底色、文字颜色、字号**普遍不对
+> （黄色底色的区域没底色、居中变左对齐、下划线丢失、颜色整体串色）。
+> **归因**：三处独立的字节级错误 —— ① XF(0x00E0) 的字段偏移量几乎全错；② 内置调色板表项错位；
+> ③ FONT(0x0031) 把「冗余位」当权威位读。全部有 `test-biff.js` [11]/[12] 节守卫（129/129）。
+
+#### 根因一：XF 记录（0x00E0）权威 20 字节布局被整段读错
+
+`BiffXf` 的解析偏移量几乎全错，导致**边框线型、四边边框色、填充图案、填充色全部取错**：
+
+| 字段 | 历史实现（错） | 权威布局（对） |
+|---|---|---|
+| 边框线型 | `data[offset+10]` 只读 1 字节，按「3 位一组、上/下/左/右」解 | `getUint32(offset+10)`，**4 位一组，顺序左/右/上/下**：bit3-0 左边框线型、bit7-4 右、bit11-8 上、bit15-12 下 |
+| 上/下边框色 | `getUint16(offset+11) & 0x3F` 等 | 上在 `getUint32(offset+14)` 的 bit6-0；下在 bit13-7 |
+| 左/右边框色 | 同上（与上/下混在一起） | 左在 `getUint32(offset+10)` 的 bit22-16；右在 bit29-23 |
+| 填充图案 | `getUint16(offset+12) & 0x3F` | `getUint32(offset+14)` 的 bit31-26 |
+| 填充前景色 | `getUint16(offset+14) & 0x3F` | `getUint16(offset+18)` 的 bit6-0 |
+| 填充背景色 | **写死 65** | `getUint16(offset+18)` 的 bit13-7 |
+| 垂直对齐 | `(alignByte >> 3) & 0x01`（只取 1 位） | `(alignByte >>> 4) & 0x07`（**bit6-4 三位**） |
+| `isStyle` | `(flags & 0xFFF0) === 0 \|\| ...` 恒真/无意义表达式 | `(typeProt & 0x0004) !== 0`（bit2） |
+
+> ⚠️ 两个最容易搞错的点：**线型的边顺序是「左/右/上/下」而非「上/下/左/右」**；
+> **四边颜色分散在两个 `u32`**（左/右在 `@10` 高位、上/下在 `@14` 低位），不能共用一个颜色。
+
+#### 根因二：内置调色板（无 PALETTE 记录时的兜底）整体错位
+
+夹具 `test_sample.xls` **没有 PALETTE 记录**（独立 Python 解包确认为 0 项），必须走 BIFF8 内置表。
+历史实现只列了 **64 项、从下标 0 平铺**，而规范是：
+
+| 索引 | 含义 |
+|---|---|
+| 0–7 | 保留 |
+| 8–63 | 系统色（8=黑 9=白 10=红 11=绿 12=蓝 13=黄 14=品红 15=青…） |
+| 64 / 65 | 系统前景（黑）/ 系统背景（白） |
+| 66–121 | 标准 56 色（与 8–63 同组） |
+
+**共 122 项**。历史把「标准 56 色」整体前移到 8–63 → **所有颜色索引取到的都是错的颜色**。
+另修正 `parsePalette` 的误导注释：PALETTE 记录每项 4 字节，顺序是 **R, G, B, 0x00（红在前）**，不是 BGR。
+
+#### 根因三：FONT 记录把「冗余位」当权威
+
+| 字段 | 历史（错） | 权威（对） |
+|---|---|---|
+| `underline` | `flags & 0x0004`（规范明确这是**冗余位**，读取时不应使用） | 读偏移 **10** 的 underline type（0 无 / 1 单 / 2 双 / 0x21 单会计 / 0x22 双会计） |
+| 上标/下标 | `flags` bit4/bit5（那是**轮廓/阴影**） | 读偏移 **8** 的 escapement（1 上标 / 2 下标） |
+| 自动色 | 未处理 `0x7FFF` | 颜色索引 `0x7FFF` → 归一为 0 |
+
+#### 根因四：`sheetParser` 的 XF → CellStyle 映射（下游对齐）
+
+即使 XF 读对了，映射层还有四处错：
+
+- **边框四边共用一个颜色** → 改为**每边各自取色**（`borderColorTop/Bottom/Left/Right`）。
+- **垂直对齐映射表**只有 `{0:'bottom', 1:'middle'}` → 修正为 `{0:'top',1:'middle',2:'bottom',3:'bottom',4:'middle'}`
+  （⚠️ **BIFF8 的 0 是 top**，历史当成 bottom，且完全漏了 2/3/4）。
+- **水平对齐**把 `2` 当 `'left'`、`7` 当 `'center'` → 修正为 `{0:'left',1:'left',2:'center',3:'right',4:'justify',5:'justify',6:'center',7:'justify'}`
+  （`distributed(7)`/`fill(4)` 就近归一到项目支持的 `justify`）。
+- **solid 填充取前景色**（`fillColorIndex`）而非背景色；`BIFF_BORDER_STYLES` 只有 8 项（缺 BIFF8 的 8–13 号线型）→ 补齐至 14 项。
+- `paletteColor` 把索引 `1–7`（保留值）也当有效色 → 改为 `index <= 7` 一律返回 `undefined`。
+
+#### 测试守卫（`test-biff.js` 由 83 → **129** 项）
+
+- `[11]` 样式解析：调色板长度/关键索引（8/9/10/13/64/65/66/121）、XF[64]（`isStyle=false`、`hAlign=2`、
+  `fillPattern=1`、`fillColorIndex=13`、`fillBackgroundIndex=64`、四边线型全 0）、XF[15]（无边框无填充）、
+  XF[0]/[16]/[63]、FONT[9]（宋体/18pt/粗体/色 54）、FONT[6]（下划线/色 12）、FONT[1]（自动色归一）、FONT[10]（斜体）。
+- `[12]` 端到端：R7C1 底色 `#FFFF00`、水平 `center`、垂直 `top`；R0C0 无填充无边框。
+- **真值来源**：独立 Python 脚本（`struct` 手工解包）建立基准，与本项目解析器逐字段对照。
+- **反证已做**：故意把填充取色改回 `bg || fg` → `R7C1 底色` FAIL；故意把垂直映射改回历史版 → `垂直对齐 = top` FAIL。
+
+#### 全量校验结果
+
+```
+23 个测试文件，全部 exit=0
+  test-biff.js           通过 129 / 129     ← 本轮 83 → 129
+npx tsc --noEmit 干净；npm run build 成功
+```
+
+---
+
+### 12.12 第十三轮：同名不同后缀的文件（`报表.xlsx` / `报表.docx`）—— 显示 + 重名检测 + 存档键
+
+> **现象**：树里已有 `报表.xlsx`，再打开同名的 `报表.docx` 时，**新文件不进树**
+> （被当成「已存在的同名文件」复用了 `.xlsx` 节点）；且重名检测只看基名、忽略后缀。
+> **要求**：同名不同后缀必须各自显示在树中；重名检测要带上后缀。
+
+#### 根因一：`findByName` 把「去扩展名一致」与「名称一致」混在同一档
+
+`findByName`（树内万能查找，供 `hasFile` / `openActivedFile` / `locate` / 高亮复用）原本写成：
+
+```ts
+if (view.key === key || stripExtension(view.key) === bare) byName.push(view);
+```
+
+于是查找 `报表.docx` 时，`报表.xlsx` 的 `stripExtension(view.key) === '报表'` 也命中，
+`showActivedFile('报表.docx')` 便复用了 `.xlsx` 节点 → **新文件永远进不了树**。
+
+**修法**：把「去扩展名」档限定为**仅当查询名本身没有扩展名时**才启用 —— 它存在的唯一意义
+是让「工作表名（`销售数据`）」这类无后缀键能定位到「显示文件名（`销售数据.xlsx`）」，
+不该让两个都带后缀的名字互相串台：
+
+```ts
+const queryHasExt = extractExtension(key) !== '';
+if (view.key === key) byName.push(view);
+if (!queryHasExt && stripExtension(path) === bare) fallback.push(view);
+```
+
+`hasFile('报表')`（无后缀）仍能命中 → 工作表名定位不受影响；`hasFile('报表.docx')` 只命中 `.docx`。
+
+#### 根因二：`toSheetKey` 去扩展名 → 同名不同后缀共用一份存档
+
+内容存档键 `toSheetKey(path) = stripExtension(path)`，`报表.xlsx` 与 `报表.docx` 都得到 `报表`
+→ **共用同一份 `values` / `images` 存档、互相覆盖**。
+
+**修法（零迁移）**：默认仍用去扩展名的键；**仅当树中确实存在「同目录 + 同基名 + 不同后缀」的冲突**时，
+该路径才改取**带后缀的完整路径**作键。判定由新增的 `FileTree.hasExtensionConflict(path)` 提供：
+
+```ts
+private toSheetKey(path: string): string {
+    const text = (path ?? '').trim();
+    if (!text) return '';
+    if (this.fileTree?.hasExtensionConflict?.(text)) return text;   // 冲突 → 带后缀
+    return stripExtension(text);                                    // 默认 → 去后缀（历史键）
+}
+```
+
+- 存量数据**零迁移**：`sheet1.xlsx`、`归档/销售数据.xlsx` 等无冲突路径的键与历史完全一致。
+- 只有当用户真的建了 `报表.xlsx` + `报表.docx` 时才启用带后缀键，语义直观且自动。
+- `hasExtensionConflict` 只比较**同目录**（不同目录的同名文件本就由目录区分），并排除自身。
+
+#### 重名检测本来就含后缀（本轮复核确认）
+
+`availableFileName` / `uniqueName` / 重命名冲突校验都基于**完整名（含扩展名）**的 `view.key`，
+因此 `报表.docx` 不会被 `报表.xlsx` 挤到 `报表1.docx`；只有**同后缀**才触发去重（`报表.xlsx` → `报表1.xlsx`）。
+本轮补了 `hasExtensionConflict` 的单元测试与「同名不同后缀是两个独立文件」的端到端断言以防回退。
+
+#### 测试守卫（`test-filetree.js` 117 → **134**，`test-file-switch.js` 154 → **159**）
+
+- `test-filetree.js` [16] 节：同名不同后缀两个独立节点且各自保留完整名、同后缀才去重、
+  `showActivedFile` 不串台、`hasFile` 精确命中不同后缀、`hasExtensionConflict` 四类边界
+  （跨后缀 true / 单文件 false / 不同目录 false / 同后缀去重后 false）、`locate` 各自高亮正确节点。
+- `test-file-switch.js`：新增 `hasExtensionConflict` 存在性 + `findByName` 不再无条件去扩展名（含反例守卫）。
+- **反证已做**：把 `findByName` 改回无条件 `stripExtension(view.key) === bare` → 「两个文件同时在树中」FAIL；
+  把 `hasExtensionConflict` 屏蔽 → 「跨后缀冲突 → true」FAIL。
+
+#### 顺带对齐夹具（`test_sample.xls` 被更新为 20992 字节）
+
+夹具在本轮被替换（新增 `XF[65]` = 居中 + solid 黄底、`XF[66]` = 字体 5，总计 67 个 XF / 55 格 / 3 处合并 /
+8 列表头）。用独立 Python 重新解包确认**解析器输出与真值逐字段一致**，仅测试里的硬编码期望过期 →
+已对齐：`test-biff.js`（XF 数量 66→67、合并 2→3、范围 maxCol 4→7、格数 40→55、样式断言改用 XF[64]/[65]/[66]）
+与 `test-sheetparser.js`（values 40→55、colHeaders 5→8）。
+
+#### 全量校验结果
+
+```
+23 个测试文件，全部 exit=0
+  test-biff.js           通过 138 / 138
+  test-filetree.js       通过 134 / 134
+  test-file-switch.js    通过 159 / 159
+  test-sheetparser.js    通过 49 / 49
+npx tsc --noEmit 干净；npm run build 成功
+```
+
+---
+
+### 12.13 第十四轮：切换/删除同名不同后缀文件的崩溃与回退失败
+
+**用户报告**：
+1. 树里有两个同名不同后缀的文件（`报表.xlsx` / `报表.docx`），打开其中一个后双击另一个 →
+   `TypeError: Cannot read properties of undefined (reading 'isHidden')`
+   （`rowHeaderCanvas.draw`）。
+2. 删除其中一个同名不同后缀的文件时，**无法回退**到另一个。
+
+#### 根因 ①：清空内容时未归零滚动偏移（崩溃）
+
+`_clearSheetContent()`（打开**尚无存档**的新文件时走这条路）重置了 `values`，却没有重置
+`rowHeaders.offsetHeight` / `colHeaders.offsetWidth`。上一个文件若滚动到很深的行，新（空）
+文件的行头数组被重算为很短，而滚动偏移仍是旧值 → `getVisibleRows()` 据此探到**越界行** →
+行头画布 `getAt(r)` 读出 `undefined` → 读 `.isHidden` 抛错。
+
+对比：`_applyLoadedState()`（打开**已有存档**的文件）本来就有归零，所以只有「打开没有存档的
+同名不同后缀文件」才必崩。
+
+**修法（两处）**：
+- 根因：`_clearSheetContent` 里把 `rowHeaders.offsetHeight` / `colHeaders.offsetWidth` 一并归零；
+- 兜底：`rowHeaderCanvas.draw` 的绘制循环 `getAt(r)` 取一次存进 `header`，越界（`undefined`）
+  即 `continue`（同一处顺手去掉循环内多次 `getAt` 的重复取值）。
+
+#### 根因 ②：存档键依赖「树里当前有没有冲突」→ 键不稳定（回退失败）
+
+第十三轮把存档键做成「默认去扩展名，**仅当树里存在同基名不同后缀冲突时**才保留后缀」。
+这条规则**不是时间的纯函数**：删掉同名的兄弟文件后冲突消失，另一个文件的键**当场漂移**
+（`报表.xlsx` → `报表`）。而 `FileTree.removeNodes` 的时序是**先把节点从树上摘掉、再调
+`content.remove(paths)`**，于是 app 侧算键时看到的树状态已经变了：
+
+- 打开 `报表.docx` 时 `activedSheetName = 报表.docx`（有冲突，保留后缀）；
+- 删除时 `toSheetKey('报表.docx')` 在「兄弟已摘除」的树上算出 `报表` →
+  `removingActived = keys.includes('报表.docx')` 判断失真；
+- 即使挑到了回退目标 `报表.xlsx`，`toSheetKey('报表.xlsx')` 此刻也算成 `报表`，
+  而该文件的存档实际存在 `报表.xlsx` 键上 → **回退后是空表 / 删不掉**。
+
+**修法：存档键改成路径的纯函数** —— `utils/fileName.ts` 新增 `toArchiveKey(path)`：
+**只去掉应用原生表格后缀 `.xlsx`，其它后缀一律保留**。
+
+| 路径 | 存档键 | 说明 |
+|---|---|---|
+| `sheet1.xlsx` | `sheet1` | 与历史存档键完全一致 → **存量零迁移** |
+| `归档/销售数据.xlsx` | `归档/销售数据` | 带目录，不同目录同名文件各自独立 |
+| `报表.xlsx` | `报表` | 原生格式，沿用历史键 |
+| `报表.docx` | `报表.docx` | 保留后缀 → 与 `报表` 互不干扰 |
+| `报表` | `报表` | 无后缀原样 |
+
+不再需要「按树状态判断冲突」，因此删掉了 `FileTree.hasExtensionConflict`。
+`toArchiveKey` 幂等，且被 `findByName` 的第三档（无后缀查询 → 路径去扩展名）继续兼容。
+
+配套：
+- `App.toSheetKey` 改为委托 `toArchiveKey`（仍是唯一换算入口）；
+- **`fileOpener.applyDocument` 修正**：它原先自行 `stripExtension(fileName)` 设置
+  `activedSheetName`，**绕过了键规则** → 从本机打开 `.docx` / `.xls` 时键与树侧不一致。
+  现改为 `toArchiveKey(fileName)`；
+- `retargetActived` / `commitRename` 里「当前文件与旧路径对应」的比对，从
+  `stripExtension(a) === stripExtension(b)` 改为 `toArchiveKey(a) === toArchiveKey(b)`
+  （前者会把 `报表.xlsx` 与 `报表.docx` 误判成同一个文件）；
+- `reconcileValueStore` 增加**一次性存量键迁移**（旧键 = 去扩展名 → 新键 = 保留后缀；
+  先迁移、再补建、后清理，避免补建的空档把迁移挤掉）；
+- `restoreActivedFile` 调整为先 `reconcileValueStore()`（含迁移）再 `switchToSheet()`。
+
+#### 测试与反证
+
+- `test-filetree.js`：`hasExtensionConflict` 断言替换为**键规则**断言（去 `.xlsx` / 保留其它后缀 /
+  无后缀原样 / 两键互不相同 / 幂等 / **删除兄弟后键不变**），并新增 [17] 节
+  **「删除同名不同后缀文件 → 能回退到另一个」端到端**（忠实模拟 `removeNodes` 的「先摘节点再算键」时序）。
+- `test-file-switch.js`：新增键规则与迁移接线断言、`fileOpener` 用 `toArchiveKey` 的断言，
+  以及 [13b] 节**越界崩溃防护**断言（`_clearSheetContent` 归零偏移 + 绘制循环防御性跳过）。
+- **反证已做**（三条守卫均确认能失败）：
+  - `toArchiveKey` 退回「一律去扩展名」→ `test-filetree.js` 8 条 FAIL，
+    含「删 docx：回退到 报表.xlsx → null」（复现用户报的故障）；
+  - 移除 `_clearSheetContent` 的偏移归零 → 「归零行头/列头滚动偏移」FAIL；
+  - 移除绘制循环的 `if (!header) continue;` → 「对越界行做防御性跳过」FAIL。
+
+#### 全量校验结果
+
+```
+23 个测试文件，全部 exit=0
+  test-filetree.js       通过 147 / 147
+  test-file-switch.js    通过 166 / 166
+npx tsc --noEmit 干净；npm run build 成功
+```
+
+---
+
 ## 13. 度量与验收指标
 
 **打点位置**（用 `performance.mark/measure`）：

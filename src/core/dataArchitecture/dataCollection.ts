@@ -337,8 +337,9 @@ export class DataCollection extends EventEmitter {
     /**
      * 当前选中的工作表名称
      *
-     * 同时也是**当前打开文件的存档键**（存档键 = 去扩展名的**完整路径**，
-     * 如 `归档/销售数据.xlsx` → `归档/销售数据`；根目录下的文件即去扩展名的文件名）。
+     * 同时也是**当前打开文件的存档键**（换算见 `utils/fileName` 的 `toArchiveKey`：
+     * 只去掉原生 `.xlsx` 后缀，其它后缀保留完整路径，
+     * 如 `归档/销售数据.xlsx` → `归档/销售数据`、`报表.docx` → `报表.docx`）。
      *
      * 默认值 `sheet1` 对应**默认空白文件**：文件树在「刷新后一个文件都没有」时会补一个
      * `sheet1.xlsx`，其存档键正是这里的 `sheet1`，因此初次装载的这张空表就是那个空白
@@ -759,6 +760,11 @@ export class DataCollection extends EventEmitter {
         // 否则新文件会顶着上一个文件的图片（且下一次落库会把它们写到新键上）
         this._images = [];
         this._imagesDirty = false;
+        // 滚动偏移随内容一起清空：旧文件可能滚动到很深的行，新（空）文件行数组被重置后，
+        // 残留的 offsetHeight 会让 getVisibleRows() 探到越界行，行头画布据此 getAt(r)
+        // 读出 undefined（Cannot read properties of undefined (reading 'isHidden')）
+        this.rowHeaders.offsetHeight = 0;
+        this.colHeaders.offsetWidth = 0;
         // values setter 会广播 VALUES_CHANGED → 主页面重绘为空表
         this.values = [];
     }

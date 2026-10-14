@@ -59,6 +59,18 @@ export class AllSelect extends EventEmitter {
     }
 
     /**
+     * 同步全选区尺寸
+     *
+     * 尺寸只与「行头宽度 × 列头高度」有关：行头宽度会随最后一行行号的位数变化
+     * （见 `RowHeaderCanvas.syncRowHeaderWidth`）——不同步的话，行头变宽后
+     * 全选区的点击热区仍停留在旧宽度，左上角会出现一条既不能全选也点不到单元格的死区。
+     */
+    public updateSize(): void {
+        this.allSelect.style.width = `${this.data.visibleView.rowHeaderWidth}px`;
+        this.allSelect.style.height = `${this.data.visibleView.colHeaderHeight}px`;
+    }
+
+    /**
      * 处理鼠标按下事件
      * @param {MouseEvent} e - 鼠标事件对象
      */

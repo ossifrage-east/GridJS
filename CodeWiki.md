@@ -618,6 +618,17 @@ Canvas 渲染层负责将数据绘制到 HTML5 Canvas 上，实现高性能表�
 
 行头画布，绘制行号（1, 2, 3...）、选中状态和行高调整手柄。
 
+**行头宽度自适应**：宽度 = 「最后一行行号」的文本宽度 + `ROW_HEADER_PADDING` × zoom，由 `syncRowHeaderWidth()` 在**每帧绘制前**
+（`Sheets.draw()` 的 rAF 回调里）同步 —— 行数会随「滚动到更深行、打开新工作簿、增删行」变化，行号位数一变（99 → 100）宽度就必须跟着走，
+否则多出来的位数会被画布右缘裁掉。两个关键点：
+
+1. 测量字号必须**除以 `devicePixelRatio`**：`ctx.font` 乘了 dpr 用于物理像素绘制，而 `measureText` 的单位跟随字号，直接测会得到物理像素宽度
+   （dpr > 1 的屏幕上宽度翻倍）。测量结果按「字体串 + 行号」缓存，命中时只做一次字符串比较。
+2. 宽度真正变化时由 `Sheets.relayout()` 广播 `resize`，让宿主（`app.onResize`）扣掉右侧工具条与行头宽度后重算内容区可用宽高，再走
+   `updateCanvasSize()` 分发给各画布；其中必须同步 `AllSelect.updateSize()`——全选区尺寸只在构造时设过一次。
+
+守卫：`test/test-row-header-width.js`。
+
 #### 5.2.5 EditCanvas
 
 **文件**：[editCanvas.ts](file:///c:/Users/Lenovo/Desktop/silkspaces/src/core/sheets/editCanvas.ts)  

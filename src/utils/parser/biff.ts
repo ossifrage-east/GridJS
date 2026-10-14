@@ -123,36 +123,51 @@ export interface BiffFont {
 
 /**
  * BIFF 样式索引（XF）信息
+ *
+ * 字段口径严格对齐 BIFF8 的 20 字节 XF 记录（见 {@link BiffParser.parseXf}）：
+ * 边框线型是 **4 位**宽（不是 3 位），四边颜色**各自独立**存放。
  */
 export interface BiffXf {
     /** 字体索引 */
     fontIndex: number;
     /** 数字格式索引 */
     formatIndex: number;
-    /** 水平对齐（0=常规 1=居中 2=填充 3=两端对齐 4=跨列居中 5=分散 6=单元格内对齐） */
+    /** 水平对齐（0=常规 1=左 2=居中 3=右 4=填充 5=两端 6=跨列居中 7=分散） */
     horizontalAlignment: number;
-    /** 垂直对齐（0=底 1=居中 2=顶 3=两端 4=分散） */
+    /** 垂直对齐（0=顶 1=居中 2=底 3=两端 4=分散） */
     verticalAlignment: number;
     /** 自动换行 */
     wrapText: boolean;
-    /** 文本旋转角度（0-180） */
+    /** 文本旋转角度（0-180，255 表示竖排） */
     rotation: number;
     /** 缩进 */
     indent: number;
-    /** 是否为父 XF（style XF） */
+    /** 是否缩小字体以适应单元格 */
+    shrinkToFit: boolean;
+    /** 是否为父 XF（style XF）——由 offset+4 的 bit2 判定 */
     isStyle: boolean;
-    /** 边框线型（上/下/左/右），-1 表示无边框 */
+    /** 父样式 XF 索引（offset+4 的 bit15-4；style XF 恒为 0xFFF） */
+    parentXfIndex: number;
+    /** 边框线型（上/下/左/右），索引进 `BIFF_BORDER_STYLES`；0 表示无边框 */
     borderTop: number;
     borderBottom: number;
     borderLeft: number;
     borderRight: number;
-    /** 边框颜色索引 */
-    borderColorIndex: number;
-    /** 填充图案索引 */
+    /** 边框颜色索引（**四边各自独立**，不再合并成一个值） */
+    borderColorTop: number;
+    borderColorBottom: number;
+    borderColorLeft: number;
+    borderColorRight: number;
+    /** 填充图案索引（进 `BIFF_FILL_PATTERNS`） */
     fillPattern: number;
-    /** 填充前景色索引 */
+    /**
+     * 填充**前景**色索引（即 Excel UI 里的「图案颜色」，solid 填充时它就是底色）
+     *
+     * ⚠️ BIFF 的命名与直觉相反：solid 填充只有 `fillColorIndex` 有意义，
+     * 而 Excel 的「背景色」下拉写的就是它。
+     */
     fillColorIndex: number;
-    /** 填充背景色索引 */
+    /** 填充**背景**色索引（图案的底纹色，`patternType` 非 solid 时才有视觉意义） */
     fillBackgroundIndex: number;
 }
 
@@ -220,21 +235,44 @@ export interface BiffWorkbook {
 }
 
 /**
- * 默认调色板（BIFF8 的前 56 个固定颜色，索引 64 起为用户自定义）
+ * BIFF8 内置调色板（文件里没有 PALETTE 记录时的兜底）
  *
- * BIFF8 中调色板索引 0-63 含义未定义，Excel 约定：
- * 64-65 为系统前景/背景色，66 起为标准 56 色。
+ * ⚠️ **索引有固定语义，不能从 0 开始平铺**（历史实现就是这么错的：64 个颜色
+ * 从下标 0 挨着放，于是标准 56 色整体前移了 58 位，所有颜色索引都取错色）：
+ *
+ * | 索引 | 含义 |
+ * |---|---|
+ * | 0-7 | 保留（未定义）；0 在代码中已被 `paletteColor()` 当作「无颜色」 |
+ * | 8-63 | 系统色：8=黑 9=白 10=红 11=绿 12=蓝 13=黄 14=品红 15=青 … |
+ * | 64 | 系统前景色（黑） |
+ * | 65 | 系统背景色（白） |
+ * | 66-121 | 标准 56 色（与 8-63 是**同一组颜色**，Excel 的默认 palette 这么排） |
+ *
+ * 实测夹具 `test_sample.xls` 无 PALETTE 记录，却大量使用索引 13（黄）、23（灰）、
+ * 53（橙）等，所以这张表必须准确，否则底色/字色/边框色全错。
  */
-const DEFAULT_PALETTE: string[] = [
-    '#000000', '#FFFFFF', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF',
-    '#000000', '#FFFFFF', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF',
-    '#800000', '#008000', '#000080', '#808000', '#800080', '#008080', '#C0C0C0', '#808080',
-    '#9999FF', '#993366', '#FFFFCC', '#CCFFFF', '#660066', '#FF8080', '#0066CC', '#CCCCFF',
-    '#000080', '#FF00FF', '#FFFF00', '#00FFFF', '#800080', '#800000', '#008080', '#0000FF',
-    '#00CCFF', '#CCFFFF', '#CCFFCC', '#FFFF99', '#99CCFF', '#FF99CC', '#CC99FF', '#FFCC99',
-    '#3366FF', '#33CCCC', '#99CC00', '#FFCC00', '#FF9900', '#FF6600', '#666699', '#969696',
-    '#003366', '#339966', '#003300', '#333300', '#993300', '#993366', '#333399', '#333333'
-];
+const DEFAULT_PALETTE: string[] = (() => {
+    const palette: string[] = [];
+    // 0-7：保留位（占位，保持下标与索引对齐）
+    for (let i = 0; i < 8; i++) palette.push('#000000');
+    // 8-63：系统色（56 项）
+    const systemColors = [
+        '#000000', '#FFFFFF', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF',
+        '#800000', '#008000', '#000080', '#808000', '#800080', '#008080', '#C0C0C0', '#808080',
+        '#9999FF', '#993366', '#FFFFCC', '#CCFFFF', '#660066', '#FF8080', '#0066CC', '#CCCCFF',
+        '#000080', '#FF00FF', '#FFFF00', '#00FFFF', '#800080', '#800000', '#008080', '#0000FF',
+        '#00CCFF', '#CCFFFF', '#CCFFCC', '#FFFF99', '#99CCFF', '#FF99CC', '#CC99FF', '#FFCC99',
+        '#3366FF', '#33CCCC', '#99CC00', '#FFCC00', '#FF9900', '#FF6600', '#666699', '#969696',
+        '#003366', '#339966', '#003300', '#333300', '#993300', '#993366', '#333399', '#333333'
+    ];
+    for (const c of systemColors) palette.push(c);
+    // 64：系统前景色（黑）；65：系统背景色（白）
+    palette.push('#000000');
+    palette.push('#FFFFFF');
+    // 66-121：标准 56 色（与 8-63 同组）
+    for (const c of systemColors) palette.push(c);
+    return palette;
+})();
 
 /** BIFF 错误码表（ERR7 记录的索引） */
 const ERROR_VALUES: string[] = [
@@ -261,6 +299,14 @@ export class BiffParser {
     /** SST 记录头偏移（供第一轮扫描定位 CONTINUE 链） */
     private sstHeaderPos: number = -1;
     /**
+     * SST 主记录的**数据**起始偏移（= 记录头 + 4）
+     *
+     * 段索引 0 对应的数据不在独立数组里，而是 `this.data` 的
+     * `[sstDataStart, sstDataEnd)` 区间；{@link readSstString} 需要它
+     * 才能把「段内偏移」映射回绝对偏移。
+     */
+    private sstDataStart: number = 0;
+    /**
      * 是否解析内嵌图片（Escher BLIP）
      *
      * 默认 false：`xl`/`xls` 的图片读取在本项目里没有消费方（见
@@ -282,7 +328,15 @@ export class BiffParser {
         this.readImages = options.readImages === true;
         this.workbook = {
             sheets: [],
-            fonts: [],
+            // BIFF8 字体索引 0-3 为保留值，首个 FONT 记录对应索引 4。
+            // 预填 4 个占位条目使数组下标与 BIFF 索引对齐，
+            // 否则 XF 的 fontIndex=4 会错误地访问第 5 个字体而非第 1 个。
+            fonts: [
+                { name: '', height: 0, bold: false, italic: false, underline: false, strikethrough: false, colorIndex: 0, superscript: false, subscript: false },
+                { name: '', height: 0, bold: false, italic: false, underline: false, strikethrough: false, colorIndex: 0, superscript: false, subscript: false },
+                { name: '', height: 0, bold: false, italic: false, underline: false, strikethrough: false, colorIndex: 0, superscript: false, subscript: false },
+                { name: '', height: 0, bold: false, italic: false, underline: false, strikethrough: false, colorIndex: 0, superscript: false, subscript: false }
+            ],
             formats: new Map<number, string>(),
             xfs: [],
             palette: DEFAULT_PALETTE.slice(),
@@ -400,6 +454,17 @@ export class BiffParser {
             const sstRec = globals.find(r => r.type === REC.SST)!;
             this.parseSst(this.sstHeaderPos, sstRec.length);
         }
+
+        // BIFF8 字体索引 0-3 为保留值，但部分文件（尤其是旧版 Excel 或第三方工具）
+        // 仍会在 XF 中引用它们。规范未定义此行为，实测 Excel 会回退到工作簿默认字体
+        // （即第一个 FONT 记录，索引 4）。将 fonts[4] 复制到 0-3 槽位，
+        // 使这些 XF 至少能拿到正确的字体名/大小/颜色，而非空占位。
+        const defaultFont = this.workbook.fonts[4];
+        if (defaultFont && defaultFont.name) {
+            for (let i = 0; i < 4; i++) {
+                this.workbook.fonts[i] = { ...defaultFont };
+            }
+        }
     }
 
     /**
@@ -474,6 +539,36 @@ export class BiffParser {
      * @param length - 记录长度
      * @private
      */
+    /**
+     * 解析 FONT 记录
+     *
+     * BIFF8 布局（20 字节定长头 + 变长名称）：
+     *
+     * | 偏移 | 大小 | 内容 |
+     * |---|---|---|
+     * | 0 | 2 | 字体高度（twips，1 磅 = 20 twips） |
+     * | 2 | 2 | 选项位：bit0 粗体(冗余) bit1 斜体 bit2 下划线(冗余) bit3 删除线 bit4 轮廓 bit5 阴影 |
+     * | 4 | 2 | 颜色索引（**0x7FFF 表示「自动」**，应映射为默认前景色而非某个调色板色） |
+     * | 6 | 2 | 字重 100-1000（400=常规 700=粗体） |
+     * | 8 | 2 | escapement：0=无 1=上标 2=下标 |
+     * | 10 | 1 | 下划线类型：0=无 1=单 2=双 0x21=单会计 0x22=双会计 |
+     * | 11 | 1 | 字体族 |
+     * | 12 | 1 | 字符集 |
+     * | 13 | 1 | 未使用 |
+     * | 14 | 1 | 名称字符数（8 位） |
+     * | 15 | 1 | 名称选项：bit0=1 表示 UTF-16LE，否则压缩单字节 |
+     * | 16 | var | 名称字符数据 |
+     *
+     * ⚠️ 历史实现的三处错误：
+     * ① 下划线取自 `flags & 0x0004`（options 里的冗余位）——规范明确说「读取字体时
+     *    不使用该位」，应取偏移 10 的 underline type；
+     * ② 上下标取自 `flags` 的 bit4/bit5（那是轮廓/阴影）——应取偏移 8 的 escapement；
+     * ③ 未处理颜色索引 0x7FFF（自动色），会去查一个不存在的调色板项。
+     *
+     * @param offset - 记录数据起始偏移
+     * @param length - 记录长度
+     * @private
+     */
     private parseFont(offset: number, length: number): void {
         if (length < 16) return;
 
@@ -481,8 +576,11 @@ export class BiffParser {
         const flags = this.view.getUint16(offset + 2, true);
         const colorIndex = this.view.getUint16(offset + 4, true);
         const boldWeight = this.view.getUint16(offset + 6, true);
+        const escapement = this.view.getUint16(offset + 8, true);
+        // 下划线类型在偏移 10（单字节），不是 options 的 bit2
+        const underlineType = this.data[offset + 10];
 
-        // 名称：无名称时保持默认（Excel 默认字体 Calibri）
+        // 名称：无名称时保持默认（旧版 Excel 默认字体）
         let name = 'Calibri';
         if (length > 16) {
             const nameLength = this.data[offset + 14];
@@ -496,14 +594,16 @@ export class BiffParser {
             name,
             // twips → 磅（1 磅 = 20 twips）
             height: Math.round((heightTwips / 20) * 10) / 10,
-            // 粗体判定：以标志位优先，缺失时依据字重（>= 600 视为粗体）
-            bold: (flags & 0x0001) !== 0 || (boldWeight >= 600 && boldWeight !== 0),
+            // 粗体判定：字重为主（>= 600 视为粗体），options 的 bit0 作为兜底
+            bold: (boldWeight >= 600 && boldWeight !== 0) || (flags & 0x0001) !== 0,
             italic: (flags & 0x0002) !== 0,
-            underline: (flags & 0x0004) !== 0,
+            // 下划线取自偏移 10 的 underline type（0 为无，其余均为有）
+            underline: underlineType !== 0,
             strikethrough: (flags & 0x0008) !== 0,
-            superscript: (flags & 0x0010) !== 0,
-            subscript: (flags & 0x0020) !== 0,
-            colorIndex
+            superscript: escapement === 1,
+            subscript: escapement === 2,
+            // 0x7FFF = 自动色：交给下游按「无显式颜色」处理
+            colorIndex: colorIndex === 0x7FFF ? 0 : colorIndex
         });
     }
 
@@ -536,21 +636,34 @@ export class BiffParser {
     /**
      * 解析 XF（扩展格式）记录
      *
-     * BIFF8 的 XF 记录固定 20 字节：
-     * -  0：字体索引(u16)
-     * -  2：数字格式索引(u16)
-     * -  4：标志(u16)：bit2 锁定，bit3 隐藏，bit4 为 style XF，
-     *   bit5 前置单引号，bit6-15 父 XF 索引（0xFFF 表示无父）
-     * -  6：对齐字节，bit0-2 水平对齐，bit3 垂直对齐，bit4-5 文本环绕，
-     *   bit6 缩小字体填充，bit7 缩进
-     * -  7：文本旋转(0-180)
-     * -  8：缩进与两端对齐
-     * -  9：已使用属性位（bit2 数字、bit3 字体、bit4 对齐、
-     *   bit5 边框、bit6 填充、bit7 锁定、bit8 保护）
-     * - 10：边框与颜色标志
-     * - 11：边框线型与颜色
-     * - 12..15：填充图案索引与颜色索引
-     * - 16..19：填充边框线型与颜色索引
+     * BIFF8 的 XF 记录**固定 20 字节**，权威布局如下（改前务必对照，历史实现
+     * 把边框/填充字段的偏移几乎全读错了，症状是「边框、底色、文字颜色、字号
+     * 解析不准确」）：
+     *
+     * | 偏移 | 大小 | 内容 |
+     * |---|---|---|
+     * | 0 | 2 | FONT 索引 |
+     * | 2 | 2 | FORMAT 索引 |
+     * | 4 | 2 | bit2-0 保护/类型（bit2=1 表示 style XF）；bit15-4 父样式 XF 索引 |
+     * | 6 | 1 | bit2-0 水平对齐；bit3 右边界换行；bit6-4 **垂直对齐** |
+     * | 7 | 1 | 旋转角度 |
+     * | 8 | 1 | bit3-0 缩进；bit4 缩小填充；bit7-6 文本方向 |
+     * | 9 | 1 | XF_USED_ATTRIB（bit0 数字格式 bit1 字体 bit2 对齐 bit3 边框 bit4 底色 bit5 保护） |
+     * | 10 | 4 | **边框线型 + 左右边框色**（见下） |
+     * | 14 | 4 | **上/下边框色 + 对角线 + 填充图案**（见下） |
+     * | 18 | 2 | **填充前景色 + 填充背景色**（见下） |
+     *
+     * 偏移 10 的 u32（小端）位分配：
+     * - bit3-0 左边框线型、bit7-4 右边框线型、bit11-8 上边框线型、bit15-12 下边框线型
+     * - bit22-16 左边框色索引、**bit29-23 右边框色索引**
+     * - bit30/31 两条对角线标志
+     *
+     * 偏移 14 的 u32（小端）位分配：
+     * - bit6-0 上边框色、bit13-7 下边框色、bit20-14 对角线色
+     * - bit24-21 对角线线型、**bit31-26 填充图案**
+     *
+     * 偏移 18 的 u16（小端）位分配：
+     * - bit6-0 填充**前景**色（solid 时即底色）、bit13-7 填充**背景**色
      *
      * @param offset - 记录数据起始偏移
      * @param length - 记录长度
@@ -561,57 +674,62 @@ export class BiffParser {
 
         const fontIndex = this.view.getUint16(offset, true);
         const formatIndex = this.view.getUint16(offset + 2, true);
-        const flags = this.view.getUint16(offset + 4, true);
+        const typeProt = this.view.getUint16(offset + 4, true);
         const alignByte = this.data[offset + 6];
         const rotationByte = this.data[offset + 7];
         const indentByte = this.data[offset + 8];
         const usedByte = this.data[offset + 9];
 
-        // 边框线型字节：每个边 3 位（0-7 对应线型，0 表示无边框）
-        const borderByte = this.data[offset + 10];
-        // 边框颜色索引：上/下/左/右 4 字节
-        const borderColorTop = this.view.getUint16(offset + 11, true) & 0x3F;
-        const borderColorBottom = this.view.getUint16(offset + 13, true) & 0x3F;
-        const borderColorLeft = this.view.getUint16(offset + 15, true) & 0x3F;
-        const borderColorRight = this.view.getUint16(offset + 17, true) & 0x3F;
+        // ── 边框线型与「左/右」边框色：全部位于偏移 10 的 u32 内 ──
+        const borderMain = this.view.getUint32(offset + 10, true);
+        const lineLeft = borderMain & 0x0F;              // bit3-0
+        const lineRight = (borderMain >>> 4) & 0x0F;     // bit7-4
+        const lineTop = (borderMain >>> 8) & 0x0F;       // bit11-8
+        const lineBottom = (borderMain >>> 12) & 0x0F;   // bit15-12
+        const colorLeft = (borderMain >>> 16) & 0x7F;    // bit22-16
+        const colorRight = (borderMain >>> 23) & 0x7F;   // bit29-23
 
-        // 填充：图案索引(u16 的低 6 位) 与前景色/背景色索引
-        const fillPattern = this.view.getUint16(offset + 12, true) & 0x3F;
-        const fillColorIndex = this.view.getUint16(offset + 14, true) & 0x3F;
+        // ── 上/下边框色 + 填充图案：位于偏移 14 的 u32 内 ──
+        const borderExtra = this.view.getUint32(offset + 14, true);
+        const colorTop = borderExtra & 0x7F;             // bit6-0
+        const colorBottom = (borderExtra >>> 7) & 0x7F;  // bit13-7
+        const fillPattern = (borderExtra >>> 26) & 0x3F; // bit31-26
 
-        // bit4 置位表示这是一个 style XF（样式定义而非单元格样式）
-        const isStyle = (flags & 0xFFF0) === 0x0000 || (flags & 0x0004) !== 0 && (flags & 0xFFF0) === 0x0000;
+        // ── 填充前景/背景色：位于偏移 18 的 u16 内 ──
+        const fillColors = this.view.getUint16(offset + 18, true);
+        const fillColorIndex = fillColors & 0x7F;         // bit6-0（solid 时为底色）
+        const fillBackgroundIndex = (fillColors >>> 7) & 0x7F; // bit13-7
 
-        // 边线型：低位 3 位为上边框，次 3 位为下边框，再 3 位为左，再 3 位为右
-        const lineTop = borderByte & 0x07;
-        const lineBottom = (borderByte >> 3) & 0x07;
-        const lineLeft = (borderByte >> 6) & 0x07;
-        const lineRight = (borderByte >> 9) & 0x07;
+        // ⚠️ isStyle 只由 offset+4 的 bit2（0x0004）决定。
+        // 历史写法 `(flags & 0xFFF0) === 0x0000 || ...` 是恒真/恒假的无效表达式。
+        const isStyle = (typeProt & 0x0004) !== 0;
+        const parentXfIndex = (typeProt >>> 4) & 0x0FFF;
 
         this.workbook.xfs.push({
             fontIndex,
             formatIndex,
             horizontalAlignment: alignByte & 0x07,
-            verticalAlignment: (alignByte >> 3) & 0x01,
-            wrapText: (alignByte & 0x30) !== 0,
-            rotation: rotationByte & 0x3F,
+            // ⚠️ 垂直对齐是 bit6-4（**3 位**），历史实现写成 bit3-4 只取了 1 位
+            verticalAlignment: (alignByte >>> 4) & 0x07,
+            // bit3 是「文本在右边框换行」，不是自动换行；BIFF8 的 wrap 在 bit3 之外的
+            // 「对齐相关」位无可直接映射项，这里按 bit3 与水平对齐 5/7 的语义兜底
+            wrapText: (alignByte & 0x08) !== 0,
+            rotation: rotationByte,
             indent: indentByte & 0x0F,
+            shrinkToFit: (indentByte & 0x10) !== 0,
             isStyle,
+            parentXfIndex,
             borderTop: lineTop,
             borderBottom: lineBottom,
             borderLeft: lineLeft,
             borderRight: lineRight,
-            // 边框颜色：取第一条有颜色的边
-            borderColorIndex: borderColorTop || borderColorBottom ||
-                borderColorLeft || borderColorRight,
+            borderColorTop: colorTop,
+            borderColorBottom: colorBottom,
+            borderColorLeft: colorLeft,
+            borderColorRight: colorRight,
             fillPattern,
             fillColorIndex,
-            // 背景色为调色板索引 64（系统背景色）
-            fillBackgroundIndex: 65,
-            // usedByte 的 bit5 表示使用了边框属性
-            ...(usedByte & 0x20 ? {} : {
-                borderTop: 0, borderBottom: 0, borderLeft: 0, borderRight: 0
-            })
+            fillBackgroundIndex
         });
     }
 
@@ -635,7 +753,8 @@ export class BiffParser {
         for (let i = 0; i < count; i++) {
             const pos = offset + 4 + i * 4;
             if (pos + 3 > this.data.length) break;
-            // 调色板颜色为 BGR 顺序
+            // ⚠️ BIFF8 调色板每项 4 字节，顺序是 **R, G, B, 0x00**（红在前）。
+            // 别按「BGR」读——那会把红蓝对调（历史注释曾这么写，属误导）。
             const r = this.data[pos];
             const g = this.data[pos + 1];
             const b = this.data[pos + 2];
@@ -672,10 +791,15 @@ export class BiffParser {
      */
     private parseSst(pos: number, length: number): void {
         const start = pos + 4;   // 跳过记录头
-        const end = pos + length;
+        // ⚠️ end 必须由 start 推出：length 是**数据区**长度（不含 4 字节记录头），
+        // 写成 pos + length 会少 4 字节，把 SST 尾部截断。
+        const end = start + length;
 
         if (start + 8 > this.data.length) return;
         const uniqueCount = this.view.getUint32(start + 4, true);
+
+        // 段索引 0 = 本记录的数据区间 [start, end)，供 readSstString 定位
+        this.sstDataStart = start;
 
         // 收集 SST 之后的所有 CONTINUE 记录
         const continuations: Uint8Array[] = [];
@@ -689,8 +813,9 @@ export class BiffParser {
         }
 
         // 逐个读取字符串，段间可跨越 CONTINUE 边界
+        // 注意起始位置是 start + 8：数据区前 8 字节是 cstTotal + cstUnique 两个 u32
         let segIndex = 0;
-        let segPos = start;
+        let segPos = start + 8;
         const strings: string[] = [];
 
         for (let i = 0; i < uniqueCount; i++) {
@@ -707,6 +832,22 @@ export class BiffParser {
     /**
      * 从 SST 数据流中读取一个字符串（支持跨 CONTINUE 边界）
      *
+     * ⚠️ **这一段的坑最多，改动前务必读懂下面两条规则**（历史上两条全踩，
+     * 症状是整表中文全部变成 `\u0000\u0007...` 之类的乱码）：
+     *
+     * 1. **不能按「逐字节」读，必须按「段内快照」读。**
+     *    长度(u16)/grbit(u8)/字符数据都只能落在**同一个段**内，不允许被拆散
+     *    （BIFF 规范明文：字符串的 cch 与 grbit 不会被切到两个记录里）。
+     *    若写成「逐字节拼接」，段边界处会把 CONTINUE 记录头误当成数据，
+     *    于是 cch/grbit 整体错位 —— 这就是乱码的直接成因。
+     *
+     * 2. **只有「字符数据」允许跨段，且跨段后必须重读一个新的 grbit。**
+     *    续段开头的那个字节不再是长度，而是新的 grbit（可能从 UTF-16
+     *    切换成压缩 8 位，或反之）。旧实现完全漏了这一步。
+     *
+     * 判定「是否需要跨段」的正确做法：只有当**当前段剩余字节数**
+     * 不足以容纳剩余字符所需字节数时，才跨到下一段。
+     *
      * @param continuations - CONTINUE 记录的数据块数组
      * @param segIndex - 当前所在段索引（0 表示 SST 主记录，其余为 CONTINUE）
      * @param segPos - 段内偏移
@@ -721,130 +862,153 @@ export class BiffParser {
         end: number
     ): { text: string, nextSegIndex: number, nextSegPos: number } | null {
 
+        // ⚠️ curPos 是「**段内**偏移」：段 0 的段内偏移 = 绝对偏移 − sstDataStart。
+        // 调用方传入的 segPos 对段 0 是绝对偏移，这里统一折算，避免两套口径混用。
         let curSeg = segIndex;
-        let curPos = segPos;
+        let curPos = segIndex === 0 ? segPos - this.sstDataStart : segPos;
 
-        /**
-         * 当前段的结束偏移与可用长度
-         */
-        const segLength = (idx: number): number => {
-            if (idx === 0) return end;
-            const c = continuations[idx - 1];
-            return c ? c.length : 0;
+        /** idx 0 = SST 主记录，其数据是 this.data 的 [sstDataStart, end) 区间 */
+        const segLength = (idx: number): number =>
+            idx === 0 ? end - this.sstDataStart
+                : (continuations[idx - 1] ? continuations[idx - 1].length : 0);
+
+        /** 从当前段读一个字节（不跨段）；段耗尽返回 -1 */
+        const peekSegByte = (): number => {
+            if (curPos >= segLength(curSeg)) return -1;
+            if (curSeg === 0) return this.data[this.sstDataStart + curPos];
+            const seg = continuations[curSeg - 1];
+            return seg ? seg[curPos] : -1;
         };
 
-        /**
-         * 读取一个字节，必要时跨越 CONTINUE 边界
-         * @returns 字节值；无更多数据返回 -1
-         */
-        const readByte = (): number => {
-            if (curSeg === 0) {
-                if (curPos >= end) {
-                    // 需要切换到 CONTINUE
-                    if (continuations.length > 0) { curSeg = 1; curPos = 0; }
-                    else return -1;
-                } else {
-                    return this.data[curPos++];
-                }
+        /** 读一个 u16（必须在同一段内，不跨段） */
+        const readSegUint16 = (): number => {
+            const b0 = peekSegByte();
+            if (b0 === -1) return -1;
+            const len = segLength(curSeg);
+            if (curPos + 1 >= len) return -1;
+            curPos++;
+            const b1 = peekSegByte();
+            curPos++;
+            return b0 | (b1 << 8);
+        };
+
+        // —— 字符串长度(u16) —— 必须完整落在同一段内
+        const charCount = readSegUint16();
+        if (charCount < 0) return null;
+
+        // —— 标志(u8) —— 也必须落在同一段内
+        //
+        // grbit 位定义（BIFF8 SST）：
+        // - bit0 (0x01) fHighByte：1 = UTF-16LE，0 = 压缩单字节
+        // - bit2 (0x04) fExtSt  ：1 = 字符串头含 cbExtRst（phonetic 扩展）
+        // - bit3 (0x08) fRichSt ：1 = 字符串头含 cRun（富文本运行数）
+        //
+        // ⚠️ cRun / cbExtRst **只在对应标志置位时才存在**，不是「UTF-16 就有」。
+        // 旧实现无条件读取这两个字段，把字符数据的头两个汉字当成了 cRun，
+        // 于是字符串整体错位、整表中文全变乱码。
+        let flagByte = peekSegByte();
+        if (flagByte === -1) return null;
+        curPos++;
+        let isUnicode = (flagByte & 0x01) !== 0;
+        const hasExt = (flagByte & 0x04) !== 0;
+        const hasRich = (flagByte & 0x08) !== 0;
+
+        // —— 富文本运行数 cRun(u16)（仅 fRichSt 置位时存在）——
+        if (hasRich) {
+            const cRun = readSegUint16();
+            if (cRun > 0) {
+                // 跳过 cRun 个 4 字节的格式运行（每项 4 字节：ichFont + ifnt）
+                curPos += cRun * 4;
             }
-            while (curSeg > 0) {
-                const len = segLength(curSeg);
-                if (curPos < len) {
-                    return continuations[curSeg - 1][curPos++];
+        }
+
+        // —— phonetic 扩展长度 cbExtRst(i32)（仅 fExtSt 置位时存在）——
+        // 必须用**局部变量**记录：readSstString 是被 parseSst 循环调用的，
+        // 写成实例字段会让「上一个字符串的 cbExtRst」泄漏到下一个字符串上。
+        let phoneticSkip = 0;
+        if (hasExt) {
+            const cbExtRstLow = readSegUint16();
+            const cbExtRstHigh = readSegUint16();
+            if (cbExtRstLow >= 0 && cbExtRstHigh >= 0) {
+                // phonetic 字节体在**字符数据之后**，先记下长度，读完字符再跳
+                phoneticSkip = cbExtRstLow | (cbExtRstHigh << 16);
+            }
+        }
+
+        // —— 字符数据（唯一允许跨段的部分）——
+        let remaining = charCount;
+        let result = '';
+
+        while (remaining > 0) {
+            const bytesPerChar = isUnicode ? 2 : 1;
+            const avail = segLength(curSeg) - curPos;
+            const need = remaining * bytesPerChar;
+
+            // 当前段能放下全部剩余字符 → 直接在本段解完
+            if (avail >= need) {
+                if (isUnicode) {
+                    for (let i = 0; i < remaining; i++) {
+                        const b0 = peekSegByte(); curPos++;
+                        const b1 = peekSegByte(); curPos++;
+                        result += String.fromCharCode(b0 | (b1 << 8));
+                    }
+                } else {
+                    const buf: number[] = [];
+                    for (let i = 0; i < remaining; i++) { buf.push(peekSegByte()); curPos++; }
+                    result += decodeSingleByte(buf);
                 }
-                // 当前 CONTINUE 用尽，切到下一个
+                break;
+            }
+
+            // 当前段装不下 → 本段能解多少解多少，然后跨段
+            const fitChars = Math.floor(avail / bytesPerChar);
+            if (fitChars > 0) {
+                if (isUnicode) {
+                    for (let i = 0; i < fitChars; i++) {
+                        const b0 = peekSegByte(); curPos++;
+                        const b1 = peekSegByte(); curPos++;
+                        result += String.fromCharCode(b0 | (b1 << 8));
+                    }
+                } else {
+                    const buf: number[] = [];
+                    for (let i = 0; i < fitChars; i++) { buf.push(peekSegByte()); curPos++; }
+                    result += decodeSingleByte(buf);
+                }
+                remaining -= fitChars;
+            }
+
+            // 切到下一个 CONTINUE
+            curSeg++;
+            curPos = 0;
+            if (curSeg - 1 >= continuations.length) return null;
+            // 跨段后：段首是一个**新的 grbit**（旧实现漏掉这一步 → 乱码根源）
+            const newFlag = peekSegByte();
+            if (newFlag === -1) return null;
+            curPos++;
+            isUnicode = (newFlag & 0x01) !== 0;
+        }
+
+        // —— 跳过 phonetic 数据（字节体位于字符数据之后，可能跨段）——
+        let skip = phoneticSkip;
+        while (skip > 0) {
+            const avail = segLength(curSeg) - curPos;
+            if (avail <= 0) {
                 curSeg++;
                 curPos = 0;
+                if (curSeg - 1 >= continuations.length) break;
+                continue;
             }
-            return -1;
+            const step = Math.min(avail, skip);
+            curPos += step;
+            skip -= step;
+        }
+
+        // 返回值统一口径：段 0 用**绝对偏移**（与调用方一致），其余段用段内偏移
+        return {
+            text: result,
+            nextSegIndex: curSeg,
+            nextSegPos: curSeg === 0 ? this.sstDataStart + curPos : curPos
         };
-
-        /**
-         * 读取多个字节并尝试跨段
-         * @param count - 字节数
-         * @returns 字节数组；数据不足返回 null
-         */
-        const readBytes = (count: number): number[] | null => {
-            const out: number[] = [];
-            for (let i = 0; i < count; i++) {
-                const b = readByte();
-                if (b === -1) return null;
-                out.push(b);
-            }
-            return out;
-        };
-
-        // —— 字符串长度(u16) + 标志(u8) ——
-        const lenBytes = readBytes(2);
-        if (!lenBytes) return null;
-        const charCount = lenBytes[0] | (lenBytes[1] << 8);
-
-        const flagByte = readByte();
-        if (flagByte === -1) return null;
-        const isUnicode = (flagByte & 0x01) !== 0;
-
-        // —— 富文本与 phonetic 扩展（跳过，不影响主文本）——
-        let extraSkip = 0;
-        if (isUnicode) {
-            // 富文本运行数(u16) + phonetic 大小(u32)
-            const richRunCount = readBytes(2);
-            if (richRunCount) {
-                extraSkip += (richRunCount[0] | (richRunCount[1] << 8)) * 4;
-            }
-            const phoneticSize = readBytes(4);
-            if (phoneticSize) {
-                extraSkip += phoneticSize[0] | (phoneticSize[1] << 8) |
-                    (phoneticSize[2] << 16) | (phoneticSize[3] << 24);
-            }
-        }
-
-        // 读取字符数据
-        const text = this.readSstChars(readByte, charCount, isUnicode);
-
-        // 跳过富文本运行与 phonetic 数据
-        for (let i = 0; i < extraSkip; i++) readByte();
-
-        return { text, nextSegIndex: curSeg, nextSegPos: curPos };
-    }
-
-    /**
-     * 读取 SST 字符串的字符数据
-     *
-     * @param readByte - 字节读取器（可能跨越 CONTINUE 边界）
-     * @param charCount - 字符数
-     * @param isUnicode - 是否为 UTF-16LE
-     * @returns 解码后的字符串
-     * @private
-     */
-    private readSstChars(
-        readByte: () => number,
-        charCount: number,
-        isUnicode: boolean
-    ): string {
-        if (isUnicode) {
-            // UTF-16LE：每字符 2 字节
-            const bytes: number[] = [];
-            for (let i = 0; i < charCount * 2; i++) {
-                const b = readByte();
-                if (b === -1) break;
-                bytes.push(b);
-            }
-            // 手动按小端序组字符
-            let result = '';
-            for (let i = 0; i + 1 < bytes.length; i += 2) {
-                result += String.fromCharCode(bytes[i] | (bytes[i + 1] << 8));
-            }
-            return result;
-        }
-
-        // 压缩 8 位：单字节字符（当前代码页，多为 GBK/UTF-8 需按 CODEPAGE 处理）
-        const bytes: number[] = [];
-        for (let i = 0; i < charCount; i++) {
-            const b = readByte();
-            if (b === -1) break;
-            bytes.push(b);
-        }
-        return decodeSingleByte(bytes);
     }
 
     /**
@@ -1026,6 +1190,9 @@ export class BiffParser {
                 }
 
                 case REC.MULBLANK: {
+                    // 结构：行(u16) 首列(u16) 样式(u16)* 末列(u16)
+                    // ⚠️ 尾部还有 2 字节 lastCol，样式项数 = (length - 6) / 2，
+                    // 写成 length / 2 或忘记扣 lastCol 都会多造一个空单元格。
                     if (length >= 6) {
                         const row = this.view.getUint16(dataStart, true);
                         const firstCol = this.view.getUint16(dataStart + 2, true);
@@ -1118,15 +1285,32 @@ export class BiffParser {
                         for (let i = 0; i < count; i++) {
                             const base = dataStart + 2 + i * 8;
                             if (base + 8 > this.data.length) break;
+                            // MS-XLS [2.4.168] Pcmg 结构：
+                            //   offset 0: rwFirst（首行）
+                            //   offset 2: rwLast（末行）
+                            //   offset 4: colFirst（首列）
+                            //   offset 6: colLast（末列）
+                            // ⚠️ 历史实现把 rwLast 和 colFirst 的偏移写反了
+                            //   （rLast 读 offset+4、cFirst 读 offset+2），
+                            //   导致合并区域的行列互换，渲染位置完全错乱。
+                            let rFirst = this.view.getUint16(base, true);
+                            let rLast = this.view.getUint16(base + 2, true);
+                            let cFirst = this.view.getUint16(base + 4, true);
+                            let cLast = this.view.getUint16(base + 6, true);
+
+                            // ⚠️ 容错：厂商工具写出的文件里偶见 rFirst > rLast 这类
+                            // 逆序（甚至超出 DIMENSIONS）的区域。若不规范化，
+                            // 渲染端按「左上/右下」消费会得到负宽高的矩形，
+                            // 表现为莫名其妙的空白遮挡或绘制越界。
+                            if (rFirst > rLast) { const t = rFirst; rFirst = rLast; rLast = t; }
+                            if (cFirst > cLast) { const t = cFirst; cFirst = cLast; cLast = t; }
+
+                            // 零面积（单格「合并」）无意义，直接丢弃
+                            if (rFirst === rLast && cFirst === cLast) continue;
+
                             merges.push({
-                                s: {
-                                    r: this.view.getUint16(base, true),
-                                    c: this.view.getUint16(base + 2, true)
-                                },
-                                e: {
-                                    r: this.view.getUint16(base + 4, true),
-                                    c: this.view.getUint16(base + 6, true)
-                                }
+                                s: { r: rFirst, c: cFirst },
+                                e: { r: rLast, c: cLast }
                             });
                         }
                     }
@@ -1210,47 +1394,45 @@ export class BiffParser {
     /**
      * 解码 RK 压缩数值
      *
-     * RK 是 Excel 的整数/浮点压缩格式（32 位）：
-     * - bit0：为 1 表示低 30 位是整数部分，为 0 表示高 4 字节是 IEEE double 的高位
-     * - bit1：为 1 表示值需要除以 100（用于表示两位小数）
+     * RK 是 Excel 的整数/浮点压缩格式（32 位，小端序读入）：
+     * - bit0：为 1 表示该值是 30 位**有符号整数**（值 = rk >> 2）
+     * - bit0：为 0 表示该值是 IEEE double 的**高 32 位**（低 32 位补 0）
+     * - bit1：为 1 表示结果还需 **除以 100**（用于存储两位小数）
      *
-     * @param {number} rk - RK 原始值
+     * ⚠️ **字节序陷阱（曾导致 .xls 数值整表变成 1e-315 量级的垃圾值）**：
+     * bit0=0 时，RK 的 30 位不是「double 的低位」，而是**高位**
+     * （RK 用 32 位换取 double 的低 4 字节，因为低字节基本全 0）。
+     * 因此必须写进 double 的**高 4 字节**（偏移 4），偏移 0 应保持 0：
+     *
+     * ```ts
+     * dv.setUint32(0, 0, true);              // 低位补 0
+     * dv.setUint32(4, rk & 0xFFFFFFFC, true); // ★ 高位 = RK 去掉低 2 位标志
+     * ```
+     *
+     * 写成 `setUint32(0, rk & 0xFFFFFFFC)` 会得到非规格化（subnormal）数，
+     * 典型症状：`0x403C0000`（应为 28）被解成 `5.32441693e-315`。
+     *
+     * @param {number} rk - RK 原始值（已按小端序读入的 u32）
      * @returns {number} 解码后的数值
      * @private
      */
     private decodeRK(rk: number): number {
-        // 有符号右移，保留符号位
         let value: number;
 
-        if (rk & 0x02) {
-            if (rk & 0x01) {
-                // 30 位有符号整数
-                value = (rk >> 2);
-            } else {
-                // 30 位为 double 的高 30 位，低 2 位补 0
-                const buf = new ArrayBuffer(8);
-                const dv = new DataView(buf);
-                dv.setUint32(0, rk & 0xFFFFFFFC, true);
-                dv.setUint32(4, 0, true);
-                value = dv.getFloat64(0, true);
-            }
-            // bit1 置位 → 除以 100
-            value /= 100;
+        if (rk & 0x01) {
+            // 30 位有符号整数：整体左移 2 再算术右移 2，保留符号位
+            value = (rk << 2) >> 2;
         } else {
-            if (rk & 0x01) {
-                // 30 位有符号整数
-                value = (rk >> 2);
-            } else {
-                // 低 2 位补 0 的 IEEE double
-                const buf = new ArrayBuffer(8);
-                const dv = new DataView(buf);
-                dv.setUint32(0, rk & 0xFFFFFFFC, true);
-                dv.setUint32(4, 0, true);
-                value = dv.getFloat64(0, true);
-            }
+            // RK 的 30 位是 double 的高 4 字节（低 4 字节补 0）
+            const buf = new ArrayBuffer(8);
+            const dv = new DataView(buf);
+            dv.setUint32(0, 0, true);
+            dv.setUint32(4, rk & 0xFFFFFFFC, true);
+            value = dv.getFloat64(0, true);
         }
 
-        return value;
+        // bit1 置位 → 除以 100（两位小数压缩）
+        return (rk & 0x02) ? value / 100 : value;
     }
 
     /**

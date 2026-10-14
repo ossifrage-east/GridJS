@@ -6,7 +6,7 @@
 */
 
 import { createDiv, createSpan, createInput, createButton, createElement } from "../../utils/dom";
-import { stripExtension, extractExtension } from "../../utils/fileName";
+import { stripExtension, extractExtension, toArchiveKey } from "../../utils/fileName";
 import { FILE_TREE_CLASS_NAMES as TREE, MENU_CLASS_NAMES } from "../constant";
 import { Menu, MenuContent } from "./menu";
 import { Dialog } from "./dialog";
@@ -806,7 +806,10 @@ export class FileTree {
         if (current !== moved && !this.isDescendantView(moved, current)) return;
 
         for (let i = 0; i < oldPaths.length; i++) {
-            if (stripExtension(oldPaths[i]) === stripExtension(this.activedFileName)) {
+            // 用**存档键**比对（而不是去扩展名）：`报表.xlsx` 与 `报表.docx` 去扩展名后都是
+            // `报表`，会把另一个同名文件误判成当前文件。activedFileName 可能是键也可能是路径，
+            // 而 toArchiveKey 是幂等的「路径 → 键」映射，两边过一遍即可精确对齐。
+            if (toArchiveKey(oldPaths[i]) === toArchiveKey(this.activedFileName)) {
                 this.activedFileName = newPaths[i] ?? this.activedFileName;
                 return;
             }
@@ -1434,7 +1437,8 @@ export class FileTree {
         if (wasActived) {
             // 当前文件可能就是被改名的文件本身，也可能是它（作为文件夹）的某个子孙
             for (let i = 0; i < oldPaths.length; i++) {
-                if (stripExtension(oldPaths[i]) === stripExtension(this.activedFileName)) {
+                // 同上：按存档键精确比对，避免 `报表.xlsx` / `报表.docx` 互相误判
+                if (toArchiveKey(oldPaths[i]) === toArchiveKey(this.activedFileName)) {
                     this.activedFileName = newPaths[i];
                     break;
                 }
@@ -1784,8 +1788,17 @@ export class FileTree {
      * 1. **完整路径一致**（`归档/销售数据.xlsx`）—— 最精确，可区分同名文件；
      * 2. 名称完全一致（`销售数据.xlsx`）；
      * 3. 「去掉扩展名后」一致 —— 树中节点是 `sheet1.xlsx`，而主页面记录的是
-     *    工作表的键（IndexDB 的存储键即路径去扩展名，见 `FileNode.path`），
+     *    工作表键（`.xlsx` 去后缀，见 `utils/fileName` 的 `toArchiveKey`），
      *    两者必须能互相定位。
+     *
+     * ⚠️ **扩展名敏感优先于扩展名无关**：`报表.xlsx` 与 `报表.docx` 是**两个不同的文件**，
+     * 必须分别命中各自的节点。历史实现把「去扩展名后一致」与「名称一致」放在同一档，
+     * 于是查找 `报表.docx` 时也会命中 `报表.xlsx`（两者去扩展名都是 `报表`），
+     * 导致打开同名不同后缀的文件时**复用错节点、新文件不进树**。
+     *
+     * 因此第 3 档只在**查询名本身没有扩展名**时才启用 —— 它存在的意义就是让
+     * 「工作表名（`销售数据`）」这类无后缀键能定位到「显示文件名（`销售数据.xlsx`）」，
+     * 而不是让两个都带后缀的名字互相串台。
      *
      * 同名时文件优先于文件夹。路径命中优先于名称命中：否则两个不同目录下的
      * 同名文件会定位到第一个（错的）那个。
@@ -1797,16 +1810,18 @@ export class FileTree {
         const key = name.trim().toLowerCase();
         if (!key) return null;
         const bare = stripExtension(key);
+        // 查询名自带扩展名时，禁止回落到「去扩展名」档：`报表.docx` 不该命中 `报表.xlsx`
+        const queryHasExt = extractExtension(key) !== '';
         const byPath: TreeNodeView[] = [];
         const byName: TreeNodeView[] = [];
         const fallback: TreeNodeView[] = [];
         this.rootViews.forEach((root) => this.walk(root, (view) => {
             const path = this.pathWithSelf(view).toLowerCase();
             if (path === key) byPath.push(view);
-            if (view.key === key || stripExtension(view.key) === bare) byName.push(view);
-            if (stripExtension(path) === bare) fallback.push(view);
+            if (view.key === key) byName.push(view);
+            if (!queryHasExt && stripExtension(path) === bare) fallback.push(view);
         }));
-        // 1) 路径精确命中（去掉扩展名也允许）→ 2) 名称命中（文件优先）→ 3) 路径去扩展名
+        // 1) 路径精确命中 → 2) 名称精确命中（文件优先）→ 3) 无后缀查询的路径去扩展名兜底
         const exactPath = byPath.find((v) => !v.isFolder) ?? byPath[0];
         if (exactPath) return exactPath;
         return byName.find((v) => !v.isFolder) ?? byName[0]

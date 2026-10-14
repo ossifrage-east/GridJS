@@ -264,7 +264,29 @@ export interface SheetParserOptions {
  *
  * 值 0 表示无边框，1-7 依次为不同线型。
  */
-const BIFF_BORDER_STYLES = ['none', 'thin', 'medium', 'dashed', 'dotted', 'thick', 'double', 'hair'];
+/**
+ * xls 边框线型索引 → xlsx `borderStyle` 名称
+ *
+ * BIFF8 的边框线型是 4 位（0–15），共 14 种有效取值（MS-XLS 2.4.268 / BORDER 枚举）。
+ * 历史实现只列了 8 项（0–7），索引 8–13（BORDER_HAIR..BORDER_DASHDOTDOT）会落空
+ * 而导致这些边的边框被整条丢弃。索引 14/15 未定义，刻意留空。
+ */
+const BIFF_BORDER_STYLES = [
+    'none',          // 0  BORDER_NONE
+    'thin',          // 1  BORDER_THIN
+    'medium',        // 2  BORDER_MEDIUM
+    'dashed',        // 3  BORDER_DASHED
+    'dotted',        // 4  BORDER_DOTTED
+    'thick',         // 5  BORDER_THICK
+    'double',        // 6  BORDER_DOUBLE
+    'hair',          // 7  BORDER_HAIR
+    'mediumDashed',  // 8  BORDER_MEDIUMDASHED
+    'dashDot',       // 9  BORDER_DASHDOT
+    'mediumDashDot', // 10 BORDER_MEDIUMDASHDOT
+    'dashDotDot',    // 11 BORDER_DASHDOTDOT
+    'mediumDashDotDot', // 12 BORDER_MEDIUMDASHDOTDOT
+    'slantDashDot'   // 13 BORDER_SLANTDASHDOT
+];
 
 /** xls 填充图案索引 → xlsx patternType 名称 */
 const BIFF_FILL_PATTERNS = [
@@ -730,24 +752,33 @@ export class SheetParser {
         const fillPatternName = BIFF_FILL_PATTERNS[xf.fillPattern];
         if (xf.fillPattern !== 0 && fillPatternName &&
             fillPatternName !== 'gray125' && fillPatternName !== 'gray0625') {
+            // ⚠️ solid（实心，pattern 1）时底色取自**前景色**（fillColorIndex）；
+            // 其余图案类填充则由前景色画网点/条纹、背景色作衬底，故取背景色更接近观感。
+            // 历史实现只写 `fg || bg`，在 `fg` 为 0（自动/未设）时会错误地用背景色当底色。
             const fg = this.paletteColor(wb.palette, xf.fillColorIndex);
             const bg = this.paletteColor(wb.palette, xf.fillBackgroundIndex);
             style.fill = {
                 patternType: fillPatternName,
-                fgColor: fg || bg
+                fgColor: xf.fillPattern === 1 ? (fg || bg) : (bg || fg)
             };
         }
 
         // —— 对齐 ——
-        // BIFF 水平对齐：0 常规 1 居中 2 填充 3 两端 4 跨列居中 5 分散 6 单元格内对齐
-        // BIFF 垂直对齐：0 底对齐 1 居中
+        // BIFF8 水平对齐：0 常规 1 左 2 居中 3 右 4 填充 5 两端 6 跨列居中 7 分散
+        //   （⚠️ 2 = 居中，不是左；历史把 2 当 left 且 7 当 center，均错）
+        // BIFF8 垂直对齐：0 顶 1 居中 2 底 3 两端 4 分散
+        //   （⚠️ 历史只映射了 0/1，且把 0 当 bottom —— 实际 0 是 top）
+        //
+        // 项目的 `TextAlign`/`VerticalAlign` 只有 4/3 个取值（无 distributed），
+        // 故 7/4 这类 BIFF 取值就近归一到 'justify'，避免写入渲染端不认识的字符串。
         const hAlignMap: Record<number, NonNullable<CellStyleInfo['alignment']>['horizontal']> = {
-            1: 'center', 3: 'justify', 5: 'justify', 7: 'center'
+            0: 'left', 1: 'left', 2: 'center', 3: 'right',
+            4: 'justify', 5: 'justify', 6: 'center', 7: 'justify'
         };
         const vAlignMap: Record<number, NonNullable<CellStyleInfo['alignment']>['vertical']> = {
-            0: 'bottom', 1: 'middle'
+            0: 'top', 1: 'middle', 2: 'bottom', 3: 'bottom', 4: 'middle'
         };
-        const horizontal = xf.horizontalAlignment === 2 ? 'left' : hAlignMap[xf.horizontalAlignment];
+        const horizontal = hAlignMap[xf.horizontalAlignment];
         const vertical = vAlignMap[xf.verticalAlignment];
         if (horizontal || vertical || xf.wrapText || xf.indent) {
             style.alignment = {
@@ -759,16 +790,23 @@ export class SheetParser {
         }
 
         // —— 边框 ——
-        const borderColor = this.paletteColor(wb.palette, xf.borderColorIndex) || '#000000';
+        // 四边**各自取色**：BIFF8 把左/右色编码在 u32@10 的高位，
+        // 上/下色编码在 u32@14 的低位（见 biff.ts 的 parseXf），实现层面已拆为
+        // 4 个独立字段，不能再共用一个颜色。
         const border: NonNullable<CellStyleInfo['border']> = {};
-        const topStyle = BIFF_BORDER_STYLES[xf.borderTop];
-        const bottomStyle = BIFF_BORDER_STYLES[xf.borderBottom];
-        const leftStyle = BIFF_BORDER_STYLES[xf.borderLeft];
-        const rightStyle = BIFF_BORDER_STYLES[xf.borderRight];
-        if (topStyle && topStyle !== 'none') border.top = { style: topStyle, color: borderColor };
-        if (bottomStyle && bottomStyle !== 'none') border.bottom = { style: bottomStyle, color: borderColor };
-        if (leftStyle && leftStyle !== 'none') border.left = { style: leftStyle, color: borderColor };
-        if (rightStyle && rightStyle !== 'none') border.right = { style: rightStyle, color: borderColor };
+        const makeEdge = (lineStyle: number, colorIndex: number) => {
+            const name = BIFF_BORDER_STYLES[lineStyle];
+            if (!name || name === 'none') return undefined;
+            return { style: name, color: this.paletteColor(wb.palette, colorIndex) || '#000000' };
+        };
+        const bTop = makeEdge(xf.borderTop, xf.borderColorTop);
+        const bBottom = makeEdge(xf.borderBottom, xf.borderColorBottom);
+        const bLeft = makeEdge(xf.borderLeft, xf.borderColorLeft);
+        const bRight = makeEdge(xf.borderRight, xf.borderColorRight);
+        if (bTop) border.top = bTop;
+        if (bBottom) border.bottom = bBottom;
+        if (bLeft) border.left = bLeft;
+        if (bRight) border.right = bRight;
         if (Object.keys(border).length > 0) style.border = border;
 
         return Object.keys(style).length > 0 ? style : undefined;
@@ -800,7 +838,9 @@ export class SheetParser {
      * @private
      */
     private paletteColor(palette: string[], index: number): string | undefined {
-        if (index <= 0) return undefined;
+        // 索引 0 = 「自动/未设」，1–7 为 BIFF8 保留值（不得用于单元格样式），
+        // 三者都当作「无颜色」返回 undefined。
+        if (index <= 7) return undefined;
         const color = palette[index];
         return color || undefined;
     }

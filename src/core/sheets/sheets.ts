@@ -193,6 +193,8 @@ export class Sheets extends EventEmitter {
         this.rowHeaderCanvas.updateCanvasSize();
         this.colHeaderCanvas.updateCanvasSize();
         this.sheetCanvas.updateCanvasSize();
+        // 全选区（左上角）尺寸只在构造时按当时的行头宽度设过一次，行头宽度变化后需同步
+        this.allSelect?.updateSize();
         this.draw();
     }
 
@@ -272,7 +274,9 @@ export class Sheets extends EventEmitter {
      * - rAF 回调内执行真实绘制，finally 中清空 _drawPromise（释放合帧锁）并 resolve，
      *   保证异常路径也不会卡死后续 draw()；
      * - canvas 未创建时（DB 加载阶段 OFFSETX/Y_CHANGED 同步回调）走守卫 return，
-     *   首次正式绘制由 setupResizeObserver 的 ResizeObserver 首次回调兜底。
+     *   首次正式绘制由 setupResizeObserver 的 ResizeObserver 首次回调兜底；
+     * - 绘制前先按「最后一行行号」的文本宽度同步行头宽度（行号位数变多时行头需变宽），
+     *   宽度有变才触发一次重排——内容区可用宽度依赖行头宽度，必须先重排再画。
      * @returns {Promise<void>} 共享的绘制 Promise（合帧周期内所有调用方拿到同一个）
      */
     public draw(): Promise<void> {
@@ -284,6 +288,11 @@ export class Sheets extends EventEmitter {
                 try {
                     if (!this.sheetCanvas) return;
                     if (!this.fontsLoaded) await this.startLoadingAnimation();
+                    // 行号位数变化（滚动到更深的行 / 打开新文件 / 增删行）时，行头宽度要跟随
+                    // 「最后一行行号」的文本宽度。宽度变了就**先重排再绘制**：内容区可用宽度
+                    // = 容器宽 − 右侧工具条 − 行头宽，重排把新宽度分发给各画布，
+                    // 于是本帧就用新宽度绘制，不会出现一帧的错位/裁切
+                    if (this.rowHeaderCanvas.syncRowHeaderWidth()) this.relayout();
                     this.rowHeaderCanvas.draw();
                     this.colHeaderCanvas.draw();
                     this.sheetCanvas.draw();
@@ -376,12 +385,27 @@ export class Sheets extends EventEmitter {
         
         for (const entry of entries) {
             if (entry.target === this.sheets) {
-                const rect = this.sheets.getBoundingClientRect();
-                if (rect.width ===0 || rect.height ===0) return;  // DOM 没有加载完成，直接返回
-                this.emitResize(rect.left, rect.top, rect.width, rect.height);
+                this.relayout();
                 break;
             }
         }
+    }
+
+    /**
+     * 按当前容器尺寸重排工作表（可见区宽高 + 各画布尺寸）
+     *
+     * 与 ResizeObserver 回调走同一条路径：对外广播 `resize` 事件，由宿主
+     * （`app.onResize`）扣掉右侧工具条与行头宽度、算出内容区可用宽高再调
+     * {@link updateCanvasSize}。除容器尺寸变化外，**行头宽度变化**（见
+     * {@link RowHeaderCanvas.syncRowHeaderWidth}）也走这里——行头变宽会挤压内容区，
+     * 必须让宿主按新的行头宽度重算，否则内容区会被行头盖住一截。
+     * @private
+     */
+    private relayout(): void {
+        if (!this.dataLoaded) return; // 数据未加载完成前不触发 resize 事件
+        const rect = this.sheets.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return;  // DOM 没有加载完成，直接返回
+        this.emitResize(rect.left, rect.top, rect.width, rect.height);
     }
 
     /**

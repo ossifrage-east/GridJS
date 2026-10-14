@@ -20,6 +20,10 @@ export class RowHeaderCanvas extends Canvas {
     private _resizeUndoBefore: FullStateSnapshot | null = null;
     /** 隐藏行悬停指示按钮（上下双三角）：鼠标悬停到「分割线且下方紧邻隐藏行」时显示 */
     private hiddenIndicator: Hidden;
+    /** 行号宽度测量缓存键（`字体串\0行号文本`），未变化时跳过 measureText */
+    private _rowLabelMeasureKey = '';
+    /** 行号宽度测量缓存值（CSS 像素，对应 {@link _rowLabelMeasureKey}） */
+    private _rowLabelWidth = 0;
 
     constructor(options: CanvasOptions) {
         super(options);
@@ -85,11 +89,65 @@ export class RowHeaderCanvas extends Canvas {
     }
 
     /**
-     * 计算行头中行最大数的宽度
+     * 计算行头中最后一行行号的文本宽度
+     *
+     * 行号按 CSS 像素字号（= DEFAULT_FONT_SIZE × zoom）居中绘制，但 `ctx.font` 里带了
+     * devicePixelRatio（画布按物理像素绘制），而 `measureText` 的返回值单位跟随字号单位
+     * ——直接在带 dpr 的字体下测量，得到的是**物理像素**宽度，在 dpr > 1 的屏幕上会比
+     * 实际渲染宽出一倍。故这里先把字号除以 dpr 再测量，返回绘制后真正的 CSS 像素宽度。
+     *
+     * 结果按「字体串 + 行号」缓存：本方法在滚动/重绘的每一帧都会被调用（见
+     * {@link syncRowHeaderWidth}），缓存命中时只做一次字符串拼接与比较，不再 measureText。
+     * @returns {number} 最后一行行号的文本宽度（CSS 像素）
      */
     public calculateRowHeaderWidth(): number {
-        const lastRow = this.data.rowHeaders.length;
-        return this.ctx.measureText(`${lastRow}`).width;
+        const label = `${Math.max(1, this.data.rowHeaders.length)}`;
+        const font = this.rowLabelFont();
+        const key = `${font}\u0000${label}`;
+        if (key !== this._rowLabelMeasureKey) {
+            this.ctx.save();
+            this.ctx.font = font;
+            this._rowLabelWidth = this.ctx.measureText(label).width;
+            this.ctx.restore();
+            this._rowLabelMeasureKey = key;
+        }
+        return this._rowLabelWidth;
+    }
+
+    /**
+     * 行号文本使用的字体串（CSS 像素单位）
+     *
+     * 与 {@link Canvas.setupContext} 设置的绘制字体等价——那里乘了 dpr 是为了按物理像素
+     * 绘制，这里去掉 dpr 是为了量出 CSS 像素宽度（见 {@link calculateRowHeaderWidth}）。
+     * @returns {string} 形如 `16px HarmonyOS Sans SC Regular`
+     */
+    private rowLabelFont(): string {
+        const dpr = window.devicePixelRatio || 1;
+        const size = Math.round(DEFAULT_FONT_SIZE * this.data.zoom * dpr) / dpr;
+        return `${size}px ${DEFAULT_FONT_FAMILY}`;
+    }
+
+    /**
+     * 行头应有的宽度：最后一行行号的文本宽度 + 内边距（CSS 像素，左右各留一半）
+     * @returns {number} 期望的行头宽度（CSS 像素）
+     */
+    private desiredRowHeaderWidth(): number {
+        return Math.round(this.calculateRowHeaderWidth() + ROW_HEADER_PADDING * this.data.zoom);
+    }
+
+    /**
+     * 按最后一行行号的文本宽度同步行头宽度
+     *
+     * 行数会随「滚动到更深行、打开新工作簿、增删行」而变化，行号位数（如 99 → 100）
+     * 随之增加；行头宽度必须跟着走，否则多出来的位数会被画布右缘裁掉。
+     * 只在宽度真正变化时写回（写回会触发 ROW_HEADER_WIDTH_CHANGED 广播）。
+     * @returns {boolean} 宽度是否发生变化（true 时调用方需按新宽度重排内容区）
+     */
+    public syncRowHeaderWidth(): boolean {
+        const width = this.desiredRowHeaderWidth();
+        if (width === this.data.visibleView.rowHeaderWidth) return false;
+        this.data.visibleView.rowHeaderWidth = width;
+        return true;
     }
 
     /**
@@ -97,7 +155,7 @@ export class RowHeaderCanvas extends Canvas {
      * 表头数据由 sheets.ensureDefaultHeaders() 在创建画布前确保已初始化
      */
     private initVisibleView() {
-        this.data.visibleView.rowHeaderWidth = Math.round(this.calculateRowHeaderWidth() + ROW_HEADER_PADDING * this.data.zoom);
+        this.data.visibleView.rowHeaderWidth = this.desiredRowHeaderWidth();
     }
 
     /**
@@ -126,10 +184,14 @@ export class RowHeaderCanvas extends Canvas {
         // 绘制网格的水平线条
         // 注意 getVisibleRows 返回 1-based 行号（含端点），此处 r 是 0-based 下标
         for (let r = startRow - 1; r < endRow; r++) {
-            if(this.data.rowHeaders.getAt(r).isHidden) continue; // 跳过隐藏行
+            const header = this.data.rowHeaders.getAt(r);
+            // 行数组可能在「切换/清空文件」后被重置为更小的尺寸，
+            // 而可见范围是按上一帧的偏移算出的 → getAt 可能越界返回 undefined，防御性跳过
+            if (!header) continue;
+            if(header.isHidden) continue; // 跳过隐藏行
             // top 已由 recalcRowPositions 重算为紧凑排列（隐藏行不占位），无需手动补偿
-            const y = (this.data.rowHeaders.getAt(r).top - this.data.rowHeaders.offsetHeight) * this.data.zoom;
-            const rowHeight = this.data.rowHeaders.getAt(r).height * this.data.zoom;
+            const y = (header.top - this.data.rowHeaders.offsetHeight) * this.data.zoom;
+            const rowHeight = header.height * this.data.zoom;
             // 背景按可见行分段绘制：紧邻隐藏块时向内收缩，
             // 前边界线（bottomY-1）、中间缺口与后边界线（y+1）占位不填充，形成缺口标识隐藏区
             const prevHidden = this.data.rowHeaders.getAt(r - 1)?.isHidden === true;
@@ -150,13 +212,13 @@ export class RowHeaderCanvas extends Canvas {
                 this.ctx.fillStyle = DEFAULT_SELECTED_BG_COLOR;
                 this.fillRect(0, y,
                     this.data.visibleView.rowHeaderWidth,
-                    this.data.rowHeaders.getAt(r).height * this.data.zoom);
+                    header.height * this.data.zoom);
                 // 绘制选中框的右侧边框
                 this.ctx.strokeStyle = DEFAULT_SELECTED_BORDER_COLOR;
                 this.drawLine(this.data.visibleView.rowHeaderWidth, 
                     y,
                     this.data.visibleView.rowHeaderWidth,
-                    y + this.data.rowHeaders.getAt(r).height * this.data.zoom,
+                    y + header.height * this.data.zoom,
                     DEFAULT_SELECTED_BORDER_WIDTH);
                 this.ctx.restore();
             }
@@ -165,7 +227,7 @@ export class RowHeaderCanvas extends Canvas {
             this.fillText(
                 `${r + 1}`,
                 this.data.visibleView.rowHeaderWidth / 2,
-                y + this.data.rowHeaders.getAt(r).height * this.data.zoom / 2);
+                y + header.height * this.data.zoom / 2);
             this.ctx.restore();
             // 绘制网格的水平线条：紧邻隐藏行块时，前后边界线向外各偏移 1px，形成 2px 隐藏区视觉标识
             this.ctx.save();
@@ -174,7 +236,7 @@ export class RowHeaderCanvas extends Canvas {
             this.drawLine(0, lineY, this.data.visibleView.rowHeaderWidth, lineY, 1);
             // 下一行隐藏时，本行底边是隐藏块的前边界，向前（上）移 1px 额外绘制
             if (this.data.rowHeaders.getAt(r + 1)?.isHidden) {
-                const bottomY = y + this.data.rowHeaders.getAt(r).height * this.data.zoom;
+                const bottomY = y + header.height * this.data.zoom;
                 this.drawLine(0, bottomY - 1, this.data.visibleView.rowHeaderWidth, bottomY - 1, 1);
             }
             this.ctx.restore();

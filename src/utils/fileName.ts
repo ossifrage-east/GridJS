@@ -36,3 +36,38 @@ export function stripExtension(name: string): string {
     const dot = (name ?? '').lastIndexOf('.');
     return dot > 0 ? name.slice(0, dot) : (name ?? '');
 }
+
+/**
+ * 应用的**原生表格后缀**
+ *
+ * 「新建文件」产出的即此格式（见 fileTree 的 `NEW_FILE_BASE_NAMES`），
+ * 因此历史上库里所有存档都对应一个 `*.xlsx` 文件。
+ */
+export const NATIVE_SHEET_EXTENSION = 'xlsx';
+
+/**
+ * 把文件**路径**换算为内容存档键（IndexedDB `values` / `images` 库的键）
+ *
+ * 规则：**只去掉应用原生表格后缀（{@link NATIVE_SHEET_EXTENSION}，即 `.xlsx`）；
+ * 其它后缀一律保留**。
+ * - `sheet1.xlsx`  → `sheet1`        （与历史存档键完全一致，存量零迁移）
+ * - `归档/销售数据.xlsx` → `归档/销售数据`（带目录：不同目录的同名文件各自独立存档）
+ * - `报表.docx`    → `报表.docx`      （保留后缀）
+ * - `报表`         → `报表`           （无后缀，原样）
+ *
+ * **为什么只去 `.xlsx`**：`报表.xlsx` 与 `报表.docx` 去扩展名后同为 `报表`，
+ * 若都去扩展名就会共用一份存档、互相覆盖。只让「原生格式」沿用历史的去扩展名键，
+ * 其它后缀保留后缀，即可在**不迁移任何存量存档**的前提下让二者互不干扰。
+ *
+ * **为什么必须只由路径决定（不能看「树里有没有同名冲突」）**：
+ * 删除同名的兄弟文件后，冲突就消失了 —— 若键依赖树状态，该文件的键会立刻改变
+ * （`报表.xlsx` → `报表`），于是「打开时用的键」与「删除/回退时算出的键」不一致，
+ * 表现为删不掉、回退到空白文件、内容丢失。因此存档键必须是**路径的纯函数**。
+ * @param path - 文件路径（含扩展名，相对根节点）
+ * @returns {string} 存档键；名称为空时返回空串
+ */
+export function toArchiveKey(path: string): string {
+    const text = (path ?? '').trim();
+    if (!text) return '';
+    return extractExtension(text) === NATIVE_SHEET_EXTENSION ? stripExtension(text) : text;
+}

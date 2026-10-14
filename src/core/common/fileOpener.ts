@@ -12,7 +12,7 @@ import { Char } from "../dataArchitecture/char";
 import { ColHeader, RowHeader } from "../dataArchitecture/header";
 import { DataCollection } from "../dataArchitecture/dataCollection";
 import { DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH } from "../constant";
-import { stripExtension } from "../../utils/fileName";
+import { toArchiveKey } from "../../utils/fileName";
 import { parseWorkbook } from "../../utils/parser/parserClient";
 import type { ExtractedImage } from "../../utils/parser/sheetParser";
 import { DocumentParser } from "../../utils/parser/documentParser";
@@ -244,17 +244,21 @@ export class FileOpener {
      * 将解析结果装载进数据集合
      *
      * 整段装载包成一次全量状态撤销操作（Ctrl+Z 可撤销打开动作）；
-     * 工作表名同步为去掉扩展名的文件名，作为 IndexedDB 的存储键。
+     * 工作表名同步为该文件的**存档键**（见 {@link toArchiveKey}），
+     * 作为 IndexedDB 的存储键。
      *
      * 从本机打开的文件**只有文件名**（浏览器不暴露所在目录），因此它就相当于
-     * 文件树根目录下的文件 —— 存档键 = 去扩展名的路径，此时路径 ≡ 文件名，
+     * 文件树根目录下的文件 —— 存档键由同一个 {@link toArchiveKey} 换算，
      * 与文件树给出的路径天然一致（不同目录的同名文件才会带上目录前缀）。
+     *
+     * ⚠️ 这里**不能**用 `stripExtension`：`报表.xlsx` 与 `报表.docx` 去扩展名后都是
+     * `报表`，会把两个文件写到同一个存档键上（后打开的覆盖先打开的）。
      * @param {string} fileName - 文件名
      * @param {OpenedDocument} document - 待装载数据
      * @private
      */
     private applyDocument(fileName: string, document: OpenedDocument): void {
-        const sheetName = stripExtension(fileName);
+        const sheetName = toArchiveKey(fileName);
         this.data.runWithFullStateUndo(`打开 ${fileName}`, () => {
             this.data.activedSheetName = sheetName;
             this.applyHeaders(document.colHeaders, document.rowHeaders);

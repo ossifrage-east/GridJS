@@ -39,7 +39,7 @@ import { Slider } from "./common/slider";
 import { Toolbar } from "./toolbar/toolbar";
 import { Menu } from "./common/menu";
 import { QuickAccess } from "./toolbar/quickAccess";
-import { stripExtension } from "../utils/fileName";
+import { stripExtension, toArchiveKey } from "../utils/fileName";
 import favicon from "../assets/images/favicon.ico";
 
 /** 导航内容区宽度在 IndexDB 中的键前缀（完整键 = 前缀 + 导航项文本） */
@@ -366,8 +366,9 @@ export class App {
             // 树结构/名称/路径变化即落库：下次刷新据此还原「刷新前的文件」
             onChange: (nodes: FileNode[]) => this.persistFileTree(nodes),
             // 内容桥：新增 / 复制 / 改名 / 移动 / 删除文件时同步数据库中该文件的内容。
-            // 参数一律是**路径**（含扩展名、相对根节点）：存档键由 toSheetKey 去扩展名后得到，
-            // 因此不同目录下的同名文件各自拥有独立存档。
+            // 参数一律是**路径**（含扩展名、相对根节点）：存档键由 toSheetKey 换算
+            // （只去原生 `.xlsx` 后缀，其它后缀保留，见 toArchiveKey），
+            // 因此不同目录的同名文件、同目录的同名不同后缀文件，各自拥有独立存档。
             content: {
                 create: (paths: string[]) => this.ensureFileContents(paths),
                 copy: (plans: FileMovePlan[]) => this.copyFileContents(plans),
@@ -377,8 +378,9 @@ export class App {
         });
         navigator.navContentItemMount(NAV_PANEL[0], this.fileTree.getElements().container);   // NAV_PANEL[0] 即「文件」
         // 「定位」的目标是「主页面正在显示的那个文件」。
-        // `activedSheetName` 是**存档键**（去扩展名的路径），树的定位匹配
-        // （{@link FileTree.findByName}）末档支持「路径去扩展名」，因此可直接对上；
+        // `activedSheetName` 是**存档键**（`.xlsx` 去后缀、其它后缀保留），
+        // 树的定位匹配（{@link FileTree.findByName}）既能按路径精确命中带后缀的键，
+        // 也支持「无后缀查询 → 路径去扩展名」的兜底，因此两种形态都能对上；
         // 从本机打开的单个文件没有目录，键与路径名相同，同样能定位到。
         this.fileTree.setActivedFileName(this.data.activedSheetName);
         this.data.on(DataEvents.ACTIVED_SHEET_NAME_CHANGED, (_, name: string) => {
@@ -421,6 +423,9 @@ export class App {
             // files 是**路径**集合；记忆里存的也是路径，两者可直接比较
             const displayName = remembered && this.fileTree.hasFile(remembered) ? remembered : files[0];
 
+            // 先对账（含存量键迁移与补建）再装载：否则历史遗留键的文件会被读成空表
+            await this.reconcileValueStore();
+
             const sheetName = this.toSheetKey(displayName);
             if (sheetName && sheetName !== this.data.activedSheetName) {
                 // 上次打开的是别的文件：装载其内容（无存档时按空表处理）
@@ -429,7 +434,6 @@ export class App {
             this.fileTree.showActivedFile(displayName);
             this.persistActivedFile(displayName);
             this.rememberOpenedFile(displayName);
-            await this.reconcileValueStore();
         } catch {
             // 恢复失败（IndexDB 不可用等）不影响后续使用：此时树中不含当前文件
         }
@@ -507,19 +511,22 @@ export class App {
     /**
      * 把文件**路径**换算为内容存档键（IndexedDB `values` / `images` 库的键）
      *
-     * 存档键 = 「去扩展名的完整路径」，如 `归档/销售数据.xlsx` → `归档/销售数据`。
+     * 规则见 {@link toArchiveKey}：只去掉应用原生表格后缀（`.xlsx`），其它后缀保留。
+     * - `归档/销售数据.xlsx` → `归档/销售数据`
+     * - `报表.xlsx` → `报表`、`报表.docx` → `报表.docx`（同名不同后缀互不干扰）
      *
-     * **为什么要带目录**：不同目录下的同名文件是两个独立文件，各自应有独立存档。
-     * 历史实现只用去扩展名的文件名作键（扁平、无目录），导致不同目录的同名文件
-     * 共用同一份存档、互相覆盖。
+     * **必须只由路径决定**：早期版本按「树里当前是否有同基名冲突」来决定是否保留后缀，
+     * 但删除同名的兄弟文件后冲突消失、键立刻漂移（`报表.xlsx` → `报表`），
+     * 致使「打开时写入的键」与「删除/回退时读的键」不一致 —— 删不掉、回退到空白。
+     * 存档键是路径的纯函数，才能保证任何时刻都指向同一份存档。
      *
-     * 兼容：传入纯文件名（无 `/`）时结果与历史实现完全一致（`sheet1.xlsx` → `sheet1`），
-     * 因此「默认空白文件」「从本机打开的文件」等路径均不受影响。
+     * 存量兼容：`.xlsx` 的键与历史完全一致（`sheet1.xlsx` → `sheet1`），无需迁移；
+     * 历史遗留的其它后缀存档（键为去扩展名）由 {@link reconcileValueStore} 一次性迁移。
      * @param path - 文件路径（含扩展名，相对根节点）
      * @returns {string} 存档键；名称为空时返回空串
      */
     private toSheetKey(path: string): string {
-        return stripExtension(path ?? '').trim();
+        return toArchiveKey(path);
     }
 
     /**
@@ -592,7 +599,7 @@ export class App {
                 const from = this.toSheetKey(plan.from);
                 const to = this.toSheetKey(plan.to);
                 if (!from || !to || from === to) {
-                    // 存档键（去扩展名的路径）没变：无需搬迁。
+                    // 存档键没变：无需搬迁。
                     // 注意这与历史实现的判断不同 —— 路径键下「剪切到别的目录」确实
                     // 改变存档键（`a/x.xlsx` → `b/x.xlsx`），必须搬迁，
                     // 只有「同一目录内名字也没变」才是真正的空操作。
@@ -754,9 +761,27 @@ export class App {
      *
      * 归属判定用**路径键**（{@link toSheetKey}）：`归档/销售数据.xlsx` 与
      * `销售数据.xlsx` 是两个不同的文件，因此也是两个不同的存档。
+     *
+     * 先做一次**存量键迁移**：`toArchiveKey` 之前「一律去扩展名」，现在改为
+     * 「只去原生 `.xlsx`、其它后缀保留」。因此历史上从本机打开的 `.docx` / `.xls` 等
+     * 文件，其存档键从 `报表` 变成 `报表.docx`——这里把旧键的存档搬到新键，
+     * 再删旧键，避免升级后这些文件看起来「内容空了」。
      */
     private async reconcileValueStore(): Promise<void> {
         try {
+            // ① 存量键迁移（必须在「补建」之前：否则会先给新键写入空白存档，把迁移挤掉）
+            for (const path of this.fileTree.listFiles()) {
+                const key = this.toSheetKey(path);
+                const legacy = stripExtension(path).trim();
+                if (!key || !legacy || key === legacy) continue;   // 原生 .xlsx：键未变
+                const moved = await this.settingsDb.getValue(legacy);
+                if (!moved || moved === '{}') continue;            // 旧键无内容，无需迁移
+                const current = await this.settingsDb.getValue(key);
+                if (current && current !== '{}') continue;         // 新键已有内容：不覆盖
+                await this.settingsDb.setValue(key, moved);
+                await this.settingsDb.deleteValue(legacy);
+            }
+
             const owned = new Set<string>();
             for (const path of this.fileTree.listFiles()) {
                 const key = this.toSheetKey(path);
