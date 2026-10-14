@@ -48,7 +48,8 @@ const NAV_WIDTH_KEY_PREFIX = 'nav-content-width:';
 /**
  * 当前打开文件在 IndexDB 中的设置键
  *
- * 值 = 文件显示名（含扩展名，如 `销售数据.xlsx`）：刷新后据此决定主页面显示哪个文件。
+ * 值 = 文件**路径**（含扩展名，如 `归档/销售数据.xlsx`）：刷新后据此决定主页面显示哪个文件。
+ * 存路径而不是文件名：不同目录下的同名文件是两个独立文件，只存名字无法区分该恢复哪一个。
  * 它只是「上次看的是哪一个」的记忆，**文件是否存在以文件树为准**
  * （见 {@link App.restoreActivedFile}），因此记忆失效（文件被删 / 被改名）时
  * 会自动退回树里的第一个文件，而不是凭记忆造出一个文件。
@@ -93,7 +94,7 @@ export class App {
     private fileOpener!: FileOpener;
 
     /**
-     * 打开历史（文件显示名，越靠前越近）
+     * 打开历史（文件**路径**，越靠前越近）
      *
      * 删除「当前打开的文件」时，据此回退到上一个仍在树中的文件。
      */
@@ -225,8 +226,15 @@ export class App {
     /**
      * 校验并规整文件树存档，避免损坏的数据把建树流程带崩
      *
-     * 只接受 `{ name: string, children?: FileNode[], open?: boolean }` 形状的节点：
+     * 可接受的节点形状：
+     * `{ name: string, path?: string, children?: FileNode[], open?: boolean,
+     *    createdAt?: number, lastModifiedAt?: number, createdBy?: string,
+     *    lastModifiedBy?: string, editable?: boolean }`。
      * 匿名节点与非法项一律丢弃；`children` 非数组时视为文件。
+     *
+     * 字段类型不符时**丢弃该字段**而不是丢弃节点（缺时间戳 / 缺创建人只影响「属性」
+     * 对话框的一行，不该让整个文件消失）；`path` 缺失时保持缺省，由 {@link FileTree}
+     * 建树阶段按父链重算，因此旧版存档（只有 `name/children/open`）依然可用。
      * @param input - 从 IndexDB 取出的原始值
      * @returns {FileNode[] | null} 规整后的树数据；无可保留节点时为 null
      */
@@ -237,12 +245,25 @@ export class App {
             const nodes: FileNode[] = [];
             for (const raw of list) {
                 if (!raw || typeof raw !== 'object') continue;
-                const { name, children, open } = raw as { name?: unknown; children?: unknown; open?: unknown };
-                const text = typeof name === 'string' ? name.trim() : '';
+                const source = raw as Record<string, unknown>;
+                const text = typeof source.name === 'string' ? source.name.trim() : '';
                 if (!text) continue;
                 const node: FileNode = { name: text };
-                if (typeof open === 'boolean') node.open = open;
-                if (Array.isArray(children)) node.children = walk(children);
+                // 路径：非空字符串才接受（空串等价于「缺失」，同样由建树阶段重算）
+                if (typeof source.path === 'string' && source.path.trim()) node.path = source.path.trim();
+                if (typeof source.open === 'boolean') node.open = source.open;
+                if (typeof source.createdAt === 'number' && Number.isFinite(source.createdAt)) {
+                    node.createdAt = source.createdAt;
+                }
+                if (typeof source.lastModifiedAt === 'number' && Number.isFinite(source.lastModifiedAt)) {
+                    node.lastModifiedAt = source.lastModifiedAt;
+                }
+                if (typeof source.createdBy === 'string' && source.createdBy) node.createdBy = source.createdBy;
+                if (typeof source.lastModifiedBy === 'string' && source.lastModifiedBy) {
+                    node.lastModifiedBy = source.lastModifiedBy;
+                }
+                if (typeof source.editable === 'boolean') node.editable = source.editable;
+                if (Array.isArray(source.children)) node.children = walk(source.children);
                 nodes.push(node);
             }
             return nodes;
@@ -317,9 +338,11 @@ export class App {
      * 因此刷新页面后树里仍是刷新前的那些文件与文件夹。
      */
     private async initFileTree(navigator: Navigator): Promise<void> {
-        // 文件打开器：负责「打开」按钮与主页面拖放，解析成功后把文件名登记到文件树
+        // 文件打开器：负责「打开」按钮与主页面拖放，解析成功后把文件登记到文件树
         this.fileOpener = new FileOpener({
             data: this.data,
+            // 从本机打开的文件只有文件名（浏览器不暴露所在目录），因此它是
+            // 根目录下的文件 —— 与「路径」语义天然一致（根目录下路径 ≡ 文件名）
             onOpened: (fileName: string) => {
                 // 打开的文件即「当前文件」：登记到树中并高亮，刷新后据此恢复
                 this.fileTree.showActivedFile(fileName);
@@ -339,19 +362,24 @@ export class App {
             nodes: savedNodes ?? undefined,
             onOpen: () => this.fileOpener.pickAndOpen(),
             // 双击树节点：切换到该文件（已在主页面显示时内容不变，见 activateFile）
-            onActivate: (fileName: string) => this.activateFile(fileName),
-            // 树结构/名称变化即落库：下次刷新据此还原「刷新前的文件」
+            onActivate: (path: string) => this.activateFile(path),
+            // 树结构/名称/路径变化即落库：下次刷新据此还原「刷新前的文件」
             onChange: (nodes: FileNode[]) => this.persistFileTree(nodes),
-            // 内容桥：新增 / 复制 / 改名 / 删除文件时同步数据库中该文件的内容
+            // 内容桥：新增 / 复制 / 改名 / 移动 / 删除文件时同步数据库中该文件的内容。
+            // 参数一律是**路径**（含扩展名、相对根节点）：存档键由 toSheetKey 去扩展名后得到，
+            // 因此不同目录下的同名文件各自拥有独立存档。
             content: {
-                create: (names: string[]) => this.ensureFileContents(names),
+                create: (paths: string[]) => this.ensureFileContents(paths),
                 copy: (plans: FileMovePlan[]) => this.copyFileContents(plans),
                 move: (plans: FileMovePlan[]) => this.moveFileContents(plans),
-                remove: (names: string[]) => this.removeFileContents(names),
+                remove: (paths: string[]) => this.removeFileContents(paths),
             },
         });
         navigator.navContentItemMount(NAV_PANEL[0], this.fileTree.getElements().container);   // NAV_PANEL[0] 即「文件」
-        // 「定位」以主页面当前显示的文件名为目标：随工作表切换同步
+        // 「定位」的目标是「主页面正在显示的那个文件」。
+        // `activedSheetName` 是**存档键**（去扩展名的路径），树的定位匹配
+        // （{@link FileTree.findByName}）末档支持「路径去扩展名」，因此可直接对上；
+        // 从本机打开的单个文件没有目录，键与路径名相同，同样能定位到。
         this.fileTree.setActivedFileName(this.data.activedSheetName);
         this.data.on(DataEvents.ACTIVED_SHEET_NAME_CHANGED, (_, name: string) => {
             this.fileTree?.setActivedFileName(name);
@@ -390,9 +418,10 @@ export class App {
 
             const saved = await this.settingsDb.getSetting(ACTIVED_FILE_KEY);
             const remembered = typeof saved === 'string' ? saved.trim() : '';
+            // files 是**路径**集合；记忆里存的也是路径，两者可直接比较
             const displayName = remembered && this.fileTree.hasFile(remembered) ? remembered : files[0];
 
-            const sheetName = stripExtension(displayName).trim();
+            const sheetName = this.toSheetKey(displayName);
             if (sheetName && sheetName !== this.data.activedSheetName) {
                 // 上次打开的是别的文件：装载其内容（无存档时按空表处理）
                 await this.data.switchToSheet(sheetName);
@@ -433,29 +462,42 @@ export class App {
      * 主页面已显示该文件时 {@link DataCollection.switchToSheet} 返回 false，
      * 此时直接返回：内容保持原样（不重绘、不重载），登记 / 高亮 / 记忆也都已就位，
      * 因此「重复双击同一个文件」不产生任何副作用。
-     * @param displayName - 节点显示名（含扩展名）
+     * @param path - 文件路径（含扩展名，相对根节点）
      */
-    private async activateFile(displayName: string): Promise<void> {
-        const sheetName = stripExtension(displayName).trim();
+    private async activateFile(path: string): Promise<void> {
+        const sheetName = this.toSheetKey(path);
         if (!sheetName) return;
 
         const switched = await this.data.switchToSheet(sheetName);
         if (!switched) return;   // 已在主页面显示当前文件 → 内容无变化
 
-        this.fileTree.showActivedFile(displayName);
-        this.persistActivedFile(displayName);
-        this.rememberOpenedFile(displayName);
-        this.data.messageBox.success(`已打开 ${displayName}`);
+        this.fileTree.showActivedFile(path);
+        this.persistActivedFile(path);
+        this.rememberOpenedFile(path);
+        this.data.messageBox.success(`已打开 ${this.baseNameOf(path)}`);
     }
 
     /**
-     * 记忆当前打开的文件（刷新后据此决定主页面显示哪个文件）
-     *
-     * 名称为空时不写入：文件是否存在以树为准，这里无需（也无法）表示「什么都没有」。
-     * @param displayName - 文件显示名（含扩展名）
+     * 取路径中的文件显示名（末段）
+     * @param path - 文件路径
+     * @returns {string} 显示名；空路径返回空串
      */
-    private persistActivedFile(displayName: string): void {
-        const name = (displayName ?? '').trim();
+    private baseNameOf(path: string): string {
+        const text = (path ?? '').trim();
+        const slash = text.lastIndexOf('/');
+        return slash >= 0 ? text.slice(slash + 1) : text;
+    }
+
+    /**
+     * 记忆当前打开的文件路径（刷新后据此决定主页面显示哪个文件）
+     *
+     * 存**路径**而不是文件名：不同目录的同名文件是两个文件，
+     * 只存名字无法在刷新后区分该恢复哪一个。
+     * 路径为空时不写入：文件是否存在以树为准。
+     * @param path - 文件路径（含扩展名，相对根节点）
+     */
+    private persistActivedFile(path: string): void {
+        const name = (path ?? '').trim();
         if (!name) return;
         this.settingsDb.setSetting(ACTIVED_FILE_KEY, name, 'actived-file').catch(() => {
             // 持久化失败不影响交互
@@ -463,20 +505,29 @@ export class App {
     }
 
     /**
-     * 把文件显示名换算为内容存档键（IndexedDB `values` 库的键 = 去扩展名的工作表名）
-     * @param displayName - 文件显示名（含扩展名）
+     * 把文件**路径**换算为内容存档键（IndexedDB `values` / `images` 库的键）
+     *
+     * 存档键 = 「去扩展名的完整路径」，如 `归档/销售数据.xlsx` → `归档/销售数据`。
+     *
+     * **为什么要带目录**：不同目录下的同名文件是两个独立文件，各自应有独立存档。
+     * 历史实现只用去扩展名的文件名作键（扁平、无目录），导致不同目录的同名文件
+     * 共用同一份存档、互相覆盖。
+     *
+     * 兼容：传入纯文件名（无 `/`）时结果与历史实现完全一致（`sheet1.xlsx` → `sheet1`），
+     * 因此「默认空白文件」「从本机打开的文件」等路径均不受影响。
+     * @param path - 文件路径（含扩展名，相对根节点）
      * @returns {string} 存档键；名称为空时返回空串
      */
-    private toSheetKey(displayName: string): string {
-        return stripExtension(displayName ?? '').trim();
+    private toSheetKey(path: string): string {
+        return stripExtension(path ?? '').trim();
     }
 
     /**
      * 记入「打开历史」（最近打开的排在最前，按存档键去重）
-     * @param displayName - 文件显示名（含扩展名）
+     * @param path - 文件路径（含扩展名，相对根节点）
      */
-    private rememberOpenedFile(displayName: string): void {
-        const name = (displayName ?? '').trim();
+    private rememberOpenedFile(path: string): void {
+        const name = (path ?? '').trim();
         if (!name) return;
         const key = this.toSheetKey(name);
         this.fileHistory = [name, ...this.fileHistory.filter((item) => this.toSheetKey(item) !== key)];
@@ -491,7 +542,10 @@ export class App {
      * 源即当前打开的文件时，先把内存中的最新内容落库再复制，
      * 否则会把「打开后尚未触发自动保存」的旧版本复制过去。
      * 源为空表时同时清掉目标键上的旧存档，避免粘贴出来的文件显示上一个同名文件的内容。
-     * @param plans - 搬迁计划（源显示名 → 目标显示名，文件夹已递归展开为文件）
+     *
+     * 存档键是**路径**：因此「不同目录下的同名文件」是完全独立的两个存档
+     * （历史实现只按文件名当键，会把它们混在一起）。
+     * @param plans - 搬迁计划（源路径 → 目标路径，文件夹已递归展开为文件）
      */
     private async copyFileContents(plans: FileMovePlan[]): Promise<void> {
         try {
@@ -506,8 +560,6 @@ export class App {
             for (const plan of plans) {
                 const from = this.toSheetKey(plan.from);
                 const to = this.toSheetKey(plan.to);
-                // 不同目录下的同名文件共用同一个存档键（键是**去扩展名的文件名**）：
-                // 此时内容本就在，无需也无法再复制
                 if (!from || !to || from === to) continue;
                 const raw = await this.settingsDb.getValue(from);
                 // 源为空表时也写入空白存档（而不是删掉目标键）：目标文件同样是
@@ -525,12 +577,13 @@ export class App {
     }
 
     /**
-     * 搬迁文件内容（重命名 / 剪切粘贴改名时由内容桥调用）
+     * 搬迁文件内容（重命名 / 剪切粘贴 / 拖拽移动时由内容桥调用）
      *
-     * 内容存档的键就是文件名，因此改名必须把存档搬到新键下，否则改名后的文件是空表。
+     * 内容存档的键就是**路径**，因此只要路径变了（改名、剪切到别的目录、拖拽换目录、
+     * 祖先文件夹改名）就必须把存档搬到新键下，否则目标任务显示为空表。
      * 被改名的正是当前打开的文件时，同步更新 `activedSheetName`（后续自动保存要写到新键）
      * 与「当前文件」记忆。
-     * @param plans - 搬迁计划（源显示名 → 目标显示名）
+     * @param plans - 搬迁计划（源路径 → 目标路径，文件夹已递归展开为文件）
      */
     private async moveFileContents(plans: FileMovePlan[]): Promise<void> {
         try {
@@ -539,7 +592,10 @@ export class App {
                 const from = this.toSheetKey(plan.from);
                 const to = this.toSheetKey(plan.to);
                 if (!from || !to || from === to) {
-                    // 名称没变（如剪切到别的目录）：存档键不变，无需搬迁
+                    // 存档键（去扩展名的路径）没变：无需搬迁。
+                    // 注意这与历史实现的判断不同 —— 路径键下「剪切到别的目录」确实
+                    // 改变存档键（`a/x.xlsx` → `b/x.xlsx`），必须搬迁，
+                    // 只有「同一目录内名字也没变」才是真正的空操作。
                     continue;
                 }
 
@@ -550,14 +606,14 @@ export class App {
                 // 空表也写一份空白存档：改名后「树里有文件、库里就得有存档」，不留空档
                 await this.settingsDb.setValue(to, raw && raw !== '{}' ? raw : this.data.blankSnapshot());
                 await this.settingsDb.deleteValue(from);
-                // 图片记录同样随名字搬迁（键就是文件名）
+                // 图片记录同样随路径搬迁（键就是路径）
                 const images = await this.settingsDb.getImages(from);
                 if (images.length > 0) await this.settingsDb.setImages(to, images);
                 else await this.settingsDb.deleteImages(to);
                 await this.settingsDb.deleteImages(from);
 
-                // 被改名的是当前打开的文件：后续自动保存必须写到新键，
-                // 否则编辑内容会被写回旧键（等于没改名的那个文件被悄悄改掉）
+                // 被改动的是当前打开的文件：后续自动保存必须写到新键，
+                // 否则编辑内容会被写回旧键（等于没改动的那个文件被悄悄改掉）
                 if (from === this.data.activedSheetName) this.data.activedSheetName = to;
                 this.rememberRenamedFile(plan.from, plan.to);
             }
@@ -567,9 +623,9 @@ export class App {
     }
 
     /**
-     * 同步「打开历史 / 当前文件记忆」中的文件名（改名后调用）
-     * @param from - 旧显示名
-     * @param to - 新显示名
+     * 同步「打开历史 / 当前文件记忆」中的文件路径（改名 / 移动后调用）
+     * @param from - 旧路径
+     * @param to - 新路径
      */
     private rememberRenamedFile(from: string, to: string): void {
         const key = this.toSheetKey(from);
@@ -589,12 +645,12 @@ export class App {
      * （见 {@link pickFallbackFile}）；无文件可回退则清空主页面。
      * 注意顺序：切换/清空会先固化当前内容，因此存档删除必须放在其后，
      * 否则刚写回的内容会留在库里，看起来「删不掉」。
-     * @param names - 被删除文件的显示名集合
+     * @param paths - 被删除文件的路径集合
      */
-    private async removeFileContents(names: string[]): Promise<void> {
+    private async removeFileContents(paths: string[]): Promise<void> {
         try {
             await this.data.dataLoaded;
-            const keys = names.map((name) => this.toSheetKey(name)).filter(Boolean);
+            const keys = paths.map((path) => this.toSheetKey(path)).filter(Boolean);
             if (keys.length === 0) return;
 
             const removingActived = keys.includes(this.data.activedSheetName);
@@ -643,17 +699,18 @@ export class App {
      * 已删除的文件名上，重绘的自动保存会立刻把这份空存档写回该键（删除等于没删），
      * 刷新后还会按该名字重新登记出一个文件。因此只要树里还有文件，就切到其中一个。
      * @param removing - 本次被删除的存档键集合
-     * @returns {string | null} 回退目标的显示名；树里一个文件都不剩时为 null
+     * @returns {string | null} 回退目标的**文件路径**（用于树中高亮与记忆）；树里一个文件都不剩时为 null
      */
     private pickFallbackFile(removing: string[]): string | null {
-        for (const name of this.fileHistory) {
-            const key = this.toSheetKey(name);
+        // 打开历史里存的就是路径，可直接用于 hasFile 与高亮
+        for (const path of this.fileHistory) {
+            const key = this.toSheetKey(path);
             if (!key || removing.includes(key)) continue;
-            if (this.fileTree?.hasFile(name)) return name;
+            if (this.fileTree?.hasFile(path)) return path;
         }
-        for (const name of this.fileTree?.listFiles() ?? []) {
-            const key = this.toSheetKey(name);
-            if (key && !removing.includes(key)) return name;
+        for (const path of this.fileTree?.listFiles() ?? []) {
+            const key = this.toSheetKey(path);
+            if (key && !removing.includes(key)) return path;
         }
         return null;
     }
@@ -666,13 +723,13 @@ export class App {
      *
      * **只补不覆盖**：这条路径也会在「登记已打开的文件」时被调用，那时内容刚刚由
      * 打开器写库，若直接覆写会把刚打开的文件清空。
-     * @param names - 新增文件的显示名集合
+     * @param paths - 新增文件的路径集合
      */
-    private async ensureFileContents(names: string[]): Promise<void> {
+    private async ensureFileContents(paths: string[]): Promise<void> {
         try {
             await this.data.dataLoaded;
-            for (const name of names) {
-                const key = this.toSheetKey(name);
+            for (const path of paths) {
+                const key = this.toSheetKey(path);
                 if (!key) continue;
                 const existing = await this.settingsDb.getValue(key);
                 if (existing && existing !== '{}') continue;   // 已有存档：保持原样
@@ -694,20 +751,23 @@ export class App {
      *
      * 图片记录（独立的 `images` 对象存储）一并按「无归属即删」清理，
      * 但**不补建**：没有图片的文件本来就不该有图片记录（补一条空记录只会白占空间）。
+     *
+     * 归属判定用**路径键**（{@link toSheetKey}）：`归档/销售数据.xlsx` 与
+     * `销售数据.xlsx` 是两个不同的文件，因此也是两个不同的存档。
      */
     private async reconcileValueStore(): Promise<void> {
         try {
             const owned = new Set<string>();
-            for (const name of this.fileTree.listFiles()) {
-                const key = this.toSheetKey(name);
+            for (const path of this.fileTree.listFiles()) {
+                const key = this.toSheetKey(path);
                 if (key) owned.add(key.toLowerCase());
             }
             const records = await this.settingsDb.getAllValues();
             const existing = new Set(records.map((record) => String(record.sheetName ?? '').toLowerCase()));
 
             // 补建：保证每个文件都有存档
-            for (const name of this.fileTree.listFiles()) {
-                const key = this.toSheetKey(name);
+            for (const path of this.fileTree.listFiles()) {
+                const key = this.toSheetKey(path);
                 if (key && !existing.has(key.toLowerCase())) {
                     await this.settingsDb.setValue(key, this.data.blankSnapshot());
                 }

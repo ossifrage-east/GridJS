@@ -134,10 +134,16 @@ export const FILE_TREE_CLASS_NAMES = {   // 定义文件树（「文件」导航
     LABEL: 'file-tree-label',
     RENAME_INPUT: 'file-tree-rename-input',
     CHILDREN: 'file-tree-children',
+    PROPERTY: 'file-tree-property',
+    PROPERTY_ROW: 'file-tree-property-row',
+    PROPERTY_LABEL: 'file-tree-property-label',
+    PROPERTY_VALUE: 'file-tree-property-value',
     OPEN: 'is-open',
     SELECTED: 'is-selected',
     LOCATED: 'is-located',
     ACTIVED: 'is-actived',
+    DRAG_DISABLED: 'is-drag-disabled',
+    DROP_TARGET: 'is-drop-target',
 }
 
 export const MENU_CLASS_NAMES = {

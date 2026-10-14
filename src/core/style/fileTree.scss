@@ -205,6 +205,23 @@
     &.is-located {
         animation: fileTreeLocate 0.9s ease-out 1;
     }
+
+    /* 拖拽放置目标：文件夹行高亮提示「可以放到这里」 */
+    &.is-drop-target {
+        background-color: rgba(76, 170, 80, 0.22);
+        box-shadow: inset 0 0 0 1px #4CAF50;
+    }
+
+    /* 拖拽期间不可作为放置目标的节点（被拖节点自身及其子孙） */
+    &.is-drag-disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+    }
+}
+
+/* 拖拽中的源节点：整体降透明度，与「不可放置」的子树区分开 */
+.file-tree-row:active {
+    cursor: grabbing;
 }
 
 @keyframes fileTreeLocate {
@@ -284,4 +301,39 @@
 .file-tree-children[hidden],
 .file-tree-empty[hidden] {
     display: none;
+}
+
+/* —— 「属性」对话框正文：定义列表（字段名 + 字段值） —— */
+
+.file-tree-property {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.file-tree-property-row {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.file-tree-property-label {
+    /* 固定标签宽度：多行字段值也能左对齐成一列 */
+    flex: none;
+    width: 88px;
+    color: #6c757d;
+    text-align: right;
+    /* 长标签（如「最初建立时间」）不换行，保持标签列整齐 */
+    white-space: nowrap;
+}
+
+.file-tree-property-value {
+    flex: 1 1 auto;
+    min-width: 0;
+    color: #212529;
+    /* 路径等长文本允许在任意位置折行，避免撑破对话框 */
+    word-break: break-all;
 }
