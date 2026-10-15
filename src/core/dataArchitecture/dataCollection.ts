@@ -6,7 +6,7 @@ import { VisibleView } from "./visibleView";
 import { CELL_PADDING, DataEvents, DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, DEFAULT_SELECTED_BORDER_WIDTH, MouseLocation } from "../constant";
 import { EventEmitter } from "../../utils/eventEmitter";
 import { IndexDB } from "./indexDB";
-import { UndoManager, UndoAction, FullStateSnapshot } from "../../utils/undoManager";
+import { UndoManager, UndoAction, FullStateSnapshot, CellPatchEntry } from "../../utils/undoManager";
 import { ClipboardManager } from "../../utils/clipboardManager";
 import { MessageBox } from "../common/message";
 import { MatrixSorter, type SortConfig } from "./matrixSorter";
@@ -332,6 +332,13 @@ export class DataCollection extends EventEmitter {
     private _hiddenRowsSet: Set<number> = new Set();
     /** runWithFullStateUndo 嵌套深度：仅最外层推入撤销记录，嵌套调用的变更折叠进外层快照 */
     private _fullStateUndoDepth: number = 0;
+    /**
+     * runWithCellPatchUndo 嵌套深度
+     *
+     * 包裹期间 {@link _recordValuesChange} 不再刷新整表基准（见该方法注释）：
+     * 补丁自己管「变化前/后」，中间步骤刷新基准只会白白深拷贝一次整表。
+     */
+    private _cellPatchUndoDepth: number = 0;
     /**
      * 编辑期间的撤销栈：保存每次按键后的 values 深拷贝快照及对应光标绝对索引。
      * 栈底（index 0）为编辑前的基准快照，供编辑内逐字撤销；
@@ -1374,27 +1381,33 @@ export class DataCollection extends EventEmitter {
     /**
      * 按名称取单元格（O(1)，替代 `values.find(v => v.cell === name)`）
      *
-     * 三层防护保证不会返回过期对象：
-     * 1. 命中后校验 `cell.cell === name`，不一致说明发生过等长重命名 → 强制重建；
-     * 2. 未命中且「长度或世代」与建索引时不一致 → 重建后重试一次；
-     * 3. 两者一致仍未命中 → 本世代索引有效，确实不存在（直接返回 undefined，
-     *    不会退化成每次查找都重建，避免把 O(1) 打回 O(N)）。
+     * 失效判定与 {@link _ensureCellIndex} **同源**，保证两类调用看到同一份索引：
+     * 1. 结构失效（{@link invalidateCellIndex}）或 `_values` 长度变化 → 重建；
+     * 2. 仅内容变化（{@link markContentChanged}）→ 只刷新世代标记，不重建；
+     * 3. 命中后再校验 `cell.cell === name`，兜住「等长重命名」这类改了名集合
+     *    却没改长度的情形。
+     *
+     * 稳态（未失效）下是一次 Map 查找，不会退化成每次都重建。
      * @param {string} name - 单元格名称（如 `A1`）
      * @returns {Cell | undefined} 单元格；不存在时 undefined
      */
     public getCellByName(name: string): Cell | undefined {
-        const hit = this._cellIndex.get(name);
-        if (hit !== undefined) {
-            if (hit.cell === name) return hit;
+        // ⚠️ 命中分支**不能**跳过失效判定：_cellIndex 里可能残留「已从 _values 删除、
+        //   但仍留在旧索引中」的条目（合并会删掉区域内除锚点外的所有格子）。
+        //   历史实现是「命中且 name 相等就直接返回」，于是删除后仍能按名取到
+        //   幽灵单元格 —— 补丁撤销据此捕获的 after 快照会把幽灵当成现存格子写回去，
+        //   表现为「撤销后合并区还在 / 撤销无效」。
+        // 判定与 {@link _ensureCellIndex} 同源：结构失效或长度变化才重建（O(N)，
+        //   一次操作只付一次），单纯的内容变化只刷新世代标记（O(1)）。
+        if (this._values.length !== this._indexedLength || this._indexStructurallyInvalid) {
             this._rebuildCellIndex();
-        } else if (this._values.length !== this._indexedLength
-            || this._indexEpoch !== this._valuesEpoch) {
-            this._rebuildCellIndex();
-        } else {
-            return undefined;
+            this._indexStructurallyInvalid = false;
+        } else if (this._indexEpoch !== this._valuesEpoch) {
+            this._indexEpoch = this._valuesEpoch;
+            this._filterCellsEpoch = this._valuesEpoch;
         }
-        const found = this._cellIndex.get(name);
-        return (found !== undefined && found.cell === name) ? found : undefined;
+        const hit = this._cellIndex.get(name);
+        return (hit !== undefined && hit.cell === name) ? hit : undefined;
     }
 
     /**
@@ -1552,7 +1565,11 @@ export class DataCollection extends EventEmitter {
      */
     private _recordValuesChange(before: Cell[] | null): void {
         if (this._suppressValuesUndo) {
-            this._refreshBaseline();
+            // 补丁撤销已自己捕获「变化前/后」，这里再刷一次整表基准纯属浪费
+            // （小表是整表深拷贝，几十万格时单次就几十毫秒）。外层结束时会统一刷新。
+            if (this._cellPatchUndoDepth === 0) {
+                this._refreshBaseline();
+            }
             return;
         }
         // 大表或不记账：不做「变化后」深拷贝，也不入栈
@@ -1989,6 +2006,153 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 捕获矩形区域内每个单元格的当前状态（局部补丁快照的「一半」）
+     *
+     * 顺序固定为「行优先」，回写时按名字匹配，因此与 `_values` 的实际排列无关。
+     * **必须在改动前调用**：此时单元格索引处于稳态，`getCellByName` 是 O(1)；
+     * 一旦在「边 push 边查」的循环里调用，每次 push 都会让索引世代失效，
+     * 下一次查找就要重建整份索引（O(N)）——这正是取消合并 1000 格要 4.4 秒的原因。
+     * @param {number} minCol - 起始列（1-based）
+     * @param {number} maxCol - 结束列（1-based，含）
+     * @param {number} minRow - 起始行（1-based）
+     * @param {number} maxRow - 结束行（1-based，含）
+     * @returns {CellPatchEntry[]} 区域内每个格子的克隆（不存在为 null）
+     * @private
+     */
+    private _captureCellPatch(minCol: number, maxCol: number, minRow: number, maxRow: number): CellPatchEntry[] {
+        const out: CellPatchEntry[] = [];
+        for (let row = minRow; row <= maxRow; row++) {
+            for (let col = minCol; col <= maxCol; col++) {
+                const name = this.getCellName(col, row);
+                const cell = this.getCellByName(name);
+                out.push({ cell: name, data: cell ? cell.clone() : null });
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 比较两份局部补丁是否等价
+     *
+     * 与 {@link _cellsEqual} 同源的字段级深比较，但多处理「null ↔ 非 null」
+     * （格子被合并吞掉 / 被取消合并补回来）与「名字不同」三种情形。
+     * @private
+     */
+    private _cellPatchesEqual(a: CellPatchEntry[], b: CellPatchEntry[]): boolean {
+        if (a === b) return true;
+        if (!a || !b || a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            if (a[i].cell !== b[i].cell) return false;
+            const ca = a[i].data;
+            const cb = b[i].data;
+            if (ca === cb) continue;
+            if (!ca || !cb) return false;
+            if (!this._cellsEqual(ca, cb)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * 以「局部单元格补丁」为单位执行一次可撤销操作
+     *
+     * 与 {@link runWithFullStateUndo} 的区别：只捕获**矩形区域内**的格子，
+     * 代价与区域大小成正比、与整表大小无关，因此不受
+     * {@link LARGE_TABLE_UNDO_CELLS} 阈值限制 —— 百万格的表里合并 50 个单元格
+     * 依然可以 Ctrl+Z / Ctrl+Y（整表快照在这种规模下会被直接关掉）。
+     *
+     * 适用面：影响范围**可预先确定**的结构性操作（合并/取消合并、按行/列合并…）。
+     * 范围不可预知的操作（删除行列会整体平移）仍应走全量快照。
+     *
+     * 流程与全量版一致：捕获 before → 抑制 values setter 自动记账 → 执行 action
+     * → 清扫空单元格 → 捕获 after → 不等则入栈 → 广播。
+     * @param {string} label - 操作标签
+     * @param {{ minCol: number; maxCol: number; minRow: number; maxRow: number }} rect - 影响区域（1-based，闭区间）
+     * @param {() => void} action - 实际的变更操作
+     */
+    public runWithCellPatchUndo(
+        label: string,
+        rect: { minCol: number; maxCol: number; minRow: number; maxRow: number },
+        action: () => void
+    ): void {
+        const { minCol, maxCol, minRow, maxRow } = rect;
+        const before = this._captureCellPatch(minCol, maxCol, minRow, maxRow);
+        const prevSuppress = this._suppressValuesUndo;
+        this._suppressValuesUndo = true;
+        this._cellPatchUndoDepth++;
+        try {
+            action();
+        } finally {
+            this._cellPatchUndoDepth--;
+            this._suppressValuesUndo = prevSuppress;
+            this._pruneEmptyCells();
+            this.markContentChanged();
+            if (!this._isApplyingUndo) {
+                const after = this._captureCellPatch(minCol, maxCol, minRow, maxRow);
+                if (!this._cellPatchesEqual(before, after)) {
+                    this.undoManager.push({ type: 'cellPatch', data: { before, after }, timestamp: Date.now(), label });
+                }
+            }
+            // 包裹期间跳过了基准刷新，这里补一次，避免后续 commitValues 拿过期基准
+            this._refreshBaseline();
+            this.emit(DataEvents.VALUES_CHANGED, this._values);
+        }
+    }
+
+    /**
+     * 回写局部单元格补丁（撤销/重做恢复）
+     *
+     * 一次遍历 `_values` 完成「命中即替换、data 为 null 即删除」；
+     * 补丁中未被命中的项（操作前不存在、操作后新增的格子）追加到末尾。
+     * 全程只做一次 {@link invalidateCellIndex}，不像「边 push 边查」那样
+     * 每个新增格子都触发一次整表索引重建。
+     * @param {CellPatchEntry[]} patch - 待回写的补丁
+     * @private
+     */
+    private _applyCellPatch(patch: CellPatchEntry[]): void {
+        const map = new Map<string, Cell | null>();
+        for (let i = 0; i < patch.length; i++) {
+            const e = patch[i];
+            // 克隆后再写入：撤销栈里的对象必须只读，否则后续编辑会改坏快照
+            map.set(e.cell, e.data ? (e.data as Cell).clone() : null);
+        }
+        const values = this._values;
+        let w = 0;
+        for (let i = 0; i < values.length; i++) {
+            const c = values[i];
+            if (!map.has(c.cell)) {
+                values[w++] = c;
+                continue;
+            }
+            const replacement = map.get(c.cell);
+            map.delete(c.cell);
+            if (replacement) values[w++] = replacement;
+        }
+        values.length = w;
+        // 补丁里没被消费掉的 = 该时刻新增的格子（补丁按行优先有序，追加顺序即行列序）
+        map.forEach((v) => { if (v) values.push(v); });
+        this.invalidateCellIndex();
+    }
+
+    /**
+     * 撤销/重做期间回写局部补丁并广播
+     *
+     * 与 {@link _applyValuesSnapshot} 同构：`_isApplyingUndo` 期间回写，
+     * 回写后刷新基准（下次 commitValues 的「变化前」）并广播 VALUES_CHANGED 驱动重绘。
+     * @param {CellPatchEntry[]} patch - 待回写的补丁
+     * @private
+     */
+    private _applyCellPatchAndBroadcast(patch: CellPatchEntry[]): void {
+        this._isApplyingUndo = true;
+        try {
+            this._applyCellPatch(patch);
+            this._refreshBaseline();
+            this.emit(DataEvents.VALUES_CHANGED, this._values);
+        } finally {
+            this._isApplyingUndo = false;
+        }
+    }
+
+    /**
      * 开始一次跨事件的连续操作撤销捕获（如拖拽调整行高/列宽）
      * 立即捕获全量状态快照作为「变化前」基准，并抑制 values setter 的自动快照记录，
      * 直到调用 {@link endContinuousUndo} 提交。两次调用必须成对出现。
@@ -2077,6 +2241,11 @@ export class DataCollection extends EventEmitter {
                 ? (action.data as { before: FullStateSnapshot; after: FullStateSnapshot }).before
                 : (action.data as { before: FullStateSnapshot; after: FullStateSnapshot }).after;
             this._applyFullStateSnapshot(snapshot);
+        } else if (action.type === 'cellPatch' && action.data) {
+            const patch = isUndo
+                ? (action.data as { before: CellPatchEntry[]; after: CellPatchEntry[] }).before
+                : (action.data as { before: CellPatchEntry[]; after: CellPatchEntry[] }).after;
+            this._applyCellPatchAndBroadcast(patch);
         } else {
             return;
         }
@@ -2417,6 +2586,67 @@ export class DataCollection extends EventEmitter {
             }
         }
         return null;
+    }
+
+    /**
+     * 汇总矩形区域**外轮廓**上的边框线宽
+     *
+     * 合并会把区域内除锚点外的格子整体删掉，它们的边框若不聚合就永久丢失
+     * （用户看到的是「合并后边框少了一截」）。Excel 的语义是：**只有落在区域
+     * 外轮廓上的那些边**才保留，内部网格线随合并消失——故这里只取四条边。
+     *
+     * 同一条边上多个格子线宽不一致时取第一个非空值（锚点只有一套边框字段，
+     * 无法表达「逐段不同」）。
+     * @param {number} minCol - 起始列（1-based）
+     * @param {number} maxCol - 结束列（1-based，含）
+     * @param {number} minRow - 起始行（1-based）
+     * @param {number} maxRow - 结束行（1-based，含）
+     * @returns 四条边的线宽（无边框的边为 undefined）
+     * @private
+     */
+    private collectOutlineBorders(minCol: number, maxCol: number, minRow: number, maxRow: number):
+        { top?: number; bottom?: number; left?: number; right?: number } {
+        const outline: { top?: number; bottom?: number; left?: number; right?: number } = {};
+        for (let col = minCol; col <= maxCol && outline.top === undefined; col++) {
+            const c = this.getCellByName(this.getCellName(col, minRow));
+            if (c && c.borderTopWidth) outline.top = c.borderTopWidth;
+        }
+        for (let col = minCol; col <= maxCol && outline.bottom === undefined; col++) {
+            const c = this.getCellByName(this.getCellName(col, maxRow));
+            if (c && c.borderBottomWidth) outline.bottom = c.borderBottomWidth;
+        }
+        for (let row = minRow; row <= maxRow && outline.left === undefined; row++) {
+            const c = this.getCellByName(this.getCellName(minCol, row));
+            if (c && c.borderLeftWidth) outline.left = c.borderLeftWidth;
+        }
+        for (let row = minRow; row <= maxRow && outline.right === undefined; row++) {
+            const c = this.getCellByName(this.getCellName(maxCol, row));
+            if (c && c.borderRightWidth) outline.right = c.borderRightWidth;
+        }
+        return outline;
+    }
+
+    /**
+     * 按名字集合批量删除单元格（**一次**遍历、只失效一次索引）
+     *
+     * 【性能约定，勿回退为「逐个 splice + findIndex」】
+     * 删除会让单元格索引世代失效，下一次 `getCellByName` 就要重建整份索引（O(N)）。
+     * 原实现在循环里交替「查找 → splice」，取消合并 1000 格时重建了 999 次索引，
+     * 5 万格实测 4.4 秒。这里改成「先收集名字 → 原地压缩一次」，重建次数恒为 1。
+     * @param {Set<string>} names - 待删除的单元格名
+     * @private
+     */
+    private _removeCellsByNames(names: Set<string>): void {
+        if (names.size === 0) return;
+        const values = this._values;
+        let w = 0;
+        for (let i = 0; i < values.length; i++) {
+            const c = values[i];
+            if (names.has(c.cell)) continue;
+            values[w++] = c;
+        }
+        values.length = w;
+        this.invalidateCellIndex();
     }
 
     /**
@@ -2808,47 +3038,52 @@ export class DataCollection extends EventEmitter {
      * 执行合并单元格操作
      */
     private executeMergeCells(minCol: number, maxCol: number, minRow: number, maxRow: number, colspan: number, rowspan: number): void {
-        try {
-            const sourceCell = this.findSourceCell(minCol, maxCol, minRow, maxRow);
-
+        // 合并只影响选区内的格子 → 走「局部补丁撤销」：
+        // 代价与选区大小成正比，不受大表阈值限制（整表快照在 10 万格以上会被关掉，
+        // 那正是「大表里合并完 Ctrl+Z 没反应」的根因）。
+        this.runWithCellPatchUndo('合并单元格', { minCol, maxCol, minRow, maxRow }, () => {
+            // ── 阶段一：只读（索引处于稳态，getCellByName 全是 O(1)）──
+            // 顺序极关键：一旦在下面「边改结构边按名查找」，每次 push/splice 都会
+            // 让索引世代失效，后续每次查找都要重建整份索引（O(N)）→ O(选区 × N)。
+            const source = this.findSourceCell(minCol, maxCol, minRow, maxRow);
+            const sourceCopy = source ? source.clone() : null;
+            const outline = this.collectOutlineBorders(minCol, maxCol, minRow, maxRow);
+            const anchorName = this.getCellName(minCol, minRow);
+            const anchor = this.getCellByName(anchorName);
+            const toRemove = new Set<string>();
             for (let row = minRow; row <= maxRow; row++) {
                 for (let col = minCol; col <= maxCol; col++) {
-                    const cellName = this.getCellName(col, row);
-                    const cellIndex = this.values.findIndex(c => c.cell === cellName);
-
-                    if (col === minCol && row === minRow) {
-                        if (cellIndex >= 0) {
-                            if (sourceCell) {
-                                Object.assign(this.values[cellIndex], sourceCell);
-                                this.values[cellIndex].cell = cellName;
-                            }
-                            this.values[cellIndex].colspan = colspan;
-                            this.values[cellIndex].rowspan = rowspan;
-                        } else {
-                            if (sourceCell) {
-                                sourceCell.cell = cellName;
-                                sourceCell.colspan = colspan;
-                                sourceCell.rowspan = rowspan;
-                                this.values.push(sourceCell);
-                            } else {
-                                const cell = new Cell();
-                                cell.cell = cellName;
-                                cell.colspan = colspan;
-                                cell.rowspan = rowspan;
-                                this.values.push(cell);
-                            }
-                        }
-                    } else {
-                        if (cellIndex >= 0) {
-                            this.clearCellValue(cellName);
-                            this.values.splice(cellIndex, 1);
-                        }
-                    }
+                    if (col === minCol && row === minRow) continue;
+                    const name = this.getCellName(col, row);
+                    if (this.getCellByName(name)) toRemove.add(name);
                 }
             }
-        } finally {
-            this.commitValues();
-        }
+
+            // ── 阶段二：结构性修改（此后不再按名查找）──
+            this._removeCellsByNames(toRemove);
+            const target = anchor || sourceCopy || new Cell();
+            if (anchor) {
+                // 源格内容整体覆盖锚点（源格可能就是被删掉的某个格子，故用克隆）
+                if (sourceCopy) {
+                    Object.assign(target, sourceCopy);
+                    target.cell = anchorName;
+                }
+            } else {
+                target.cell = anchorName;
+                this._values.push(target);
+            }
+            target.colspan = colspan;
+            target.rowspan = rowspan;
+            // 外轮廓边框：**锚点自己的四边优先**（Excel 语义：合并区沿用左上角单元格的
+            // 边框，A1 的四边在合并后就是 A1:C3 的四边）；锚点缺哪条边，再用区域内
+            // 落在同一条轮廓边上的格子的边框补齐（用户给整个区域加了外框时，
+            // 只有 C3 带右边框之类也很常见）。区域内部的网格线随合并消失。
+            target.borderTopWidth = (anchor && anchor.borderTopWidth) || outline.top;
+            target.borderBottomWidth = (anchor && anchor.borderBottomWidth) || outline.bottom;
+            target.borderLeftWidth = (anchor && anchor.borderLeftWidth) || outline.left;
+            target.borderRightWidth = (anchor && anchor.borderRightWidth) || outline.right;
+            this.invalidateCellIndex();
+        });
     }
 
     /**
@@ -2888,55 +3123,64 @@ export class DataCollection extends EventEmitter {
         const rowspan = topLeftCell.rowspan || 1;
         
         if (colspan === 1 && rowspan === 1) return;
-        
-        // 提取需要复制到所有单元格的样式（背景色和边框）
-        const sharedStyles: Partial<Cell> = {
-            backgroundColor: topLeftCell.backgroundColor,
-            borderTopWidth: topLeftCell.borderTopWidth,
-            borderBottomWidth: topLeftCell.borderBottomWidth,
-            borderLeftWidth: topLeftCell.borderLeftWidth,
-            borderRightWidth: topLeftCell.borderRightWidth
-        };
-        
-        try {
-            topLeftCell.colspan = 1;
-            topLeftCell.rowspan = 1;
-            
+
+        const minCol = topLeftCol;
+        const maxCol = topLeftCol + colspan - 1;
+        const minRow = topLeftRow;
+        const maxRow = topLeftRow + rowspan - 1;
+
+        // 取消合并同样只影响原合并区 → 走局部补丁撤销（大表下也可 Ctrl+Z / Ctrl+Y）
+        this.runWithCellPatchUndo('取消合并单元格', { minCol, maxCol, minRow, maxRow }, () => {
+            // ── 阶段一：只读（索引稳态，getCellByName 全 O(1)）──
+            // 必须在 push 之前把区域内已有格子全部查出来：下面会一边遍历一边补建
+            // 缺失的格子，若此时再按名查找，每 push 一个就重建一次整份索引（O(N)）。
+            const bg = topLeftCell.backgroundColor;
+            // 合并区的四边边框：取消合并后**只应出现在区域外轮廓上**。
+            // 历史实现把它们原样复制到区域内每一格 → 每个格子都变成「四边全有」，
+            // 取消合并后立刻长出一整片网格状粗线（用户反馈的「边框显示有问题」）。
+            const edge = {
+                top: topLeftCell.borderTopWidth,
+                bottom: topLeftCell.borderBottomWidth,
+                left: topLeftCell.borderLeftWidth,
+                right: topLeftCell.borderRightWidth,
+            };
+            const topLeftName = this.getCellName(minCol, minRow);
+            const existing = new Map<string, Cell>();
             for (let r = 0; r < rowspan; r++) {
                 for (let c = 0; c < colspan; c++) {
-                    const currentCol = topLeftCol + c;
-                    const currentRow = topLeftRow + r;
-                    const currentCellName = this.getCellName(currentCol, currentRow);
-                    const existingCell = this.getCellByName(currentCellName);
-                    
-                    if (r === 0 && c === 0) {
-                        // 左上角单元格：保留内容和所有样式
-                        if (existingCell) {
-                            existingCell.colspan = undefined;
-                            existingCell.rowspan = undefined;
-                        }
-                    } else {
-                        // 其他单元格：只保留背景色和边框，内容清空
-                        if (existingCell) {
-                            existingCell.colspan = undefined;
-                            existingCell.rowspan = undefined;
-                            existingCell.chars = [];
-                            Object.assign(existingCell, sharedStyles);
-                        } else {
-                            const cell = new Cell();
-                            cell.cell = currentCellName;
-                            cell.colspan = undefined;
-                            cell.rowspan = undefined;
-                            cell.chars = [];
-                            Object.assign(cell, sharedStyles);
-                            this.values.push(cell);
-                        }
-                    }
+                    const name = this.getCellName(minCol + c, minRow + r);
+                    const cell = this.getCellByName(name);
+                    if (cell) existing.set(name, cell);
                 }
             }
-        } finally {
-            this.commitValues();
-        }
+
+            // ── 阶段二：结构性修改（此后不再按名查找）──
+            for (let r = 0; r < rowspan; r++) {
+                for (let c = 0; c < colspan; c++) {
+                    const name = this.getCellName(minCol + c, minRow + r);
+                    let cell = existing.get(name);
+                    if (!cell) {
+                        cell = new Cell();
+                        cell.cell = name;
+                        this._values.push(cell);
+                    }
+                    cell.colspan = undefined;
+                    cell.rowspan = undefined;
+                    if (name === topLeftName) {
+                        // 左上角：保留内容与全部样式（含四边边框，它就在区域轮廓上）
+                        continue;
+                    }
+                    cell.chars = [];
+                    cell.backgroundColor = bg;
+                    // 只给「落在外轮廓上」的那几条边着色，内部一律无边框
+                    cell.borderTopWidth = r === 0 ? edge.top : undefined;
+                    cell.borderBottomWidth = r === rowspan - 1 ? edge.bottom : undefined;
+                    cell.borderLeftWidth = c === 0 ? edge.left : undefined;
+                    cell.borderRightWidth = c === colspan - 1 ? edge.right : undefined;
+                }
+            }
+            this.invalidateCellIndex();
+        });
     }
 
     /**
@@ -2983,49 +3227,55 @@ export class DataCollection extends EventEmitter {
      * 执行按列合并单元格操作
      */
     private executeMergeCellsByCol(minCol: number, maxCol: number, minRow: number, maxRow: number, rowspan: number): void {
-        try {
+        // 同 {@link executeMergeCells}：只读阶段与结构修改阶段严格分离，
+        // 索引重建次数恒为 1（历史实现是「每列各来一遍」）。
+        this.runWithCellPatchUndo('按列合并单元格', { minCol, maxCol, minRow, maxRow }, () => {
+            // ── 阶段一：只读 ──
+            const anchors: Array<Cell | undefined> = [];
+            const sources = new Map<string, Cell>();
+            const outlines = new Map<string, { top?: number; bottom?: number; left?: number; right?: number }>();
+            const anchorNames: string[] = [];
+            const toRemove = new Set<string>();
             for (let col = minCol; col <= maxCol; col++) {
-                const sourceCell = this.findSourceCell(col, col, minRow, maxRow);
-
+                const anchorName = this.getCellName(col, minRow);
+                anchorNames.push(anchorName);
+                const source = this.findSourceCell(col, col, minRow, maxRow);
+                if (source) sources.set(anchorName, source.clone());
+                outlines.set(anchorName, this.collectOutlineBorders(col, col, minRow, maxRow));
+                anchors.push(this.getCellByName(anchorName));
                 for (let row = minRow; row <= maxRow; row++) {
-                    const cellName = this.getCellName(col, row);
-                    const cellIndex = this.values.findIndex(c => c.cell === cellName);
-
-                    if (row === minRow) {
-                        // 当前列的第一行：设置 rowspan
-                        if (cellIndex >= 0) {
-                            if (sourceCell) {
-                                Object.assign(this.values[cellIndex], sourceCell);
-                                this.values[cellIndex].cell = cellName;
-                            }
-                            this.values[cellIndex].colspan = 1;
-                            this.values[cellIndex].rowspan = rowspan;
-                        } else {
-                            if (sourceCell) {
-                                sourceCell.cell = cellName;
-                                sourceCell.colspan = 1;
-                                sourceCell.rowspan = rowspan;
-                                this.values.push(sourceCell);
-                            } else {
-                                const cell = new Cell();
-                                cell.cell = cellName;
-                                cell.colspan = 1;
-                                cell.rowspan = rowspan;
-                                this.values.push(cell);
-                            }
-                        }
-                    } else {
-                        // 当前列的其他行：清除内容和样式
-                        if (cellIndex >= 0) {
-                            this.clearCellValue(cellName);
-                            this.values.splice(cellIndex, 1);
-                        }
-                    }
+                    if (row === minRow) continue;
+                    const name = this.getCellName(col, row);
+                    if (this.getCellByName(name)) toRemove.add(name);
                 }
             }
-        } finally {
-            this.commitValues();
-        }
+
+            // ── 阶段二：结构性修改 ──
+            this._removeCellsByNames(toRemove);
+            for (let i = 0; i < anchorNames.length; i++) {
+                const name = anchorNames[i];
+                const anchor = anchors[i];
+                const sourceCopy = sources.get(name);
+                const outline = outlines.get(name);
+                const target = anchor || sourceCopy || new Cell();
+                if (anchor) {
+                    if (sourceCopy) {
+                        Object.assign(target, sourceCopy);
+                        target.cell = name;
+                    }
+                } else {
+                    target.cell = name;
+                    this._values.push(target);
+                }
+                target.colspan = 1;
+                target.rowspan = rowspan;
+                target.borderTopWidth = (anchor && anchor.borderTopWidth) || (outline && outline.top);
+                target.borderBottomWidth = (anchor && anchor.borderBottomWidth) || (outline && outline.bottom);
+                target.borderLeftWidth = (anchor && anchor.borderLeftWidth) || (outline && outline.left);
+                target.borderRightWidth = (anchor && anchor.borderRightWidth) || (outline && outline.right);
+            }
+            this.invalidateCellIndex();
+        });
     }
 
     /**
@@ -3072,49 +3322,54 @@ export class DataCollection extends EventEmitter {
      * 执行按行合并单元格操作
      */
     private executeMergeCellsByRow(minCol: number, maxCol: number, minRow: number, maxRow: number, colspan: number): void {
-        try {
+        // 同 {@link executeMergeCellsByCol}，只是把「每列一个锚点」换成「每行一个锚点」
+        this.runWithCellPatchUndo('按行合并单元格', { minCol, maxCol, minRow, maxRow }, () => {
+            // ── 阶段一：只读 ──
+            const anchors: Array<Cell | undefined> = [];
+            const sources = new Map<string, Cell>();
+            const outlines = new Map<string, { top?: number; bottom?: number; left?: number; right?: number }>();
+            const anchorNames: string[] = [];
+            const toRemove = new Set<string>();
             for (let row = minRow; row <= maxRow; row++) {
-                const sourceCell = this.findSourceCell(minCol, maxCol, row, row);
-
+                const anchorName = this.getCellName(minCol, row);
+                anchorNames.push(anchorName);
+                const source = this.findSourceCell(minCol, maxCol, row, row);
+                if (source) sources.set(anchorName, source.clone());
+                outlines.set(anchorName, this.collectOutlineBorders(minCol, maxCol, row, row));
+                anchors.push(this.getCellByName(anchorName));
                 for (let col = minCol; col <= maxCol; col++) {
-                    const cellName = this.getCellName(col, row);
-                    const cellIndex = this.values.findIndex(c => c.cell === cellName);
-
-                    if (col === minCol) {
-                        // 当前行的第一列：设置 colspan
-                        if (cellIndex >= 0) {
-                            if (sourceCell) {
-                                Object.assign(this.values[cellIndex], sourceCell);
-                                this.values[cellIndex].cell = cellName;
-                            }
-                            this.values[cellIndex].colspan = colspan;
-                            this.values[cellIndex].rowspan = 1;
-                        } else {
-                            if (sourceCell) {
-                                sourceCell.cell = cellName;
-                                sourceCell.colspan = colspan;
-                                sourceCell.rowspan = 1;
-                                this.values.push(sourceCell);
-                            } else {
-                                const cell = new Cell();
-                                cell.cell = cellName;
-                                cell.colspan = colspan;
-                                cell.rowspan = 1;
-                                this.values.push(cell);
-                            }
-                        }
-                    } else {
-                        // 当前行的其他列：清除内容和样式
-                        if (cellIndex >= 0) {
-                            this.clearCellValue(cellName);
-                            this.values.splice(cellIndex, 1);
-                        }
-                    }
+                    if (col === minCol) continue;
+                    const name = this.getCellName(col, row);
+                    if (this.getCellByName(name)) toRemove.add(name);
                 }
             }
-        } finally {
-            this.commitValues();
-        }
+
+            // ── 阶段二：结构性修改 ──
+            this._removeCellsByNames(toRemove);
+            for (let i = 0; i < anchorNames.length; i++) {
+                const name = anchorNames[i];
+                const anchor = anchors[i];
+                const sourceCopy = sources.get(name);
+                const outline = outlines.get(name);
+                const target = anchor || sourceCopy || new Cell();
+                if (anchor) {
+                    if (sourceCopy) {
+                        Object.assign(target, sourceCopy);
+                        target.cell = name;
+                    }
+                } else {
+                    target.cell = name;
+                    this._values.push(target);
+                }
+                target.colspan = colspan;
+                target.rowspan = 1;
+                target.borderTopWidth = (anchor && anchor.borderTopWidth) || (outline && outline.top);
+                target.borderBottomWidth = (anchor && anchor.borderBottomWidth) || (outline && outline.bottom);
+                target.borderLeftWidth = (anchor && anchor.borderLeftWidth) || (outline && outline.left);
+                target.borderRightWidth = (anchor && anchor.borderRightWidth) || (outline && outline.right);
+            }
+            this.invalidateCellIndex();
+        });
     }
 
     /**
@@ -3275,21 +3530,26 @@ export class DataCollection extends EventEmitter {
         const minRow = Math.min(startRow0, endRow0);
         const maxRow = Math.max(startRow0, endRow0);
         // 收缩到范围内的可见行列（隐藏项不占位，选区框不覆盖其尺寸）
+        //
+        // 【性能约定，勿回退为「从 min 到 max 全量扫一遍」】
+        // 本方法每帧被 drawSelectedRect 调用，而选区可以大得离谱（全选 = A1:XFD1048576
+        // → 106 万次迭代/帧）。改成**从两端向内找，命中即停**：无隐藏行列时一步命中
+        // （绝大多数表格如此）；有隐藏时最多走「连续隐藏段」那么长，而不是整个选区。
         let startCol = -1;
-        let endCol = -1;
-        let startRow = -1;
-        let endRow = -1;
         for (let c = minCol; c <= maxCol; c++) {
-            if (!this.colHeaders.getAt(c - 1)?.isHidden) {
-                if (startCol < 0) startCol = c;
-                endCol = c;
-            }
+            if (!this.colHeaders.getAt(c - 1)?.isHidden) { startCol = c; break; }
         }
+        let endCol = -1;
+        for (let c = maxCol; c >= minCol; c--) {
+            if (!this.colHeaders.getAt(c - 1)?.isHidden) { endCol = c; break; }
+        }
+        let startRow = -1;
         for (let r = minRow; r <= maxRow; r++) {
-            if (!this.rowHeaders.getAt(r - 1)?.isHidden) {
-                if (startRow < 0) startRow = r;
-                endRow = r;
-            }
+            if (!this.rowHeaders.getAt(r - 1)?.isHidden) { startRow = r; break; }
+        }
+        let endRow = -1;
+        for (let r = maxRow; r >= minRow; r--) {
+            if (!this.rowHeaders.getAt(r - 1)?.isHidden) { endRow = r; break; }
         }
         // 选区完全落在隐藏行列上：返回空矩形
         if (startCol < 0 || startRow < 0) {

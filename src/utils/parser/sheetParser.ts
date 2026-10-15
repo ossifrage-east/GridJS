@@ -51,7 +51,7 @@ import {
 } from './cellSource';
 import { ZipParser, ZipArchive } from './zip';
 import { CompoundFile } from './cfb';
-import { BiffParser, BiffXf, BiffFont, BiffWorkbook, DEFAULT_PALETTE } from './biff';
+import { BiffParser, BiffXf, BiffFont, BiffWorkbook, DEFAULT_PALETTE, resolveFont } from './biff';
 import { scanXml, attrValue, XmlAttrs } from './xmlScanner';
 import { yieldToUI, SliceBudget } from '../../utils/scheduler';
 import { getCellDisplayText } from '../numberFormat';
@@ -751,8 +751,12 @@ export class SheetParser {
         const style: CellStyleInfo = {};
 
         // —— 字体 ——
-        const font: BiffFont | undefined = wb.fonts[xf.fontIndex];
-        if (font) {
+        // ⚠️ 必须走 resolveFont（MS-XLS 2.5.129）：BIFF8 的 FontIndex 取值集合是
+        // `{0,1,2,3} ∪ {5,6,…}`（下标 4 永不出现），直接 `fonts[ifnt]` 只有在
+        // 字体表按下标 == FontIndex 对齐时才成立；写成 `fonts[ifnt - 4]`
+        // 会让每个字体错位 3 格（字号/加粗/颜色全对不上）。
+        const font: BiffFont | undefined = resolveFont(wb.fonts, xf.fontIndex);
+        if (font && font.name) {
             style.font = {
                 name: font.name,
                 size: font.height || undefined,
@@ -782,30 +786,36 @@ export class SheetParser {
         }
 
         // —— 对齐 ——
-        // BIFF8 水平对齐：0 常规 1 左 2 居中 3 右 4 填充 5 两端 6 跨列居中 7 分散
-        //   （⚠️ 2 = 居中，不是左；历史把 2 当 left 且 7 当 center，均错）
-        // BIFF8 垂直对齐：0 顶 1 居中 2 底 3 两端 4 分散
-        //   （⚠️ 历史只映射了 0/1，且把 0 当 bottom —— 实际 0 是 top）
-        //
-        // 项目的 `TextAlign`/`VerticalAlign` 只有 4/3 个取值（无 distributed），
-        // 故 7/4 这类 BIFF 取值就近归一到 'justify'，避免写入渲染端不认识的字符串。
-        const hAlignMap: Record<number, NonNullable<CellStyleInfo['alignment']>['horizontal']> = {
-            0: 'left', 1: 'left', 2: 'center', 3: 'right',
-            4: 'justify', 5: 'justify', 6: 'center', 7: 'justify'
+        // BIFF8 水平对齐（`alc`）：0 常规 1 左 2 居中 3 右 4 填充 5 两端 6 跨列居中 7 分散
+        //   ⚠️ 0 是**常规(general)**，不是「左对齐」：常规由 Excel 按值类型自动决定
+        //   （数字右、文本左、布尔居中），固定成 left 会让所有数字都左对齐 ——
+        //   而 BIFF8 里绝大多数 XF 的 alc 就是 0（Excel 默认），影响面极大。
+        //   项目的 `TextAlign` 没有 general 态，这里用 undefined 表示「不指定」，
+        //   与 xlsx 路径口径一致（xlsx 只有显式写了 <alignment horizontal=…> 才产出
+        //   horizontal，没写的同样不产出）；渲染端对「未指定」的既有处理保持不变。
+        //   ⚠️ 4 是填充(fill)：把内容重复铺满整格，项目无此能力，按「左起」近似；
+        //   ⚠️ 7 是分散(distributed)：项目无此能力，归一到 'justify'。
+        // BIFF8 垂直对齐（`alcV`）：0 顶 1 居中 2 底 3 两端 4 分散
+        //   Excel 自己的默认值是 2=bottom（前 4 条 XF 亦如此）。3 两端对齐首行贴顶、
+        //   单行观感同顶；4 分散时文本块整体居中。项目无对应能力，就近归一。
+        const hAlignMap: Record<number, NonNullable<CellStyleInfo['alignment']>['horizontal'] | undefined> = {
+            0: undefined, 1: 'left', 2: 'center', 3: 'right',
+            4: 'left', 5: 'justify', 6: 'center', 7: 'justify'
         };
         const vAlignMap: Record<number, NonNullable<CellStyleInfo['alignment']>['vertical']> = {
-            0: 'top', 1: 'middle', 2: 'bottom', 3: 'bottom', 4: 'middle'
+            0: 'top', 1: 'middle', 2: 'bottom', 3: 'top', 4: 'middle'
         };
         const horizontal = hAlignMap[xf.horizontalAlignment];
         const vertical = vAlignMap[xf.verticalAlignment];
-        if (horizontal || vertical || xf.wrapText || xf.indent) {
-            style.alignment = {
-                horizontal: horizontal || 'left',
-                vertical: vertical || 'bottom',
-                wrapText: xf.wrapText || undefined,
-                indent: xf.indent || undefined
-            };
-        }
+        // 垂直对齐在 BIFF8 里**没有「未指定」态**（0=顶 1=中 2=底 …，Excel 自己的
+        // 默认值是 2=底），所以总是产出 alignment（至少带 vertical）；
+        // 水平对齐的「常规」则用 undefined 表示不指定。
+        style.alignment = {
+            horizontal,
+            vertical,
+            wrapText: xf.wrapText || undefined,
+            indent: xf.indent || undefined
+        };
 
         // —— 边框 ——
         // 四边**各自取色**：BIFF8 把左/右色编码在 u32@10 的高位，
@@ -833,6 +843,11 @@ export class SheetParser {
     /**
      * 读取 xls 单元格样式对应的数字格式码
      *
+     * ⚠️ `wb.formats` 只收录**自定义** FORMAT 记录（id ≥ 164）。XF 引用的
+     * id &lt; 164 是内置格式（9=`0%`、14=`m/d/yyyy`、49=`@` …），文件里没有对应记录，
+     * 必须回退到内置表，否则这些格子的百分比/日期格式会被整片丢掉。
+     * 内置表与 xlsx 路径共用 {@link builtinNumFmt}，两条路径口径一致。
+     *
      * @param wb - BIFF 工作簿
      * @param styleIndex - XF 索引
      * @returns 格式码；为内置 General 格式时返回 undefined
@@ -844,7 +859,7 @@ export class SheetParser {
         const formatIndex = xf.formatIndex;
         // 0 是内置的 General 格式，无需保留
         if (formatIndex === 0) return undefined;
-        return wb.formats.get(formatIndex);
+        return wb.formats.get(formatIndex) || this.builtinNumFmt(formatIndex);
     }
 
     /**

@@ -224,7 +224,14 @@ export interface BiffImage {
  */
 export interface BiffWorkbook {
     sheets: BiffSheet[];
-    fonts: BiffFont[];
+    /**
+     * 字体表，**下标严格等于 BIFF8 的 FontIndex**（MS-XLS 2.5.129）
+     *
+     * 与「第几条 FONT 记录」并不相同：FontIndex < 4 时是 0 起算的记录序号，
+     * FontIndex > 4 时是 **1 起算** 的记录序号，且 4 永不出现。
+     * 因此下标 4 恒为空洞（`undefined`）。详见 {@link BiffParser.parseFont}。
+     */
+    fonts: Array<BiffFont | undefined>;
     formats: Map<number, string>;
     xfs: BiffXf[];
     palette: string[];
@@ -280,6 +287,28 @@ const ERROR_VALUES: string[] = [
 ];
 
 /**
+ * 按 BIFF8 FontIndex 取字体（MS-XLS 2.5.129）
+ *
+ * {@link BiffWorkbook.fonts} 的下标已按 FontIndex 语义对齐（下标 4 是空洞），
+ * 所以这里就是一次直查；抽成函数是为了让「取值集合 = {0,1,2,3}∪{5,6,…}」
+ * 这条规则只有一处实现、便于测试与复用（SST 富文本 run、TXO run 共用同一套索引）。
+ *
+ * 索引越界或落到空洞（`undefined`）时回退到默认字体（下标 0），
+ * 与 Excel 遇到非法字体索引时的行为一致。
+ *
+ * @param fonts - 字体表（下标 == FontIndex）
+ * @param fontIndex - XF / 富文本 run 里的 ifnt
+ * @returns 命中的字体；表为空时返回 undefined
+ */
+export function resolveFont(
+    fonts: Array<BiffFont | undefined>,
+    fontIndex: number
+): BiffFont | undefined {
+    // 规范保证 ifnt 永不等于 4；这里不做特判，靠「下标 4 是空洞」自然回退。
+    return fonts[fontIndex] ?? fonts[0];
+}
+
+/**
  * BIFF8 解析器
  *
  * @example
@@ -328,15 +357,10 @@ export class BiffParser {
         this.readImages = options.readImages === true;
         this.workbook = {
             sheets: [],
-            // BIFF8 字体索引 0-3 为保留值，首个 FONT 记录对应索引 4。
-            // 预填 4 个占位条目使数组下标与 BIFF 索引对齐，
-            // 否则 XF 的 fontIndex=4 会错误地访问第 5 个字体而非第 1 个。
-            fonts: [
-                { name: '', height: 0, bold: false, italic: false, underline: false, strikethrough: false, colorIndex: 0, superscript: false, subscript: false },
-                { name: '', height: 0, bold: false, italic: false, underline: false, strikethrough: false, colorIndex: 0, superscript: false, subscript: false },
-                { name: '', height: 0, bold: false, italic: false, underline: false, strikethrough: false, colorIndex: 0, superscript: false, subscript: false },
-                { name: '', height: 0, bold: false, italic: false, underline: false, strikethrough: false, colorIndex: 0, superscript: false, subscript: false }
-            ],
+            // 字体表**按下标 == FontIndex 语义**填充，见 parseFont：
+            // 前 4 条 FONT 记录落到下标 0-3；下标 4 是规范禁止引用的空洞，
+            // 第 5 条记录落到下标 5。
+            fonts: [],
             formats: new Map<number, string>(),
             xfs: [],
             palette: DEFAULT_PALETTE.slice(),
@@ -455,15 +479,31 @@ export class BiffParser {
             this.parseSst(this.sstHeaderPos, sstRec.length);
         }
 
-        // BIFF8 字体索引 0-3 为保留值，但部分文件（尤其是旧版 Excel 或第三方工具）
-        // 仍会在 XF 中引用它们。规范未定义此行为，实测 Excel 会回退到工作簿默认字体
-        // （即第一个 FONT 记录，索引 4）。将 fonts[4] 复制到 0-3 槽位，
-        // 使这些 XF 至少能拿到正确的字体名/大小/颜色，而非空占位。
-        const defaultFont = this.workbook.fonts[4];
-        if (defaultFont && defaultFont.name) {
-            for (let i = 0; i < 4; i++) {
-                this.workbook.fonts[i] = { ...defaultFont };
-            }
+        // 规范（MS-XLS 2.5.129）要求前 4 条 FONT 记录必定存在且依次是
+        // 「默认字体 / 粗体 / 斜体 / 粗斜体」。少数第三方写入器只写其中一部分，
+        // 此时按该语义把缺失的下标补出来，否则 XF 用 ifnt 0-3 会取不到字体。
+        this.ensureDefaultFontSlots();
+    }
+
+    /**
+     * 补齐前 4 个字体槽位（下标 0-3）
+     *
+     * 只在文件缺记录时补，语义按 MS-XLS 2.5.129 的对照表：
+     * `0` 默认字体、`1` 默认字体加粗、`2` 默认字体倾斜、`3` 默认字体加粗倾斜。
+     *
+     * @private
+     */
+    private ensureDefaultFontSlots(): void {
+        const fonts = this.workbook.fonts;
+        const base = fonts[0];
+        if (!base) return;
+        for (let i = 0; i < 4; i++) {
+            if (fonts[i]) continue;
+            fonts[i] = {
+                ...base,
+                bold: i === 1 || i === 3 || base.bold,
+                italic: i === 2 || i === 3 || base.italic
+            };
         }
     }
 
@@ -565,12 +605,33 @@ export class BiffParser {
      * ② 上下标取自 `flags` 的 bit4/bit5（那是轮廓/阴影）——应取偏移 8 的 escapement；
      * ③ 未处理颜色索引 0x7FFF（自动色），会去查一个不存在的调色板项。
      *
+     * **字体索引（本方法负责维护数组下标）** —— MS-XLS 2.5.129 FontIndex：
+     *
+     * > If this value is less than 4, then it specifies a **zero-based** index of a Font
+     * > record …; if this value is greater than 4, then it specifies a **one-based** index
+     * > …; MUST NOT equal 4.
+     *
+     * 即取值集合是 `{0,1,2,3} ∪ {5,6,7,…}` —— **下标 4 被永久跳过**，
+     * 第 5 条 FONT 记录对应 ifnt 5（不是 4）。所以填充字体表时要在下标 4 留一个空洞，
+     * 数组下标才与 FontIndex 一一对应（`wb.fonts[ifnt]` 直接可用）。
+     *
+     * 历史实现把整个表按 `ifnt - 4` 对齐（前 4 格占位、记录从下标 4 开始），
+     * 于是**每个字体都错位 3 格** —— 症状正是「字号/加粗/颜色与 Excel 对不上」：
+     * 例如夹具里 XF 用 ifnt=7（应为第 6 条记录：Arial 36pt）会被取成第 3 条
+     * （宋体 11pt）。现按规范对齐。
+     *
      * @param offset - 记录数据起始偏移
      * @param length - 记录长度
      * @private
      */
     private parseFont(offset: number, length: number): void {
         if (length < 16) return;
+
+        // 前 4 条记录占下标 0-3；第 5 条记录起 ifnt 是「1 起算」的，
+        // 因此在准备写入第 5 条（此时数组长度恰为 4）时把下标 4 挖空。
+        if (this.workbook.fonts.length === 4) {
+            this.workbook.fonts.length = 5;
+        }
 
         const heightTwips = this.view.getUint16(offset, true);
         const flags = this.view.getUint16(offset + 2, true);
@@ -678,6 +739,13 @@ export class BiffParser {
         const alignByte = this.data[offset + 6];
         const rotationByte = this.data[offset + 7];
         const indentByte = this.data[offset + 8];
+        // XF_USED_ATTRIB（偏移 9）：bit0=fAtrNum bit1=fAtrFnt bit2=fAtrAlc
+        // bit3=fAtrBdr bit4=fAtrPat …，语义是「该属性是否有效」。
+        // **刻意不用它做门控**：两份夹具实测都从不置起 bit0/bit1 ——
+        // test/_ref_xlwt.xls 只出现 0xF4 / 0xF8，test/test_sample.xls 出现
+        // 0x00/0x94/0x9C/0xB4/0xD4/0xF4/0xF8/0xFC，**全部** bit0=bit1=0。
+        // 按它过滤会把字体和数字格式整片丢掉，而这两项在 XF 里本就是实值。
+        // 单元格 XF（fStyle=0）的各字段直接采信即可。
         const usedByte = this.data[offset + 9];
 
         // ── 边框线型与「左/右」边框色：全部位于偏移 10 的 u32 内 ──
@@ -711,8 +779,10 @@ export class BiffParser {
             horizontalAlignment: alignByte & 0x07,
             // ⚠️ 垂直对齐是 bit6-4（**3 位**），历史实现写成 bit3-4 只取了 1 位
             verticalAlignment: (alignByte >>> 4) & 0x07,
-            // bit3 是「文本在右边框换行」，不是自动换行；BIFF8 的 wrap 在 bit3 之外的
-            // 「对齐相关」位无可直接映射项，这里按 bit3 与水平对齐 5/7 的语义兜底
+            // 对齐字节 @6 的位分配（MS-XLS 2.4.353 / OpenOffice BIFF8 §5.5）：
+            //   bit0-2 = alc（水平）  bit3 = fWrap（自动换行）  bit4-6 = alcV（垂直）
+            // ⚠️ alcV 是 **3 位**（历史实现写成 bit3-4 只取了 1 位，1 与 4 都读成 0）。
+            // fWrap 由 test/_ref_xlwt.xls 的 `al.wrap = 1` 实证：该 XF 读出 true。
             wrapText: (alignByte & 0x08) !== 0,
             rotation: rotationByte,
             indent: indentByte & 0x0F,

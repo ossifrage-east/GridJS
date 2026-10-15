@@ -1179,12 +1179,18 @@ decode(file) → DecodedWorkbook → extract() → ExtractedSheet[] → generate
 - 列宽 → `ColHeader.width`（缺省 `DEFAULT_CELL_WIDTH`），行高 → `RowHeader.height`（缺省 `DEFAULT_CELL_HEIGHT`），并逐项累加 `left` / `top`
 - 数字格式：非 `General` 的格式码写入 `cell.numberFormat`
 - 边框样式映射：`thin`/`dotted`/`dashed`/`hair` 等 → 1，`medium`/`mediumDashed` 等 → 2，`thick` → 3
+- **对齐映射（`.xls` / BIFF8）**：`alc=0` 是**常规(general) → 不写 `textAlign`**（由渲染端按值类型自动决定：
+  数字右/文本左/布尔居中，写死 `left` 会让所有数字左对齐）；`alc=1/2/3` → `left`/`center`/`right`；
+  `alcV=0/1/2` → `alignItems` 的 `top`/`middle`/`bottom`。项目 `TextAlign` 无 `general` 态，
+  `undefined` 即「不指定」，与 `.xlsx` 路径口径一致。
+- **字体索引（`.xls` / BIFF8）**：`BiffWorkbook.fonts` 的下标**严格等于 FontIndex**（MS-XLS 2.5.129，
+  取值集合 `{0,1,2,3} ∪ {5,6,…}`，**下标 4 恒为空洞**）；取字体必须走 `resolveFont(fonts, ifnt)`。
 - 颜色转换：`argbToHex()` 将 `AARRGGBB` → `#RRGGBB`
-- 内置格式码：`builtinNumFmt()` 覆盖 ID 0/1/2/3/4/9-11/14-17/22/37-40/44-49
+- 内置格式码：`builtinNumFmt()` 覆盖 ID 0/1/2/3/4/9-11/14-17/22/37-40/44-49；
+  **`.xls` 的 `biffNumberFormat` 也必须回退到它**（`wb.formats` 只收录自定义 id ≥ 164）
 
-> **当前状态**：`SheetParser` 尚未接入主流程（`src/` 内暂无其它模块引用），属于已完成但待集成的解析能力。
->
-> **已知问题**：`npx tsc --noEmit` 在该文件报 6 处类型错误——`xlsx-js-style` 的 `ColInfo` / `RowInfo` 类型未声明 `customWidth` / `customHeight` 字段（运行时存在，仅类型缺失）。集成前需补类型声明或改用 `wpx/hpx` 之外的判断方式。
+> **当前状态**：已接入主流程——`fileOpener` 经 `parserClient.parseWorkbook()` 调用 `SheetParser`
+> （Worker 可用时走 Worker，不可用时回退主线程），`.xlsx` / `.xls` 均由此路径导入。
 
 ---
 

@@ -1571,6 +1571,180 @@ npx tsc --noEmit 干净；npm run build 成功
 
 ---
 
+### 12.14 第十五轮：.xls 字体样式/字号/颜色/对齐不精准 —— FontIndex 跳过 4（MS-XLS 2.5.129）
+
+用户反馈「.xls 解析里字体样式、大小、颜色、对齐方式仍不够精准」。逐项复核后定位到
+**一个字节级根因 + 两处映射口径**，并用 xlwt 写入端造了「意图已知」的绝对真值夹具做双向验证。
+
+#### 根因：`BiffWorkbook.fonts` 与 BIFF8 FontIndex 差 3 格
+
+MS-XLS 2.5.129（FontIndex）原文：
+
+> If this value is less than 4, then it specifies a **zero-based** index of a Font record …;
+> if this value is greater than 4, then it specifies a **one-based** index …; **MUST NOT equal 4**.
+
+即 FontIndex 的取值集合是 `{0,1,2,3} ∪ {5,6,7,…}`——**下标 4 被永久跳过**，
+第 5 条 FONT 记录对应 ifnt **5**（不是 4）；前 4 条记录固定是「默认字体 / 粗体 / 斜体 / 粗斜体」。
+
+历史实现把整张表按 `ifnt - 4` 对齐（预填 4 个占位条目、记录从下标 4 开始 push），
+于是**每个字体都错位 3 格**：XF 用 `ifnt=8`（应为第 8 条记录 Verdana 20pt bold）会取到
+第 5 条记录（Arial 10pt）。症状正是用户说的「字号/粗细/颜色跟 Excel 对不上」。
+
+**修法**：`parseFont` 在准备写入第 5 条记录时把 `fonts.length` 置 5（挖空下标 4），此后逐条 push，
+使**数组下标 ≡ FontIndex**；取字体统一走新增的 `resolveFont(fonts, ifnt)`（落空洞/越界时回退默认字体 = 下标 0）。
+`fonts` 类型相应改为 `Array<BiffFont | undefined>`，让「下标 4 是空洞」在类型上可见。
+另把「把 `fonts[4]` 复制到 0-3」的旧兜底换成 `ensureDefaultFontSlots()`——按规范语义补齐
+「默认/粗/斜/粗斜」四种组合，而不是四份相同副本。
+
+> 同一套索引被 **XF 记录、SST 富文本 run、TXO 格式 run** 三处共用，所以这个错位是「全样式层」的。
+
+#### 映射口径：`alc = 0` 是「常规」，不是「左对齐」
+
+BIFF8 的每个 XF 都带对齐字节，绝大多数格子的 `alc` 就是 **0**。而 0 的语义是
+**常规(general)**——由 Excel 按值类型自动决定（数字右、文本左、布尔居中），
+历史把它固定映射成 `left`，结果是「所有数字都被左对齐」。
+项目的 `TextAlign` 没有 general 态，故改为 `undefined` 表示「不指定」，
+与 xlsx 路径一致（xlsx 只有显式写了 `<alignment horizontal=…>` 才产出 horizontal）。
+
+顺带把两个「就近归一」项校准：`alc=4`（填充，把内容重复铺满）→ `left`（原 `justify`）、
+`alcV=3`（垂直两端，首行贴顶）→ `top`（原 `bottom`）。
+复核确认 `alc=2/3` 与 `alcV=0/1/2` 本来就是对的（`2` 一直是 `center`），未改。
+
+#### 附带：内置数字格式回退
+
+`wb.formats` 只收录**自定义** FORMAT 记录（id ≥ 164）；XF 引用 id < 164 时文件里没有对应记录，
+历史直接返回 `undefined` → `9`(`0%`)、`14`(`m/d/yyyy`)、`49`(`@`) 等整片丢失。
+改为回退 `builtinNumFmt`（与 xlsx 路径共用同一张表）。
+
+#### 刻意**不做**的两件事（都有实测依据）
+
+- **不用 XF_USED_ATTRIB(@9) 做门控**：实测两份夹具该字节的 bit0(fAtrNum)/bit1(fAtrFnt) **恒为 0**
+  （`_ref_xlwt.xls` 只出现 `0xF4`/`0xF8`；`test_sample.xls` 出现 `00/94/9C/B4/D4/F4/F8/FC`），
+  按它过滤会把字体和数字格式整片丢掉。单元格 XF（`fStyle=0`）的字段本就是实值，直接采信。
+- **不给 Cell 模型加 double 线型**：`Cell` 只有 `border*Width: 1|2|3`，`double` 无落点，
+  故 `borderStyleToWidth` 的兜底 `1` 保持不变（属数据模型限制，不是解析错）。
+
+#### 真值来源（三层交叉）
+
+1. `test/_make_ref_xlwt.py` 用 xlwt 写 `test/_ref_xlwt.xls`（**写入端意图已知**）：
+   6 种字体（Verdana 20pt 粗 `#CCFFCC`、Times New Roman 8pt 斜 `#0000FF`、Courier New 14pt `#008000`、
+   Arial 11pt 粗斜 `#FFCC99`、Consolas 9pt `#000000`、SimSun 16/12pt）、居中+垂直居中+换行、右对齐、
+   常规+垂直居中、纯黄底（`#FFFF00`）、四边 `thin/double/thick/dashed` 各带色。
+2. xlrd 1.2 读回交叉验证（`font_list`/`xf_list`/`cell_xf`）。
+3. `test/_probe_xls_styles.js` 把项目解析器的**四层**输出倒出来逐项对照：
+   `[1]` FONT 表 → `[2]` XF→CellStyleInfo → `[3]` 单元格→XF → `[4]` 端到端 Cell。
+
+> ⚠️ 踩坑记录：xlwt 夹具必须把样式作为**第 4 个参数**传给 `ws.write()`。只调
+> `ws.row(i).set_style(st)` 时样式**不会**落到 `CELL` 记录上，全部格子会静默停在默认 XF，
+> 于是「看起来解析全对」——白验一轮。
+
+#### 测试守卫
+
+`test-biff.js` 120/133（含陈旧期望）→ **160/160**：
+
+- `[11]` 节：字体数改 **28**（27 条记录 + 下标 4 空洞）、新增「下标 4 是空洞」断言、
+  FONT 断言全部改成**按下标 == FontIndex** 逐条（0/1/5/6/7/9/12/13）、
+  新增 `resolveFont` 7 条（含 `resolveFont(4)`/`resolveFont(99)` 回退、`≠ fonts[ifnt-4]`）、
+  内置数字格式回退 4 条；XF 数 67 → **68**；XF[64]/[65] 角色按真值纠正（**XF[64] 是
+  `ifnt=5`→Arial 20pt 无填充；XF[65] 才是 `solid` 前景色 13 = 黄底**），新增 XF[67] 居中。
+- `[12]` 节：按 `_probe_xls_styles.js` 的 `[3]` 段真值重写「单元格 → XF」对照表，
+  并把原来 `if (s66) {…}` 这种**条件式空洞断言**（拿到 undefined 就整块静默跳过）
+  改成**先断言存在、再断言属性**，补上 XF[64] 的 `ifnt=5`→Arial/20pt 端到端回归。
+
+`test-sheetparser.js` 45/49 → **55/55**：
+
+- `values 共 49 个` → **38**：49 是**原始记录数**，合并区 `(0,0)-(0,3)` 吸收 B1/C1/D1 共 3 格、
+  `(21,1)-(23,3)` 吸收 B22 以外的 8 格，49 − 3 − 8 = 38。
+- 删掉 `B1/C1/D1 文本为 年龄/分数/日期`——表头行 R1 是 A1:D1 **整块合并**，这三格根本不存在。
+- 新增：`D4` 字体名/字号（`ifnt=5` 端到端回归）、`A1 textAlign === undefined` + `alignItems === 'top'`、
+  `B8` 存在且底色 `#FFFF00`（MULBLANK 空白格仅承载样式）。
+
+#### 反证（四条，全部确认能失败）
+
+| 故意破坏 | 结果 |
+|---|---|
+| 去掉 `parseFont` 的「下标 4 挖空」 | `test-biff.js` **12 条 FAIL**（FONT[5].height 20→12、FONT[12] 颜色 54→23…）+ `test-sheetparser.js`「D4 字号 20→12」 |
+| `hAlignMap[0]` 退回 `'left'` | `test-biff.js`「R7C1 水平对齐 undefined」FAIL + `test-sheetparser.js`「A1 textAlign 未指定」FAIL |
+| `biffNumberFormat` 去掉内置回退 | `test-biff.js`「内置日期/内置百分比」2 条 FAIL |
+| `resolveFont` 去掉空洞回退 | `test-biff.js`「空洞/越界回退」2 条 FAIL（并顺带把断言改成 null-safe，避免抛 TypeError 中断整文件） |
+
+#### 全量校验结果
+
+```
+test-biff.js           通过 160 / 160   （本轮 120 → 160）
+test-sheetparser.js    通过  55 /  55   （本轮  45 →  55）
+其余 17 个测试文件与本轮改动前逐项一致（含 5 个**预先存在**的失败文件，见下）
+npx tsc --noEmit 干净；npm run build 成功（主包 + parser.worker.js）
+```
+
+> ⚠️ **预先存在的失败（非本轮引入）**：`test-filter.js` 29/30、`test-filter-clear-and-visible.js` 63/70、
+> `test-render-opt.js` 34/35、`test-snapshot-v4.js` 54/55、`test-xlsx-parse.js` 94/99。
+> 已用 `git stash push/pop` 把本轮两个源文件还原后再跑一遍，**五项计数完全相同**，
+> 且失败的断言都不在 .xls 样式链路上（分别为 ZOOM_CHANGED 接线、可见范围、源码级「无第二份实现」守卫、
+> xlsx 夹具格数/富文本/百分比）。待单独排查。
+
+---
+
+### 12.15 第十六轮：大表「合并/撤销 50+ 单元格」卡顿 + 边框错 + 撤销失效 + 大选区背板丢失
+
+用户反馈（数据量大的表格）：① 合并或撤销 50 个以上单元格时卡顿；② 单元格边框显示有问题；
+③ 撤销和重做不管用；④ 选择范围超出屏幕时，选择框的背景无法正确显示。
+
+四个现象、五个根因（其中一个是**根因级既有 bug**），全部用 `test/_bench-merge.js` 实测定位。
+
+#### 根因
+
+| # | 现象 | 根因 | 实测 |
+|---|---|---|---|
+| 1 | 卡顿 | `unmergeCells` 在双重循环里**一边 `values.push()` 一边 `getCellByName()`**：每 push 一个就改了 `_values.length`，下一次查找即触发**整份索引重建 O(N)** | 选区 1000 格 → 重建 **999 次** → 5 万格 **4396ms** |
+| 2 | 撤销不管用 | `_undoTrackingEnabled()` 在 `_values.length ≥ 100000` 时整表快照记账**全关**；且合并删格后跌破阈值又恢复 → 「有时能撤销有时不能」 | 30 万格合并后撤销栈 **0** |
+| 3 | 边框错 | 取消合并把**四边边框复制给区域内每一格**（9 格全变 `1111` → 网格状粗线）；合并时又直接 splice 掉区域内格子的边框 → 外轮廓丢失 | 逐格倒出确认 |
+| 4 | **幽灵单元格** | `getCellByName` 的命中分支「`cell.cell === name` 就**直接返回**」不做失效判定 → 按名删除后旧 `_cellIndex` 仍留条目 | 合并后 `getCellByName('B1')` 仍返回对象 |
+| 5 | 背板丢失 | `drawSelectedRect` 按**整个选区**建 `OffscreenCanvas`，超出浏览器上限（Chrome 单边 65535px、总像素 2^28）→ 画布**静默变空白** | 全选/拖到表底必现 |
+
+> #4 是 #2 修好后撤销**仍**不生效的直接原因：补丁的 after 快照把幽灵当成现存格子写回去了。
+
+#### 修复
+
+1. **只读阶段 / 修改阶段分离**（`executeMergeCells` / `executeMergeCellsByCol` / `ByRow` / `unmergeCells`）：
+   阶段一用 `getCellByName` 把涉及的格子全查出来，阶段二一次性改 `_values`（删格走新增的 `_removeCellsByNames`，
+   原地压缩、O(N) 一次），末尾只 `invalidateCellIndex()` 一次。**索引重建次数从「选区格数」降到常数**。
+2. **局部补丁撤销 `runWithCellPatchUndo`**（`type: 'cellPatch'`，`CellPatchSnapshot`）：
+   只捕获矩形区域内格子的前后克隆，**代价与区域大小成正比、不受 10 万格阈值限制**。
+   `_undoRestoreCallback` 加分支 + `_applyCellPatchAndBroadcast`；`_cellPatchUndoDepth > 0` 时
+   `_recordValuesChange` 跳过整表基准刷新（否则小表每次白拷一份整表）。
+   只适用于**影响范围可预先确定**的操作；删除行列会整体平移 → 仍走 `runWithFullStateUndo`。
+3. **边框只认外轮廓**：新增 `collectOutlineBorders`。合并时**锚点四边优先**、缺失由轮廓上其它格子补齐；
+   取消合并时**只给落在外轮廓上的那条边**着色。
+4. `getCellByName` 的失效判定与 `_ensureCellIndex` **同源**（`长度变 || _indexStructurallyInvalid` → 重建；
+   仅内容变 → 只刷 epoch）。
+5. 新增导出纯函数 **`clipRectToViewport`**，`drawSelectedRect` 用它求「选区 ∩ 视口」再建离屏画布；
+   `getSelectedRect()` 找可见端点改为**从两端向内、命中即停**（无隐藏行列时 O(1)，全选不再是 106 万次/帧）。
+
+#### 实测（同基准，改动前 → 改动后）
+
+```
+                          合并              取消合并            撤销栈
+30 万格 / 60 格选区      83  → 164ms      2814 →   74ms      0 → 1（可撤销）
+ 5 万格 / 1000 格选区   125  →  41ms      4396 →   55ms      1 → 2
+索引重建次数（取消合并）                    999  →    1 次
+```
+
+`_rebuildCellIndex` 单次的既有地板：5 万格 8ms / 10 万格 17ms / 30 万格 79ms。
+
+#### 全量校验结果
+
+```
+test-merge-undo.js（新增）  通过 56 / 56
+其余 23 个测试文件与本轮改动前逐项一致（含 5 个预先存在的失败文件）
+npx tsc --noEmit 干净；npm run build 成功
+```
+
+**反证 5 条全部确认能失败**：恢复「命中即返回」→ 6 条 FAIL；取消合并改回四边复制 → 7 条；
+裁剪函数改回原样返回 → 5 条；`cellPatch` 加回大表门控 → 7 条；取消合并改回「边 push 边查」→ 1 条（重建 999 次）。
+
+---
+
 ## 13. 度量与验收指标
 
 **打点位置**（用 `performance.mark/measure`）：
@@ -1676,3 +1850,10 @@ getCellByName(name):
   「当目录用」一律走 `containerPathOf`（根节点返回 `''`）；③ 搬迁计划**只能**由 `collectFilePaths` 生成
   （显示名会混淆同名文件）；④ `drop` 处理器必须**先 `moveNodeTo` 再 `clearDragState`**
   （顺序反了 `canDropOn` 的二次校验恒 false → 拖拽静默失效）。
+- **BIFF8 样式三条铁律**（第十五轮，见 12.14）：① `fonts` 下标 **≡ FontIndex**（`{0,1,2,3} ∪ {5,6,…}`，
+  下标 4 恒为空洞），取字体只能走 `resolveFont`；② 水平 `alc=0` 是**常规** → 不写 `textAlign`（不是 `left`！）；
+  ③ `biffNumberFormat` 必须回退 `builtinNumFmt`（`wb.formats` 只收自定义 id ≥ 164）。
+- **大表合并/撤销四条铁律**（第十六轮，见 12.15）：① 批量结构修改必须**只读阶段与修改阶段分离**
+  （交替「push/splice + 按名查找」= 每格重建一次整份索引）；② `getCellByName` 的**命中分支也要走失效判定**
+  （否则拿到已从 `values` 删除的幽灵单元格）；③ 范围可预定的操作走 `runWithCellPatchUndo`（不受 10 万格阈值限制），
+  范围不可预定的（删除行列）才走全量快照；④ 选中框背板必须 `clipRectToViewport`（否则大选区时画布超限静默变空白）。

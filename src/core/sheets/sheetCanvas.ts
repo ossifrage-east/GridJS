@@ -17,6 +17,30 @@ import { Filter } from "../assistant/filter";
 import { layoutVisibleImages, type ImageLayoutGrid } from "./imageLayout";
 import { SheetImageLayer } from "./sheetImageLayer";
 
+/**
+ * 把选区矩形裁剪到视口范围（**纯函数**，便于单测）
+ *
+ * 选区可以远大于屏幕（全选、Ctrl+Shift+↓ 拖到表底、拖选几万行），此时直接用
+ * 选区尺寸建离屏画布会超出浏览器画布上限（Chrome 单边 65535px、总像素 2^28），
+ * 超限后画布静默变空白 —— 这就是「选区一大，选中框的半透明背景整片消失」的原因。
+ * 裁剪后背板的尺寸恒不超过视口，既不会超限，也不必为屏外区域白填像素。
+ *
+ * @param rect - 选区矩形（工作表坐标系，相对视口原点）
+ * @param view - 视口宽高
+ * @returns 裁剪后的矩形；与视口无交集时返回 null
+ */
+export function clipRectToViewport(
+    rect: { left: number; top: number; width: number; height: number },
+    view: { width: number; height: number }
+): { left: number; top: number; width: number; height: number } | null {
+    const left = Math.max(rect.left, 0);
+    const top = Math.max(rect.top, 0);
+    const right = Math.min(rect.left + rect.width, view.width);
+    const bottom = Math.min(rect.top + rect.height, view.height);
+    if (right <= left || bottom <= top) return null;
+    return { left, top, width: right - left, height: bottom - top };
+}
+
 export class SheetCanvas extends Canvas {
     /** 筛选按钮实例：单元格名 → Filter（每帧按名字定位，避免数组 find 的 O(F²)） */
     private filters: Map<string, Filter> = new Map();
@@ -463,36 +487,52 @@ export class SheetCanvas extends Canvas {
         // 跳过绘制，否则零尺寸 OffscreenCanvas 会导致 drawImage 抛出异常
         if (width <= 0 || height <= 0) return;
         const { activedLeft, activedTop, activedWidth, activedHeight } = this.data.getActivedRect();
-        // 绘制选中区域背景及activedCell透明背景
-        const { offscreenCanvas, offscreenCtx } = this.offscreen(width * this.data.zoom * window.devicePixelRatio,
-            height * this.data.zoom * window.devicePixelRatio);
-        offscreenCtx.clearRect(0, 0, 
-            width * this.data.zoom * window.devicePixelRatio,
-            height * this.data.zoom * window.devicePixelRatio);
-        // 绘制选中区域背景（从 offscreenCanvas 的原点开始绘制）
-        offscreenCtx.fillStyle = DEFAULT_SELECTED_BG_COLOR;
-        offscreenCtx.fillRect(0, 0,
-            offscreenCanvas.width,
-            offscreenCanvas.height);
-        
-        // 绘制activedCell透明背景（使用相对坐标）
-        offscreenCtx.clearRect(
-            (activedLeft - left) * this.data.zoom * window.devicePixelRatio,
-            (activedTop - top) * this.data.zoom * window.devicePixelRatio,
-            activedWidth * this.data.zoom * window.devicePixelRatio,
-            activedHeight * this.data.zoom * window.devicePixelRatio);
+        const zoom = this.data.zoom;
+        const dpr = window.devicePixelRatio;
 
-        // 绘制选中区域背景
+        // 【视口裁剪，勿回退为「按整个选区建离屏画布」】
+        // 选区常常远大于屏幕（全选、拖到第几万行、Ctrl+Shift+↓ 到底），此时
+        // `w × h` 会超出浏览器画布上限（Chrome 单边 65535px、总像素 2^28），
+        // 超限后 OffscreenCanvas 静默变成空白 —— 表现就是「选区一大，选中框的
+        // 半透明背景整片消失，只剩一个描边框」。同时为屏外区域做几百万像素的
+        // 填充也是纯浪费（每帧都做）。故只给「选区 ∩ 视口」建画布。
+        const clip = clipRectToViewport(
+            { left, top, width, height },
+            { width: this.data.visibleView.sheetWidth, height: this.data.visibleView.sheetHeight }
+        );
+
         this.ctx.save();
-        this.ctx.drawImage(offscreenCanvas, left * this.data.zoom * window.devicePixelRatio,
-            top * this.data.zoom * window.devicePixelRatio);
+        if (clip !== null) {
+            // 绘制选中区域背景及activedCell透明背景
+            const { offscreenCanvas, offscreenCtx } = this.offscreen(clip.width * zoom * dpr, clip.height * zoom * dpr);
+            offscreenCtx.clearRect(0, 0,
+                offscreenCanvas.width,
+                offscreenCanvas.height);
+            // 绘制选中区域背景（从 offscreenCanvas 的原点开始绘制）
+            offscreenCtx.fillStyle = DEFAULT_SELECTED_BG_COLOR;
+            offscreenCtx.fillRect(0, 0,
+                offscreenCanvas.width,
+                offscreenCanvas.height);
+
+            // 绘制activedCell透明背景（相对裁剪区左上角的坐标）
+            offscreenCtx.clearRect(
+                (activedLeft - clip.left) * zoom * dpr,
+                (activedTop - clip.top) * zoom * dpr,
+                activedWidth * zoom * dpr,
+                activedHeight * zoom * dpr);
+
+            // 绘制选中区域背景（贴到裁剪后的位置）
+            this.ctx.drawImage(offscreenCanvas, clip.left * zoom * dpr, clip.top * zoom * dpr);
+        }
+        // 选区完全滚出视口时不画背景，但描边仍按完整选区画（Canvas 自行裁剪，
+        // 超出部分不显示，也不必为它单独算裁剪）
 
         this.ctx.strokeStyle = DEFAULT_SELECTED_BORDER_COLOR;
         this.setLineWidth(DEFAULT_SELECTED_BORDER_WIDTH);
-        this.strokeRect(left * this.data.zoom ,
-            top * this.data.zoom,
-            width * this.data.zoom,
-            height * this.data.zoom);
+        this.strokeRect(left * zoom,
+            top * zoom,
+            width * zoom,
+            height * zoom);
         this.ctx.restore();
         this.drawAnchor();
     }
