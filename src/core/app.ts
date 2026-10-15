@@ -87,6 +87,14 @@ export class App {
     private rightToolsSplit!: Split;
     private hScroller!: Scroller;
     private vScroller!: Scroller;
+    /**
+     * 滚动/缩放引起的重绘合帧句柄
+     *
+     * 横向与纵向滚动在同一帧内可能各发一次 OFFSET 事件，拖拽滚动条时
+     * 事件频率还会高于显示器刷新率。用 requestAnimationFrame 合并后，
+     * 一帧最多执行一次 sheets.draw()，避免重复全量重绘导致的滚动卡顿。
+     */
+    private _sheetDrawFrame: number | null = null;
     private toolbar!: Toolbar;
     private menu!: Menu;
     private navigator!: Navigator;
@@ -944,19 +952,35 @@ export class App {
         });
     }
 
+    /**
+     * 调度一次「合帧」的表格重绘
+     *
+     * 同一动画帧内的多次调用（横向 + 纵向滚动、滚动条拖拽的高频事件）
+     * 只会产生一次 sheets.draw()。数据编辑类事件不走这里——它们要求立即
+     * 反馈，仍直接调用 draw()。
+     * @private
+     */
+    private scheduleSheetDraw(): void {
+        if (this._sheetDrawFrame !== null) return;
+        this._sheetDrawFrame = requestAnimationFrame(() => {
+            this._sheetDrawFrame = null;
+            this.sheets.draw();
+        });
+    }
+
     private setupDataListeners() {
             this.data.on(DataEvents.ACTIVED_CELL_CHANGED, (_, cell) => {
                 this.data.isEditting = false;
                 // this.sheets.draw(); // 与SELECT_CHANGED事件冲突
             });
             this.data.colHeaders.on(DataEvents.OFFSETX_CHANGED, () => {
-                this.sheets.draw();
+                this.scheduleSheetDraw();
             });
             this.data.on(DataEvents.ALL_COL_WIDTH_CHANGED, () => {
                 this.sheets.draw();
             });
             this.data.rowHeaders.on(DataEvents.OFFSETY_CHANGED, () => {
-                this.sheets.draw();
+                this.scheduleSheetDraw();
             });
             this.data.on(DataEvents.ALL_ROW_HEIGHT_CHANGED, () => {
                 this.sheets.draw();
@@ -971,7 +995,7 @@ export class App {
                 if(!isEditting) this.sheets.draw();
             });
             this.data.on(DataEvents.ZOOM_CHANGED, () => {
-                this.sheets.draw();
+                this.scheduleSheetDraw();
             });
             this.data.on(DataEvents.VALUES_CHANGED, (newValues) => {
                 this.sheets.draw();

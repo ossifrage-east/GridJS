@@ -51,9 +51,10 @@ import {
 } from './cellSource';
 import { ZipParser, ZipArchive } from './zip';
 import { CompoundFile } from './cfb';
-import { BiffParser, BiffXf, BiffFont, BiffWorkbook } from './biff';
+import { BiffParser, BiffXf, BiffFont, BiffWorkbook, DEFAULT_PALETTE } from './biff';
 import { scanXml, attrValue, XmlAttrs } from './xmlScanner';
 import { yieldToUI, SliceBudget } from '../../utils/scheduler';
+import { getCellDisplayText } from '../numberFormat';
 
 // ── 中间数据结构 ──
 
@@ -219,7 +220,7 @@ interface ExcelStyleSheet {
         name?: string; size?: number; bold?: boolean; italic?: boolean;
         color?: string; underline?: boolean; strikethrough?: boolean;
     }>;
-    fills: Array<{ patternType?: string; fgColor?: string }>;
+    fills: Array<{ patternType?: string; fgColor?: string; bgColor?: string }>;
     borders: Array<{
         left?: { style?: string; color?: string };
         right?: { style?: string; color?: string };
@@ -305,6 +306,18 @@ export class SheetParser {
      * 数值键一一对应，可安全替代 `${row},${col}` 字符串键。
      */
     private static readonly CELL_KEY_STRIDE = 16384;
+
+    /**
+     * 内置 Office 主题色兜底表（Office 2007+ 默认主题）
+     *
+     * 当工作簿缺失 xl/theme/theme1.xml 时使用；索引含义见
+     * {@link parseThemeColors} 的映射表。
+     */
+    private static readonly FALLBACK_THEME_COLORS = [
+        '#FFFFFF', '#000000', '#E7E6E6', '#44546A',
+        '#5B9BD5', '#ED7D31', '#A5A5A5', '#FFC000',
+        '#4472C4', '#70AD47', '#0563C1', '#954F72'
+    ];
 
     /**
      * 列名缓存：下标 = 1-based 列号，值为 "A"/"B"/..."AA"
@@ -555,7 +568,12 @@ export class SheetParser {
         if (readStyles) {
             const stylesBytes = files.get('xl/styles.xml');
             if (stylesBytes) {
-                styleSheet = this.parseStyleSheetBytes(stylesBytes);
+                // 主题色表（xl/theme/theme1.xml）：styles.xml 的 <color theme="N" tint=".."/>
+                // 必须经主题色解析，否则这类字体/填充色会全部退化为黑色（详见
+                // parseThemeColors 的注释）。缺主题时传 null，按内置 Office 主题兜底。
+                const themeBytes = files.get('xl/theme/theme1.xml') || files.get('xl/theme/theme2.xml');
+                const themeColors = themeBytes ? this.parseThemeColors(themeBytes) : null;
+                styleSheet = this.parseStyleSheetBytes(stylesBytes, themeColors);
             }
         }
 
@@ -923,11 +941,28 @@ export class SheetParser {
         // 用数值键 `row * COL_STRIDE + col` 取代模板字符串键：
         // 逐格拼接 `${row},${col}` 会在百万格规模下产生百万次字符串分配，是纯粹的浪费。
         const mergeMap = new Map<number, { rowspan: number; colspan: number }>();
+        // 合并区内「被覆盖」的非锚点格：这些位置即使存在单元格记录（xls 常见重复
+        // DUPCOL、xlsx 偶发冗余 <c>）也必须丢弃，否则同一合并区会在多个格子里重复
+        // 绘制文本。
+        const coveredKeys = new Set<number>();
+        // 待补造的合并锚点：锚点位置在数据源中完全没有单元格记录时（xls 的锚点
+        // 只有 MULBLANK 空记录、xlsx 整行省略 <c> 都会发生），合并区会彻底不显示。
+        const pendingAnchors = new Map<number,
+            { r: number; c: number; rowspan: number; colspan: number }>();
         for (const merge of source.merges) {
             const rowspan = merge.e.r - merge.s.r + 1;
             const colspan = merge.e.c - merge.s.c + 1;
-            if (rowspan > 1 || colspan > 1) {
-                mergeMap.set(merge.s.r * SheetParser.CELL_KEY_STRIDE + merge.s.c, { rowspan, colspan });
+            if (rowspan <= 1 && colspan <= 1) continue;
+            const anchorKey = merge.s.r * SheetParser.CELL_KEY_STRIDE + merge.s.c;
+            mergeMap.set(anchorKey, { rowspan, colspan });
+            pendingAnchors.set(anchorKey, {
+                r: merge.s.r, c: merge.s.c, rowspan, colspan
+            });
+            for (let r = merge.s.r; r <= merge.e.r; r++) {
+                for (let c = merge.s.c; c <= merge.e.c; c++) {
+                    if (r === merge.s.r && c === merge.s.c) continue;
+                    coveredKeys.add(r * SheetParser.CELL_KEY_STRIDE + c);
+                }
             }
         }
 
@@ -937,17 +972,40 @@ export class SheetParser {
         // 原实现对**每个字符**都执行 7 次条件赋值，百万格 × 平均十字即千万级写入。
         const fontTemplateCache = new Map<string, Char>();
         const count = source.length;
-        const values: Cell[] = new Array(count);
+        const values: Cell[] = [];
         // 分片让出：超过预算就让出主线程一次，
         // 使「打开大文件」期间页面仍可响应（滚动/关闭/取消）。
         const slice = new SliceBudget();
         for (let i = 0; i < count; i++) {
-            values[i] = this.buildCell(source, i, mergeMap, fontTemplateCache);
+            const row0 = source.rowAt(i);
+            const col0 = source.colAt(i);
+            const key = row0 * SheetParser.CELL_KEY_STRIDE + col0;
+            // 合并覆盖区内的重复记录：跳过（锚点自身不在覆盖集合中）
+            if (coveredKeys.has(key)) continue;
+            // 锚点有真实记录，无需补造
+            if (pendingAnchors.has(key)) pendingAnchors.delete(key);
+            values.push(this.buildCell(source, i, mergeMap, fontTemplateCache));
             if (slice.shouldYield(i)) await slice.yieldNow();
         }
 
+        // —— 补造缺失的合并锚点（无值无样式的空合并格）——
+        for (const anchor of pendingAnchors.values()) {
+            const cell = new Cell();
+            cell.cell = this.colToName(anchor.c + 1) + (anchor.r + 1);
+            if (anchor.colspan > 1) cell.colspan = anchor.colspan;
+            if (anchor.rowspan > 1) cell.rowspan = anchor.rowspan;
+            values.push(cell);
+        }
+
         // —— 列头：生成从 1 到 maxCol 的 ColHeader[] ——
-        const maxCol = source.range.maxCol + 1;  // 1-based
+        // 合并区域可能延伸到所有单元格记录之外（补造锚点时），范围需一并扩展。
+        let rangeMaxCol = source.range.maxCol;
+        let rangeMaxRow = source.range.maxRow;
+        for (const anchor of pendingAnchors.values()) {
+            if (anchor.c > rangeMaxCol) rangeMaxCol = anchor.c;
+            if (anchor.r > rangeMaxRow) rangeMaxRow = anchor.r;
+        }
+        const maxCol = rangeMaxCol + 1;  // 1-based
         const colWidthMap = new Map<number, number>();
         for (const col of source.cols) {
             if (col.width) colWidthMap.set(col.index + 1, col.width);
@@ -962,7 +1020,7 @@ export class SheetParser {
         }
 
         // —— 行头：生成从 1 到 maxRow 的 RowHeader[] ——
-        const maxRow = source.range.maxRow + 1;
+        const maxRow = rangeMaxRow + 1;
         const rowHeightMap = new Map<number, number>();
         for (const row of source.rows) {
             if (row.height) rowHeightMap.set(row.index + 1, row.height);
@@ -1012,19 +1070,41 @@ export class SheetParser {
 
         // 值 → Char[]（每个字符一个 Char，共享同一字体样式）
         // 布尔值/空值的显示文本由数据源统一处理（见 cellSource.cellDisplayText）
-        const text = source.textAt(index);
         const style = source.styleAt(index);
+
+        // 数字/日期格式在导入阶段一次性「烧成」字符文本：
+        // 项目的 chars 是逐字符几何与颜色的唯一数据源，而原先把原始序列号
+        // （如 41029）放进 chars、把显示文本（如 1/30/2012）放在渲染期临时格式化，
+        // 两套文本长度不一致会导致逐字符宽度/颜色错位（时间格式显示异常的根因）。
+        // 烧成后不再给 Cell 挂 numberFormat，编辑框里看到的也是与画面一致的文本。
+        const numberFormat = source.formatAt(index);
+        let text = source.textAt(index);
+        let formatConsumed = false;
+        if (text && numberFormat && numberFormat !== 'General' && numberFormat !== '@') {
+            const displayText = getCellDisplayText(text, numberFormat);
+            if (displayText !== text) {
+                text = displayText;
+                formatConsumed = true;
+            }
+        }
+
         if (text) {
             // 字体样式映射：统一到一份「模板」上，避免逐字符重复判定
             const f = style?.font;
             let template: Char | null = null;
             if (f) {
-                const key = `${f.name ?? ''}\u0000${f.size ?? ''}\u0000${f.bold ? 1 : 0}${f.italic ? 1 : 0}\u0000${f.color ?? ''}\u0000${f.underline ? 1 : 0}${f.strikethrough ? 1 : 0}`;
+                // 解析出的字号单位是「磅」；项目内部统一存「CSS 像素」
+                // （与工具栏 sectionFont 的口径一致：pt × devicePixelRatio）。
+                // 直接存磅值会让导入文字整体偏小且与应用内字号体系错乱。
+                const dpr = typeof window !== 'undefined' && window.devicePixelRatio
+                    ? window.devicePixelRatio : 1;
+                const sizePx = f.size ? Math.floor(f.size * dpr) : undefined;
+                const key = `${f.name ?? ''}\u0000${sizePx ?? ''}\u0000${f.bold ? 1 : 0}${f.italic ? 1 : 0}\u0000${f.color ?? ''}\u0000${f.underline ? 1 : 0}${f.strikethrough ? 1 : 0}`;
                 template = fontTemplateCache.get(key) ?? null;
                 if (template === null) {
                     template = new Char();
                     if (f.name) template.fontFamily = f.name;
-                    if (f.size) template.fontSize = f.size;
+                    if (sizePx) template.fontSize = sizePx;
                     if (f.bold) template.fontWeight = true;
                     if (f.italic) template.fontStyle = true;
                     if (f.color) template.fontColor = f.color;
@@ -1077,9 +1157,9 @@ export class SheetParser {
             }
         }
 
-        // 数字格式
-        const numberFormat = source.formatAt(index);
-        if (numberFormat && numberFormat !== 'General') {
+        // 数字格式：显示文本已烧成 chars 的格不再挂格式码，
+        // 否则渲染期会对已格式化文本二次格式化；文本类/未产生变化的格保留格式码。
+        if (!formatConsumed && numberFormat && numberFormat !== 'General') {
             cell.numberFormat = numberFormat;
         }
 
@@ -1109,17 +1189,19 @@ export class SheetParser {
     /**
      * 解析 styles.xml 样式表（流式扫描）
      *
-     * 与旧 DOM 版语义对齐的取舍（保持行为一致，含既有癖性）：
+     * 取舍说明：
      * - font / fill / border 元素**不区分容器**（与 `getElementsByTagName`
      *   会连 dxfs 中同名元素一起收集的行为一致）；
      * - cellXfs 中的 xf 仅在 `cellXfs` 容器内生效（cellStyleXfs 中的不算）；
-     * - `<b/>`（无 val）按 `isOn(undefined) === false` 处理，与旧实现一致。
+     * - `<b/>`/`<i/>`/`<u/>`/`<strike/>` 无 `val` 时按 OOXML 规范视为 true
+     *   （布尔属性缺省即开启；显式 `val="0"` 才是关闭）。
      *
      * @param bytes - styles.xml 的字节
+     * @param themeColors - 主题色表（见 {@link parseThemeColors}）；为 null 时使用内置 Office 主题
      * @returns 样式表结构
      * @private
      */
-    private parseStyleSheetBytes(bytes: Uint8Array): ExcelStyleSheet {
+    private parseStyleSheetBytes(bytes: Uint8Array, themeColors: string[] | null): ExcelStyleSheet {
         const result: ExcelStyleSheet = {
             numFmts: new Map(), fonts: [], fills: [], borders: [], cellXfs: []
         };
@@ -1150,16 +1232,17 @@ export class SheetParser {
                         };
                         break;
                     case 'b':
-                        if (font) font.bold = this.isOn(attrValue(attrs, 'val'));
+                        // 元素存在即开启（<b/> 无 val 等价于 val="1"）
+                        if (font) font.bold = this.isXmlElementOn(attrs['val']);
                         break;
                     case 'i':
-                        if (font) font.italic = this.isOn(attrValue(attrs, 'val'));
+                        if (font) font.italic = this.isXmlElementOn(attrs['val']);
                         break;
                     case 'u':
-                        if (font) font.underline = true;
+                        if (font) font.underline = this.isXmlElementOn(attrs['val']);
                         break;
                     case 'strike':
-                        if (font) font.strikethrough = true;
+                        if (font) font.strikethrough = this.isXmlElementOn(attrs['val']);
                         break;
                     case 'name':
                         if (font) font.name = attrValue(attrs, 'val') || undefined;
@@ -1168,12 +1251,12 @@ export class SheetParser {
                         if (font) font.size = parseFloat(attrValue(attrs, 'val') || '0') || undefined;
                         break;
                     case 'color':
-                        // 字体色 / 边框色：<color rgb="..."/>（按当前上下文分派）
-                        if (font) font.color = this.rgbFromAttrs(attrs);
-                        else if (borderSide) borderSide.color = this.rgbFromAttrs(attrs);
+                        // 字体色 / 边框色：rgb 优先，其次 theme+tint、indexed、auto
+                        if (font) font.color = this.colorFromAttrs(attrs, themeColors);
+                        else if (borderSide) borderSide.color = this.colorFromAttrs(attrs, themeColors);
                         break;
                     case 'fill':
-                        fill = { patternType: undefined, fgColor: undefined };
+                        fill = { patternType: undefined, fgColor: undefined, bgColor: undefined };
                         break;
                     case 'patternFill':
                         if (fill) {
@@ -1182,7 +1265,10 @@ export class SheetParser {
                         }
                         break;
                     case 'fgColor':
-                        if (inPatternFill && fill) fill.fgColor = this.rgbFromAttrs(attrs);
+                        if (inPatternFill && fill) fill.fgColor = this.colorFromAttrs(attrs, themeColors);
+                        break;
+                    case 'bgColor':
+                        if (inPatternFill && fill) fill.bgColor = this.colorFromAttrs(attrs, themeColors);
                         break;
                     case 'border':
                         border = { left: undefined, right: undefined, top: undefined, bottom: undefined };
@@ -1264,9 +1350,149 @@ export class SheetParser {
     }
 
     /**
+     * 解析 `<color>` 元素的全部颜色表达形式
+     *
+     * 优先级与 Excel 一致：`rgb`（ARGB）> `theme`（主题色 + tint 明暗）>
+     * `indexed`（旧版索引调色板）> `auto`（无显式颜色，返回 undefined 走默认黑）。
+     *
+     * @param attrs - 元素属性表
+     * @param themeColors - 主题色表（null 时使用内置 Office 主题兜底）
+     * @returns `#RRGGBB`；无法解析或显式 auto 时返回 undefined
+     * @private
+     */
+    private colorFromAttrs(attrs: XmlAttrs, themeColors: string[] | null): string | undefined {
+        // 1. 显式 ARGB（FFRRGGBB / RRGGBB）
+        const rgb = attrs['rgb'];
+        if (rgb && rgb.length >= 6) {
+            return this.argbToHex(rgb);
+        }
+        // 2. 主题色索引（可带 tint 明暗系数）
+        const themeAttr = attrs['theme'];
+        if (themeAttr !== undefined && themeAttr !== '') {
+            const themeIndex = parseInt(themeAttr, 10);
+            if (Number.isFinite(themeIndex)) {
+                const palette = themeColors ?? SheetParser.FALLBACK_THEME_COLORS;
+                const base = palette[themeIndex];
+                if (base) {
+                    const tint = attrs['tint'] !== undefined ? parseFloat(attrs['tint']) : 0;
+                    return Number.isFinite(tint) && tint !== 0 ? this.applyTint(base, tint) : base;
+                }
+            }
+        }
+        // 3. 旧版索引色（8-63 标准色；64=系统前景，65=系统背景）
+        const indexed = attrs['indexed'];
+        if (indexed !== undefined && indexed !== '') {
+            const index = parseInt(indexed, 10);
+            if (index >= 8 && index < DEFAULT_PALETTE.length) {
+                return DEFAULT_PALETTE[index];
+            }
+        }
+        // 4. auto / 无法解析：无显式颜色
+        return undefined;
+    }
+
+    /**
+     * 解析 theme1.xml 的 `<a:clrScheme>`，得到主题色索引 → RGB 的对照表
+     *
+     * 索引编号采用 SpreadsheetML `<color theme="N"/>` 的约定（与 DrawingML
+     * clrScheme 的书写顺序有意错开，0/1 与 2/3 互换——这是 OOXML 的历史遗留）：
+     *
+     * | 索引 | 含义 | clrScheme 节点 |
+     * | --- | --- | --- |
+     * | 0 | 背景 1（lt1，通常白） | lt1 |
+     * | 1 | 文本 1（dk1，通常黑） | dk1 |
+     * | 2 | 背景 2（lt2） | lt2 |
+     * | 3 | 文本 2（dk2） | dk2 |
+     * | 4-9 | accent1-6 | accent1-6 |
+     * | 10 | 超链接 | hlink |
+     * | 11 | 已访问超链接 | folHlink |
+     *
+     * 每个颜色节点取 `<a:srgbClr val="RRGGBB"/>`；`<a:sysClr>` 则取其 lastClr。
+     *
+     * @param bytes - theme1.xml 的字节
+     * @returns 长度 12 的主题色表（缺失项为 '#000000' 占位）
+     * @private
+     */
+    private parseThemeColors(bytes: Uint8Array): string[] {
+        const colors = ['#FFFFFF', '#000000', '#E7E6E6', '#44546A',
+            '#5B9BD5', '#ED7D31', '#A5A5A5', '#FFC000',
+            '#4472C4', '#70AD47', '#0563C1', '#954F72'];
+        /** clrScheme 子节点名 → 索引 */
+        const slotMap: Record<string, number> = {
+            lt1: 0, dk1: 1, lt2: 2, dk2: 3,
+            accent1: 4, accent2: 5, accent3: 6, accent4: 7,
+            accent5: 8, accent6: 9, hlink: 10, folHlink: 11
+        };
+        let slot = -1;
+        scanXml(bytes, {
+            onStart: (name, attrs) => {
+                if (slotMap[name] !== undefined) {
+                    slot = slotMap[name];
+                } else if (slot >= 0 && name === 'srgbClr' && attrs['val']) {
+                    colors[slot] = this.argbToHex(attrs['val']);
+                    slot = -1;
+                } else if (slot >= 0 && name === 'sysClr' && attrs['lastClr']) {
+                    colors[slot] = this.argbToHex(attrs['lastClr']);
+                    slot = -1;
+                }
+            },
+            onEnd: (name) => {
+                if (slotMap[name] !== undefined) slot = -1;
+            }
+        });
+        return colors;
+    }
+
+    /**
+     * 对 RGB 颜色应用 OOXML tint 明暗系数
+     *
+     * 算法取自 ECMA-376（HSL 亮度通道线性插值）：
+     * - tint < 0：向黑色混合，L' = L × (1 + tint)；
+     * - tint > 0：向白色混合，L' = L × (1 - tint) + tint。
+     *
+     * @param hex - 原始 `#RRGGBB`
+     * @param tint - 范围 [-1, 1]
+     * @returns 调色后的 `#RRGGBB`
+     * @private
+     */
+    private applyTint(hex: string, tint: number): string {
+        const r = parseInt(hex.slice(1, 3), 16) / 255;
+        const g = parseInt(hex.slice(3, 5), 16) / 255;
+        const b = parseInt(hex.slice(5, 7), 16) / 255;
+        const max = Math.max(r, g, b), min = Math.min(r, g, b);
+        const l = (max + min) / 2;
+        let h = 0, s = 0;
+        if (max !== min) {
+            const d = max - min;
+            s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+            if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+            else if (max === g) h = (b - r) / d + 2;
+            else h = (r - g) / d + 4;
+            h /= 6;
+        }
+        const newL = tint < 0 ? l * (1 + tint) : l * (1 - tint) + tint;
+
+        const hue2rgb = (p: number, q: number, t: number): number => {
+            if (t < 0) t += 1;
+            if (t > 1) t -= 1;
+            if (t < 1 / 6) return p + (q - p) * 6 * t;
+            if (t < 1 / 2) return q;
+            if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+            return p;
+        };
+        const q = newL < 0.5 ? newL * (1 + s) : newL + s - newL * s;
+        const p = 2 * newL - q;
+        const to255 = (v: number): string => Math.round(Math.min(1, Math.max(0, v)) * 255)
+            .toString(16).padStart(2, '0');
+        return `#${to255(hue2rgb(p, q, h + 1 / 3))}${to255(hue2rgb(p, q, h))}${to255(hue2rgb(p, q, h - 1 / 3))}`;
+    }
+
+    /**
      * 从属性表中取 `rgb` 并转为 `#RRGGBB`
      *
      * 与旧 DOM 版 `childRgb` 语义一致：indexed / theme / auto / 短值一律返回 undefined。
+     * 新代码请优先使用 {@link colorFromAttrs}（支持 theme/indexed）；本方法仅保留
+     * 给不需要主题色兜底的窄场景。
      *
      * @param attrs - 属性表
      * @returns 颜色；不可解析时 undefined
@@ -1276,6 +1502,22 @@ export class SheetParser {
         const rgb = attrs['rgb'];
         if (!rgb || rgb.length < 6) return undefined;
         return this.argbToHex(rgb);
+    }
+
+    /**
+     * 解析 XML 布尔**元素**的 val 属性
+     *
+     * OOXML 中 `<b/>`、`<i/>`、`<u/>`、`<strike/>` 这类布尔元素的 val 属性
+     * 缺省即 true（元素出现本身表示开启），只有显式 `val="0"`/`"false"` 才关闭。
+     * 注意与 {@link isOn} 的区别：后者用于 applyFont 等缺省为 false 的属性。
+     *
+     * @param value - val 属性字符串（可能缺省）
+     * @returns 是否开启
+     * @private
+     */
+    private isXmlElementOn(value: string | null | undefined): boolean {
+        if (value === null || value === undefined || value === '') return true;
+        return value !== '0' && value !== 'false' && value !== 'off';
     }
 
     /**
@@ -1499,7 +1741,17 @@ export class SheetParser {
                             numberFormat = cached.numberFormat;
                         }
 
-                        cells.push({ row, col, value, type: cellType, style, styleId, numberFormat });
+                        // — 空 <c> 裁剪 —
+                        // 无值的格子只有在携带「可见样式」或数字格式时才保留：
+                        // 默认 XF（仅含与默认字体等价的 name/size）不产生任何视觉
+                        // 差异，百万级样本中这类空格占一半以上，全部建 Cell 会导致
+                        // 内存膨胀、删除/撤销卡顿。合并锚点缺失由 generateFrom 兜底补造。
+                        const isEmpty = value === null || value === '';
+                        const meaningfulStyle = this.hasVisibleCellStyle(style);
+                        if (!isEmpty || meaningfulStyle ||
+                            (numberFormat !== undefined && numberFormat !== 'General')) {
+                            cells.push({ row, col, value, type: cellType, style, styleId, numberFormat });
+                        }
                         break;
                     }
                 }
@@ -1561,7 +1813,8 @@ export class SheetParser {
             fill.patternType !== 'gray125' && xf.applyFill !== false) {
             style.fill = {
                 patternType: fill.patternType,
-                fgColor: fill.fgColor
+                // solid 填充通常写 fgColor；旧版文件写 bgColor，二者取其一
+                fgColor: fill.fgColor || fill.bgColor
             };
         }
 
@@ -1592,6 +1845,31 @@ export class SheetParser {
         }
 
         return { style: Object.keys(style).length > 0 ? style : undefined, numberFormat };
+    }
+
+    /**
+     * 判断样式是否携带「肉眼可见」的格式信息
+     *
+     * 仅含默认字体名/字号（无粗斜、下划线、删除线、字体色）的样式视为不可见——
+     * 它与画布内置默认字体渲染结果一致，空单元格挂着这种样式没有任何意义，
+     * 却会让百万级 xlsx 的空格全部实体化。
+     *
+     * @param style - 单元格样式（可能为 undefined）
+     * @returns 是否存在可见格式
+     * @private
+     */
+    private hasVisibleCellStyle(style: CellStyleInfo | undefined): boolean {
+        if (!style) return false;
+        if (style.fill?.fgColor || style.fill?.patternType) return true;
+        if (style.border) {
+            const b = style.border;
+            if (b.left?.style || b.right?.style || b.top?.style || b.bottom?.style) return true;
+        }
+        const a = style.alignment;
+        if (a && (a.horizontal || a.vertical || a.wrapText || a.indent !== undefined)) return true;
+        const f = style.font;
+        if (f && (f.bold || f.italic || f.underline || f.strikethrough || f.color)) return true;
+        return false;
     }
 
     /**
@@ -1937,10 +2215,21 @@ export class SheetParser {
             9: '0%', 10: '0.00%', 11: '0.00E+00', 14: 'm/d/yyyy',
             15: 'd-mmm-yy', 16: 'd-mmm', 17: 'mmm-yy',
             18: 'h:mm AM/PM', 19: 'h:mm:ss AM/PM', 20: 'h:mm', 21: 'h:mm:ss',
-            22: 'm/d/yyyy h:mm', 37: '#,##0 ;(#,##0)', 38: '#,##0 ;[Red](#,##0)',
+            22: 'm/d/yyyy h:mm',
+            // 27-36：东亚区域常用内置格式
+            27: 'yyyy"年"m"月"', 28: 'm"月"d"日"', 29: 'm"月"d"日"',
+            30: 'm-d-yy', 31: 'yyyy"年"m"月"d"日"',
+            32: 'h"时"mm"分"', 33: 'h"时"mm"分"ss"秒"',
+            34: 'tth"时"mm"分"', 35: 'tth"时"mm"分"ss"秒"',
+            36: 'yyyy"年"m"月"',
+            37: '#,##0 ;(#,##0)', 38: '#,##0 ;[Red](#,##0)',
             39: '#,##0.00;(#,##0.00)', 40: '#,##0.00;[Red](#,##0.00)',
             45: 'mm:ss', 46: '[h]:mm:ss',
-            47: 'mmss.0', 48: '##0.0', 49: '@'
+            47: 'mmss.0', 48: '##0.0', 49: '@',
+            // 50-58：扩展内置日期/时间格式（58 = 中文区域的「日期+时间」）
+            50: 'yyyy-mm-dd', 51: 'yyyy-mm-dd h:mm', 52: 'yyyy-mm-dd h:mm:ss',
+            53: 'yyyy-mm', 54: 'm-d',
+            57: 'yyyy"年"m"月"', 58: 'yyyy/m/d h:mm'
         };
         return builtins[id];
     }

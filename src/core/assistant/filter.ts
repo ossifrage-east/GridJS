@@ -124,9 +124,12 @@ export class Filter {
         if (!cond) return;
         // 判定本列数据是否全部显示：筛选行以下无任何隐藏行
         // （行 isHidden 的变更只经 setRowsHidden 统一入口，末尾必发 VALUES_CHANGED）
-        const rowHeaders = this.data.rowHeaders;
-        for (let r = cond.anchorRow + 1; r <= rowHeaders.length; r++) {
-            if (rowHeaders.getAt(r - 1)?.isHidden) return;  // 仍有隐藏行 → 筛选仍生效，保持绿色
+        // 【性能约定，勿回退为「for r = anchorRow+1..rowHeaders.length」】
+        // 大表 rowHeaders.length 可达百万级，线性扫描每次着色/操作都触发。
+        // 改为遍历 _hiddenRowsSet（已隐藏行通常只有几百到几千行）。
+        const hiddenSet = this.data.getHiddenRowsSet();
+        for (const r of hiddenSet) {
+            if (r > cond.anchorRow) return;  // 筛选行以下仍有隐藏行 → 筛选仍生效，保持绿色
         }
         // 全部显示：清除本列筛选条件（作为可撤销步骤，嵌套在外层操作时折叠为其一步），
         // 按钮恢复默认色，内容清单恢复全部内容
@@ -740,77 +743,83 @@ export class Filter {
             const targetHidden = this.data.computeFilterHiddenRows();
 
             // 3) 需要重新判定的行 = 本列筛选行以下「有内容的行」∪「当前已隐藏的行」
-            const totalRows = this.data.rowHeaders.length;
+            //
+            // 【性能约定，勿回退为「for r = anchorRow+1..totalRows」】
+            // 历史实现对「当前已隐藏的行」用 `for r 到总行数` 全表扫描：百万行大表
+            // 上每次点「确定」/「仅筛选此项」都要扫一遍，是筛选卡顿的主因。
+            // 现在改为遍历 {@link DataCollection.getHiddenRowsSet} 倒排索引
+            // （已隐藏行通常只有几百到几千行），复杂度与总行数无关。
             const candidates = new Set<number>();
             this.data.getRowsWithText().forEach((r) => {
                 if (r > anchorRow) candidates.add(r);
             });
-            for (let r = anchorRow + 1; r <= totalRows; r++) {
-                if (this.data.rowHeaders.getAt(r - 1)?.isHidden === true) candidates.add(r);
-            }
+            this.data.getHiddenRowsSet().forEach((r) => {
+                if (r > anchorRow) candidates.add(r);
+            });
 
-            // 4) 目标状态与现状不一致的连续行分段调用 setRowsHidden（统一入口自带
-            //    recalc/clamp/补足/收缩/广播）
+            // 4) 目标状态与现状不一致的行：直接改 RowHeader.isHidden 标记
+            //    （同步维护 _hiddenRowsSet），最后调一次 finalizeRowVisibility 收尾——
+            //    避免分段调用 setRowsHidden 产生多次 recalcRowPositions + 多次广播/重绘。
             const sorted = Array.from(candidates).sort((a, b) => a - b);
-            let segStart = -1;
-            let segEnd = -1;
-            let segTarget = false;
-            const flush = (): void => {
-                if (segStart >= 0) this.data.setRowsHidden(segStart, segEnd, segTarget);
-                segStart = -1;
-                segEnd = -1;
-            };
+            let minChanged = Infinity;
+            let maxChanged = -Infinity;
+            let hadHide = false;
+            let hadUnhide = false;
             for (let i = 0; i < sorted.length; i++) {
                 const r = sorted[i];
                 const rh = this.data.rowHeaders.getAt(r - 1);
                 if (!rh) continue;
                 const shouldHide = targetHidden.has(r);
-                if (rh.isHidden === shouldHide) {   // 目标与现状一致：断开当前段
-                    flush();
-                    continue;
-                }
-                if (segStart < 0) {
-                    segStart = r;
-                    segEnd = r;
-                    segTarget = shouldHide;
-                } else if (r === segEnd + 1 && shouldHide === segTarget) {
-                    segEnd = r;
-                } else {
-                    flush();
-                    segStart = r;
-                    segEnd = r;
-                    segTarget = shouldHide;
-                }
+                if (rh.isHidden === shouldHide) continue;   // 目标与现状一致：跳过
+                this.data.setRowHiddenFlag(r, shouldHide);
+                if (shouldHide) hadHide = true;
+                else hadUnhide = true;
+                if (r < minChanged) minChanged = r;
+                if (r > maxChanged) maxChanged = r;
             }
-            flush();
+            // 有任何行需要变化时做一次收尾（recalc + clamp + 补足/收缩 + 广播）
+            if (minChanged !== Infinity) {
+                this.data.finalizeRowVisibility(
+                    minChanged, maxChanged, hadHide, hadUnhide
+                );
+            }
 
             // 5) 按钮状态：本列筛选行以下全部行都命中本列条件（全选，无实际筛选效果）时
             // 恢复默认背景色，否则标为主题绿色。
             // 按内容级判定而非行数 —— 避免其它列条件隐藏的行被误判为本列筛选效果。
-            // 统计口径与历史「逐行扫描到总行数」完全一致：内容范围之后的行文本一律为 ''，
-            // 因此其命中与否只取决于本列是否保留了「空白」，不必真去逐行扫。
+            //
+            // 【性能约定，勿回退为「for r = anchorRow+1..upper」】
+            // 历史实现逐行扫到 upper（百万级大表的卡顿源）。现在改为遍历
+            // {@link DataCollection.getRowsWithText}（只含有内容的行，通常几千行），
+            // 空白行数按「应判定的行数 − 有内容行数」推算，不逐行扫。
             const maxRow = this.data.getContentBounds().maxRow;
+            const totalRows = this.data.rowHeaders.length;
             const upper = Math.min(totalRows, Math.max(anchorRow, maxRow));
-            let contentRows = 0;
+            // 应被判定的行数 = upper - anchorRow（筛选行以下到内容末尾/行头末尾）
+            const contentRows = Math.max(0, upper - anchorRow);
             let matchedRows = 0;
-            for (let r = anchorRow + 1; r <= upper; r++) {
-                contentRows++;
+            // 只遍历有内容的行（O(有内容行数)，与总行数无关）
+            let countedContent = 0;
+            this.data.getRowsWithText().forEach((r) => {
+                if (r <= anchorRow || r > upper) return;
+                countedContent++;
                 const cell = this.data.getEffectiveCellAt(r, col);
                 if (cell !== undefined
                     && this.data.getCellColAndRow(cell.cell).row <= anchorRow) {
                     // 跨越本列筛选行的合并块覆盖的行不受条件约束，视为命中
                     matchedRows++;
-                    continue;
+                    return;
                 }
                 const text = cell === undefined ? '' : cell.getText();
                 if (keepContents.has(text)) matchedRows++;
-            }
-            const rest = totalRows - upper;
-            if (rest > 0) {
-                contentRows += rest;
-                if (keepContents.has('')) matchedRows += rest;
-            }
-            this.setFilterButtonActive(matchedRows < contentRows);
+            });
+            // 空白行数 = 应判定的行数 − 有内容的行数
+            const blankRows = Math.max(0, contentRows - countedContent);
+            if (blankRows > 0 && keepContents.has('')) matchedRows += blankRows;
+            // 内容范围之后的行（行头已补足但无内容）一律为空白
+            const rest = Math.max(0, totalRows - upper);
+            if (rest > 0 && keepContents.has('')) matchedRows += rest;
+            this.setFilterButtonActive(matchedRows < contentRows + rest);
         });
     }
 

@@ -276,16 +276,26 @@ export class Scroller extends EventEmitter {
             const clampedDelta = Math.min(Math.max(delta, -startScrollPosition), maxDelta);
 
             const totalWidth = data.colHeaders.allColWidth * data.zoom;
-            const newOffset = ((startScrollPosition + clampedDelta) / track.clientWidth) * totalWidth;
-            data.colHeaders.offsetWidth = Math.max(0, Math.min(newOffset, totalWidth - data.visibleView.sheetWidth) / data.zoom);
+            // thumb 在可用滑动空间（track - thumb）中的比例 × 内容可滚动范围（total - viewport）
+            // 确保 thumb 拖到最右时 offset 正好到达 maxOffset（旧公式除以 track.clientWidth
+            // 会导致比例 < 100%，无法滚到最右/最下）
+            const scrollableTrack = track.clientWidth - thumb.clientWidth;
+            const scrollableContent = totalWidth - data.visibleView.sheetWidth;
+            const thumbPos = startScrollPosition + clampedDelta;
+            const newOffset = scrollableTrack > 0 ? (thumbPos / scrollableTrack) * scrollableContent : 0;
+            data.colHeaders.offsetWidth = Math.max(0, Math.min(newOffset, scrollableContent) / data.zoom);
         } else {
             const startScrollPosition = this.isDragging ? this.startScrollPosition : parseFloat(thumb.style.top) || 0;
             const maxDelta = track.clientHeight - thumb.clientHeight - startScrollPosition;
             const clampedDelta = Math.min(Math.max(delta, -startScrollPosition), maxDelta);
 
             const totalHeight = data.rowHeaders.allRowHeight * data.zoom;
-            const newOffset = ((startScrollPosition + clampedDelta) / track.clientHeight) * totalHeight;
-            data.rowHeaders.offsetHeight = Math.max(0, Math.min(newOffset, totalHeight - data.visibleView.sheetHeight) / data.zoom);
+            // 同水平方向：按可用滑动空间比例映射，确保 thumb 到底时到达 maxOffset
+            const scrollableTrack = track.clientHeight - thumb.clientHeight;
+            const scrollableContent = totalHeight - data.visibleView.sheetHeight;
+            const thumbPos = startScrollPosition + clampedDelta;
+            const newOffset = scrollableTrack > 0 ? (thumbPos / scrollableTrack) * scrollableContent : 0;
+            data.rowHeaders.offsetHeight = Math.max(0, Math.min(newOffset, scrollableContent) / data.zoom);
         }
     }
 

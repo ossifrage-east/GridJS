@@ -251,7 +251,7 @@ export interface BiffWorkbook {
  * 实测夹具 `test_sample.xls` 无 PALETTE 记录，却大量使用索引 13（黄）、23（灰）、
  * 53（橙）等，所以这张表必须准确，否则底色/字色/边框色全错。
  */
-const DEFAULT_PALETTE: string[] = (() => {
+export const DEFAULT_PALETTE: string[] = (() => {
     const palette: string[] = [];
     // 0-7：保留位（占位，保持下标与索引对齐）
     for (let i = 0; i < 8; i++) palette.push('#000000');

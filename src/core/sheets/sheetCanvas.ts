@@ -12,6 +12,7 @@ import { CELL_PADDING, DEFAULT_ANCHOR_SELECTED_BORDER_COLOR, DEFAULT_CELL_BG_COL
     MouseLocation} from "../constant";
 import { Canvas, CanvasOptions } from "./canvas";
 import { Cell } from "../dataArchitecture/cell";
+import { LineText } from "../dataArchitecture/cellContent";
 import { Filter } from "../assistant/filter";
 import { layoutVisibleImages, type ImageLayoutGrid } from "./imageLayout";
 import { SheetImageLayer } from "./sheetImageLayer";
@@ -28,6 +29,17 @@ export class SheetCanvas extends Canvas {
     private readonly imageLayer: SheetImageLayer;
     /** 是否已排期一次「图片解码完成」的重绘（合并同一批解码的多次回调） */
     private imageRedrawScheduled: boolean = false;
+
+    /**
+     * 单元格文本位图缓存：缓存键 → 已光栅化的单元格位图
+     *
+     * 滚动只改变格的位置，不改变内容与尺寸，因此视口内文本绝大多数可直接
+     * drawImage 命中，省掉每帧的逐字符排版与绘制。条目超限时整体清空
+     * （LRU 在这里收益不高，清空策略与基类离屏池一致）。
+     */
+    private readonly _textBitmapCache: Map<string, OffscreenCanvas> = new Map();
+    /** 文本位图缓存的条目上限 */
+    private static readonly TEXT_BITMAP_CACHE_LIMIT = 1500;
     constructor(options: CanvasOptions) {
         super(options);
         this.parentElement = options.parentElement;
@@ -259,21 +271,21 @@ export class SheetCanvas extends Canvas {
         this.ctx.save();
         this.ctx.strokeStyle = GRID_LINE_COLOR;
 
-        // 绘制网格的垂直线条（跳过隐藏列）
-        // 注意 getVisibleCols 返回的是 1-based 列号（含端点），这里的 c 是 0-based 下标
-        const { startCol, endCol } = this.data.getVisibleCols();
-        for (let c = startCol - 1; c < endCol; c++) {
-            if (this.data.colHeaders.getAt(c).isHidden) continue;
+        // 绘制网格的垂直线条（只遍历视口内可见列，不再按列号跳过隐藏列）
+        // 注意 getVisibleColNumbers 返回的是 1-based 列号，这里转回 0-based 下标取列头
+        const colNumbers = this.data.getVisibleColNumbers();
+        for (let ci = 0; ci < colNumbers.length; ci++) {
+            const c = colNumbers[ci] - 1; // 1-based 转 0-based
             this.setLineWidth(1);  // 使用 CSS 像素，内部自动转换为物理像素
             const x = (this.data.colHeaders.getAt(c).left - this.data.colHeaders.offsetWidth) * this.data.zoom;
             this.drawLine(x, 0, x, this.data.visibleView.sheetHeight);
         }
-        
-        // 绘制网格的水平线条（跳过隐藏行）
-        // 注意 getVisibleRows 返回的是 1-based 行号（含端点），这里的 r 是 0-based 下标
-        const { startRow, endRow } = this.data.getVisibleRows();
-        for (let r = startRow - 1; r < endRow; r++) {
-            if (this.data.rowHeaders.getAt(r).isHidden) continue;
+
+        // 绘制网格的水平线条（只遍历视口内可见行，不再按行号跳过隐藏行）
+        // 注意 getVisibleRowNumbers 返回的是 1-based 行号，这里转回 0-based 下标取行头
+        const rowNumbers = this.data.getVisibleRowNumbers();
+        for (let ri = 0; ri < rowNumbers.length; ri++) {
+            const r = rowNumbers[ri] - 1; // 1-based 转 0-based
             this.setLineWidth(1);  // 使用 CSS 像素，内部自动转换为物理像素
             const y = (this.data.rowHeaders.getAt(r).top - this.data.rowHeaders.offsetHeight) * this.data.zoom;
             this.drawLine(0, y, this.data.visibleView.sheetWidth, y);
@@ -534,17 +546,22 @@ export class SheetCanvas extends Canvas {
      * 绘制单元格内容
      *
      * 【性能约定，勿回退】
-     * 一帧内每个可见单元格都要走一遍，因此这里刻意做了三件事：
-     * 1. 空文本单元格直接跳过（大表里空格子占多数，省掉一次离屏取用 + 一次合成）；
-     * 2. **不再逐字符 `ctx.save()/restore()`**：只有下划线/删除线才需要临时改
-     *    strokeStyle/lineWidth，用完就地复位即可；
-     * 3. **`font` / `fillStyle` 只在样式真正变化时赋值**：赋值本身会触发浏览器
-     *    重新解析字体串、作废文本度量缓存，是文本绘制里最贵的一次「状态抖动」。
-     *    历史实现每个字符都赋一遍（实测 1500 格视口 = 4214 次/帧）。
+     * 一帧内每个可见单元格都要走一遍，因此这里刻意做了几件事：
+     * 1. 空文本单元格直接跳过（大表里空格子占多数）；
+     * 2. **单元格文本位图缓存**（{@link _textBitmapCache}）：滚动时单元格的
+     *    内容、字号、尺寸都不变，只是位置变化。命中缓存时直接 drawImage，
+     *    跳过最贵的 measureCellText（逐字符度量 + 换行计算）与逐字符 fillText；
+     * 3. 未命中时走 {@link rasterizeCellText}，同样保持：
+     *    - 不逐字符 save/restore；
+     *    - font/fillStyle 仅在样式变化时赋值。
+     *
+     * 缓存键包含物理像素尺寸、zoom、dpr、对齐/换行/字距行距/数字格式以及
+     * 每个字符的内容与字体签名，因此任何一项变化都会自然产生新键，无需手动失效。
      * @param {Cell[]} cells - 视口内的单元格（由 draw() 统一计算）
      */
     private drawCellsText(cells: Cell[]) {
         this.ctx.save();
+        const dpr = window.devicePixelRatio;
         // 视口裁剪：只遍历当前可见的单元格
         for (let i=0; i<cells.length; i++) {
             const cellObj = cells[i];
@@ -560,99 +577,164 @@ export class SheetCanvas extends Canvas {
             if (!rect) continue;
             const cellWidth = rect.width;
             const cellHeight = rect.height;
-
-            // 获取单元格位置
             const cellLeft = rect.left;
             const cellTop = rect.top;
-            const { lines } = this.measureCellText(cell);
-            const { offscreenCanvas, offscreenCtx } = this.offscreen(
-                Math.round(cellWidth * this.data.zoom * window.devicePixelRatio),
-                Math.round(cellHeight * this.data.zoom * window.devicePixelRatio)
-            );
-            offscreenCtx.clearRect(0, 0, offscreenCanvas.width, offscreenCanvas.height);
-            
-            const letterSpacing = cellObj.letterSpacing || 0;
-            const lineSpacing = cellObj.lineSpacing || 0;
-            offscreenCtx.textAlign = 'left';
-            offscreenCtx.textBaseline = 'bottom';
-            // 连续相同样式的字符共享同一次 ctx 状态赋值（见方法注释第 3 条）
-            let lastFontStyle: string | null = null;
-            let lastFontWeight = '';
-            let lastFontSize = -1;
-            let lastFontFamily = '';
-            let lastFillColor = '';
-            // 在offscreenCanvas上绘制文本
-            let k = 0; // 特殊字符索引
-            for (let line of lines) {
-                if (line.text.length === 0) continue;
-                let currentX = line.x;
-                let currentY = line.y + line.lineHeight - lineSpacing;
-                for (let j=0; j < line.text.length; j++) {
-                    const char = line.text[j] === '\n' ? '' : line.text[j];
-                    const { 
-                        charWidth,
-                        fontColor,
-                        fontWeight,
-                        fontStyle,
-                        fontSize,
-                        fontFamily,
-                        underline,
-                        strikethrough 
-                    } = this.calculateCharGeometry(cell, k);
 
-                    if (fontColor !== lastFillColor) {
-                        offscreenCtx.fillStyle = fontColor;
-                        lastFillColor = fontColor;
-                    }
-                    if (fontStyle !== lastFontStyle || fontWeight !== lastFontWeight
-                        || fontSize !== lastFontSize || fontFamily !== lastFontFamily) {
-                        const fontParts = [];
-                        if (fontStyle) fontParts.push(fontStyle);
-                        if (fontWeight) fontParts.push(fontWeight);
-                        fontParts.push(`${Math.round(fontSize * window.devicePixelRatio)}px`);
-                        fontParts.push(fontFamily);
-                        offscreenCtx.font = fontParts.join(' ');
-                        lastFontStyle = fontStyle;
-                        lastFontWeight = fontWeight;
-                        lastFontSize = fontSize;
-                        lastFontFamily = fontFamily;
-                    }
-                    offscreenCtx.fillText(char, Math.round(currentX * window.devicePixelRatio), Math.round(currentY * window.devicePixelRatio));
-                    
-                    // 绘制下划线 / 删除线：临时改描边参数，画完就地复位（无需 save/restore）
-                    if (underline || strikethrough) {
-                        offscreenCtx.strokeStyle = fontColor;
-                        offscreenCtx.lineWidth = Math.max(1, Math.round(fontSize / 10 * window.devicePixelRatio));
-                        if (underline) {
-                            const underlineY = Math.round(currentY * window.devicePixelRatio - 1);
-                            offscreenCtx.beginPath();
-                            offscreenCtx.moveTo(Math.round(currentX * window.devicePixelRatio), underlineY);
-                            offscreenCtx.lineTo(Math.round((currentX + charWidth) * window.devicePixelRatio), underlineY);
-                            offscreenCtx.stroke();
-                        }
-                        if (strikethrough) {
-                            const strikethroughY = Math.round((currentY - fontSize * 0.48) * window.devicePixelRatio);
-                            offscreenCtx.beginPath();
-                            offscreenCtx.moveTo(Math.round(currentX * window.devicePixelRatio), strikethroughY);
-                            offscreenCtx.lineTo(Math.round((currentX + charWidth) * window.devicePixelRatio), strikethroughY);
-                            offscreenCtx.stroke();
-                        }
-                    }
-                    
-                    k += 1;
-                    currentX += charWidth + (j < line.text.length - 1 ? letterSpacing : 0);
+            const bitmapW = Math.round(cellWidth * this.data.zoom * dpr);
+            const bitmapH = Math.round(cellHeight * this.data.zoom * dpr);
+            const cacheKey = this.buildTextBitmapKey(cellObj, bitmapW, bitmapH);
+            let bitmap = this._textBitmapCache.get(cacheKey);
+            if (!bitmap) {
+                // 未命中：测量布局并光栅化到一张专属位图，随后缓存供滚动复用
+                const { lines } = this.measureCellText(cell);
+                bitmap = new OffscreenCanvas(bitmapW, bitmapH);
+                const bctx = bitmap.getContext('2d');
+                if (!bctx) continue;
+                this.rasterizeCellText(cell, lines, bctx);
+                if (this._textBitmapCache.size >= SheetCanvas.TEXT_BITMAP_CACHE_LIMIT) {
+                    this._textBitmapCache.clear();
                 }
+                this._textBitmapCache.set(cacheKey, bitmap);
             }
-            // 将 offscreenCanvas 内容合并到主canvas
+
+            // 将缓存位图合并到主 canvas（坐标/尺寸口径与原先逐字符绘制完全一致）
             const x = Math.round(cellLeft * this.data.zoom);
             const y = Math.round(cellTop * this.data.zoom);
-            this.ctx.drawImage(offscreenCanvas, 
-                Math.round(x * window.devicePixelRatio), Math.round(y * window.devicePixelRatio), 
-                Math.round(cellWidth * this.data.zoom * window.devicePixelRatio), 
-                Math.round(cellHeight * this.data.zoom * window.devicePixelRatio));
+            this.ctx.drawImage(bitmap,
+                Math.round(x * dpr), Math.round(y * dpr),
+                bitmapW, bitmapH);
         }
-        
+
         this.ctx.restore();
+    }
+
+    /**
+     * 构造单元格文本位图的缓存键
+     *
+     * 键覆盖所有能影响光栅化结果的输入：位图物理尺寸（含列宽行高/zoom/dpr）、
+     * 单元格级排版属性（换行/对齐/字距/行距/数字格式/单元格级字体兜底）、
+     * 以及逐字符的内容与 7 个字体字段。任一项变化都会得到不同的键。
+     *
+     * @param {Cell} cellObj - 单元格
+     * @param {number} bitmapW - 位图物理宽
+     * @param {number} bitmapH - 位图物理高
+     * @returns {string} 缓存键
+     * @private
+     */
+    private buildTextBitmapKey(cellObj: Cell, bitmapW: number, bitmapH: number): string {
+        const dpr = window.devicePixelRatio;
+        const z = Math.round(this.data.zoom * 1000);
+        const chars = cellObj.chars ?? [];
+        // 逐字符签名用单字符分隔符拼接；短字段名不参与以控制键长度
+        let sig = '';
+        for (let i = 0; i < chars.length; i++) {
+            const c = chars[i];
+            sig += c.char
+                + '\u0001' + (c.fontFamily ?? '')
+                + ',' + (c.fontSize ?? '')
+                + ',' + (c.fontWeight ? 1 : 0)
+                + ',' + (c.fontStyle ? 1 : 0)
+                + ',' + (c.fontColor ?? '')
+                + ',' + (c.underline ? 1 : 0)
+                + ',' + (c.strikethrough ? 1 : 0)
+                + '\u0002';
+        }
+        return `${bitmapW}x${bitmapH}|${z}|${dpr}|${cellObj.wrap ? 1 : 0}`
+            + `|${cellObj.letterSpacing ?? 0}|${cellObj.lineSpacing ?? 0}`
+            + `|${cellObj.numberFormat ?? ''}`
+            + `|${cellObj.textAlign ?? ''}|${cellObj.alignItems ?? ''}`
+            + `|${cellObj.fontFamily ?? ''}|${cellObj.fontSize ?? ''}|${sig}`;
+    }
+
+    /**
+     * 把一个单元格的文本行光栅化到指定（物理像素）位图上下文
+     *
+     * 从原 drawCellsText 抽出的纯绘制逻辑，坐标系与主画布物理像素一致。
+     * 保持两条性能约定：不逐字符 save/restore；font/fillStyle 仅在变化时赋值。
+     *
+     * @param {string} cell - 单元格名
+     * @param {LineText[]} lines - measureCellText 产出的行布局
+     * @param {OffscreenCanvasRenderingContext2D} ctx - 目标位图上下文（已按物理像素建图）
+     * @private
+     */
+    private rasterizeCellText(
+        cell: string,
+        lines: LineText[],
+        ctx: OffscreenCanvasRenderingContext2D
+    ): void {
+        const cellObj = this.data.getCellByName(cell);
+        const letterSpacing = cellObj?.letterSpacing || 0;
+        const lineSpacing = cellObj?.lineSpacing || 0;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'bottom';
+        // 连续相同样式的字符共享同一次 ctx 状态赋值（见 drawCellsText 注释）
+        let lastFontStyle: string | null = null;
+        let lastFontWeight = '';
+        let lastFontSize = -1;
+        let lastFontFamily = '';
+        let lastFillColor = '';
+        let k = 0; // 字符全局索引（与 calculateCharGeometry 的 charIndex 对齐）
+        for (let li = 0; li < lines.length; li++) {
+            const line = lines[li];
+            if (line.text.length === 0) continue;
+            let currentX = line.x;
+            const currentY = line.y + line.lineHeight - lineSpacing;
+            for (let j = 0; j < line.text.length; j++) {
+                const ch = line.text[j] === '\n' ? '' : line.text[j];
+                const {
+                    charWidth,
+                    fontColor,
+                    fontWeight,
+                    fontStyle,
+                    fontSize,
+                    fontFamily,
+                    underline,
+                    strikethrough
+                } = this.calculateCharGeometry(cell, k);
+
+                if (fontColor !== lastFillColor) {
+                    ctx.fillStyle = fontColor;
+                    lastFillColor = fontColor;
+                }
+                if (fontStyle !== lastFontStyle || fontWeight !== lastFontWeight
+                    || fontSize !== lastFontSize || fontFamily !== lastFontFamily) {
+                    const fontParts: string[] = [];
+                    if (fontStyle) fontParts.push(fontStyle);
+                    if (fontWeight) fontParts.push(fontWeight);
+                    fontParts.push(`${Math.round(fontSize * window.devicePixelRatio)}px`);
+                    fontParts.push(fontFamily);
+                    ctx.font = fontParts.join(' ');
+                    lastFontStyle = fontStyle;
+                    lastFontWeight = fontWeight;
+                    lastFontSize = fontSize;
+                    lastFontFamily = fontFamily;
+                }
+                ctx.fillText(ch, Math.round(currentX * window.devicePixelRatio), Math.round(currentY * window.devicePixelRatio));
+
+                // 绘制下划线 / 删除线：临时改描边参数，画完就地复位（无需 save/restore）
+                if (underline || strikethrough) {
+                    ctx.strokeStyle = fontColor;
+                    ctx.lineWidth = Math.max(1, Math.round(fontSize / 10 * window.devicePixelRatio));
+                    if (underline) {
+                        const underlineY = Math.round(currentY * window.devicePixelRatio - 1);
+                        ctx.beginPath();
+                        ctx.moveTo(Math.round(currentX * window.devicePixelRatio), underlineY);
+                        ctx.lineTo(Math.round((currentX + charWidth) * window.devicePixelRatio), underlineY);
+                        ctx.stroke();
+                    }
+                    if (strikethrough) {
+                        const strikethroughY = Math.round((currentY - fontSize * 0.48) * window.devicePixelRatio);
+                        ctx.beginPath();
+                        ctx.moveTo(Math.round(currentX * window.devicePixelRatio), strikethroughY);
+                        ctx.lineTo(Math.round((currentX + charWidth) * window.devicePixelRatio), strikethroughY);
+                        ctx.stroke();
+                    }
+                }
+
+                k += 1;
+                currentX += charWidth + (j < line.text.length - 1 ? letterSpacing : 0);
+            }
+        }
     }
 
     /**

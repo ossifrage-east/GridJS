@@ -134,6 +134,8 @@ export class DataCollection extends EventEmitter {
     private _valuesEpoch: number = 0;
     /** 索引当前所处的世代；与 `_valuesEpoch` 不一致说明索引可能已过期 */
     private _indexEpoch: number = -1;
+    /** 索引是否因结构操作（重命名/增删单元格）而需要重建；属性变化（着色/格式）不设此标记 */
+    private _indexStructurallyInvalid: boolean = false;
     /**
      * 合并单元格锚点缓存（形如 `A1:C3`），随索引一并重建。
      * 原先 {@link getMergedCells} 每次调用都全表扫描一遍，而它又被
@@ -318,6 +320,16 @@ export class DataCollection extends EventEmitter {
     private _filterConditions: Map<number, { anchorRow: number; keep: Set<string> }> = new Map();
     /** 筛选操作顺序：已筛选列号按首次执行筛选的先后排列（重放筛选条件时使用） */
     private _filterOrder: number[] = [];
+    /**
+     * 已隐藏行号倒排索引（1-based）
+     *
+     * `setRowsHidden` 同步维护：隐藏=true 加入集合，=false 移除。
+     * 筛选（{@link computeFilterHiddenRows} / Filter.applyFilter）需要遍历
+     * 「当前已隐藏的行」做差量更新；历史实现 `for r = anchorRow+1..totalRows`
+     * 是 O(总行数) 全表扫描，百万行大表卡顿主因。改用本索引后为 O(已隐藏行数)，
+     * 而已隐藏行通常只有几百到几千行。
+     */
+    private _hiddenRowsSet: Set<number> = new Set();
     /** runWithFullStateUndo 嵌套深度：仅最外层推入撤销记录，嵌套调用的变更折叠进外层快照 */
     private _fullStateUndoDepth: number = 0;
     /**
@@ -328,6 +340,33 @@ export class DataCollection extends EventEmitter {
     private _editUndoStack: { values: Cell[]; cursor: number }[] = [];
     /** 编辑期间的重做栈，配合 _editUndoStack 使用 */
     private _editRedoStack: { values: Cell[]; cursor: number }[] = [];
+    /**
+     * 最近一次编辑内快照入栈时间戳（performance.now()）
+     *
+     * 用于时间窗口合并：连续输入/删除在约 500ms 内的多次提交合并为栈顶一条，
+     * 避免「输入 abcdef 要按 6 次 Ctrl+Z 才能撤销」的过细粒度——
+     * 这是用户反馈「撤销/重做不精准」的根因。窗口内仅替换栈顶快照（保留最新 cursor），
+     * 超过窗口或切换操作类型（输入↔删除）才新压一条。
+     */
+    private _lastEditCommitTime: number = 0;
+    /**
+     * 最近一次编辑提交的操作类型（'input' | 'delete' | 'style' | null）
+     *
+     * 时间窗口合并只在同类型内进行：连续输入合并、连续删除合并，
+     * 但「输入→删除」之间不合并（让用户能分别撤销输入与删除）。
+     */
+    private _lastEditCommitType: 'input' | 'delete' | 'style' | null = null;
+    /**
+     * 大表编辑期间的「单格版」撤销栈
+     *
+     * 一次编辑会话只会改动活动单元格，因此大表（整表深拷贝被禁用，见
+     * {@link LARGE_TABLE_UNDO_CELLS}）下改为仅对该单元格做逐状态深拷贝，
+     * 成本与表大小无关。cell 为 null 表示该状态下活动单元格尚不存在。
+     * 栈底为编辑前基准；_editUndoStack 为空即表示当前处于单格记账模式。
+     */
+    private _editCellUndoStack: { cell: Cell | null; cursor: number }[] = [];
+    /** 大表编辑期间的单格重做栈 */
+    private _editCellRedoStack: { cell: Cell | null; cursor: number }[] = [];
     /**
      * 编辑内撤销/重做后应恢复到的光标绝对索引。
      * 由 _undoEditStep/_redoEditStep 写入，供 editCanvas 在重测 lines、
@@ -1028,6 +1067,22 @@ export class DataCollection extends EventEmitter {
      */
     public invalidateCellIndex(): void {
         this._valuesEpoch++;
+        this._indexStructurallyInvalid = true;
+    }
+
+    /**
+     * 标记单元格内容/属性已变化（如着色、格式、文本编辑），但不涉及名集合变更。
+     *
+     * 与 {@link invalidateCellIndex} 的区别：不设 {@link _indexStructurallyInvalid}，
+     * 因此 {@link _ensureCellIndex} 不会触发全量索引重建——着色/格式操作在百万格
+     * 大表上不再每次都重建索引（O(N) → O(1)）。
+     *
+     * 筛选按钮的世代缓存（{@link hasFilterCells}）仍因 _valuesEpoch 变化而失效，
+     * 下次 draw 会走一次 getFilterCells → _ensureCellIndex，但后者发现长度未变且
+     * 非结构失效，直接跳过重建。
+     */
+    public markContentChanged(): void {
+        this._valuesEpoch++;
     }
 
     /**
@@ -1085,8 +1140,13 @@ export class DataCollection extends EventEmitter {
      * @private
      */
     private _ensureCellIndex(): void {
-        if (this._values.length !== this._indexedLength || this._indexEpoch !== this._valuesEpoch) {
+        if (this._values.length !== this._indexedLength || this._indexStructurallyInvalid) {
             this._rebuildCellIndex();
+            this._indexStructurallyInvalid = false;
+        } else if (this._indexEpoch !== this._valuesEpoch) {
+            // 内容变了但结构没变：只刷新世代标记，不重建索引
+            this._indexEpoch = this._valuesEpoch;
+            this._filterCellsEpoch = this._valuesEpoch;
         }
     }
 
@@ -1524,7 +1584,10 @@ export class DataCollection extends EventEmitter {
     public commitValues(): void {
         if (this.isEditting) {
             if (!this._undoTrackingEnabled()) {
-                // 大表：不记编辑内快照，仅广播（撤销记账整体关闭）
+                // 大表：整表快照关闭，改用「单格快照」记录编辑内撤销——
+                // 编辑会话只触及活动单元格，单格深拷贝的成本与整表大小无关，
+                // 因此百万格的表在编辑态改字体/打字依然可以 Ctrl+Z / Ctrl+Y。
+                this._commitEditCellState();
                 this.emit(DataEvents.VALUES_CHANGED, this._values);
                 return;
             }
@@ -1532,7 +1595,18 @@ export class DataCollection extends EventEmitter {
             const last = this._editUndoStack[this._editUndoStack.length - 1];
             // 仅在内容确实变化时入栈，跳过无变化的提交，避免撤销栈产生空操作
             if (!last || !this._valuesSnapshotsEqual(last.values, current)) {
-                this._editUndoStack.push({ values: current, cursor: this.cursorAbsolutePosition });
+                // 时间窗口合并：500ms 内连续提交合并为栈顶一条，
+                // 避免「输入 abcdef 要按 6 次 Ctrl+Z」的过细粒度。
+                // 栈底（基准）永远不替换，只在 length > 1 时合并到栈顶。
+                const now = performance.now();
+                if (last && this._editUndoStack.length > 1
+                    && now - this._lastEditCommitTime < 500) {
+                    last.values = current;
+                    last.cursor = this.cursorAbsolutePosition;
+                } else {
+                    this._editUndoStack.push({ values: current, cursor: this.cursorAbsolutePosition });
+                }
+                this._lastEditCommitTime = now;
                 this._editRedoStack = [];
             }
             this.emit(DataEvents.VALUES_CHANGED, this._values);
@@ -1544,6 +1618,72 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 大表编辑态下记录活动单元格的一次状态变化（单格版撤销栈）
+     *
+     * 仅当活动单元格相对栈顶确实发生变化时入栈并清空重做栈；
+     * 无变化的提交（如重复点同一个格式按钮）不入栈。
+     * @private
+     */
+    private _commitEditCellState(): void {
+        const active = this.getCellByName(this.activedCell);
+        const snapshot = active ? active.clone() : null;
+        const top = this._editCellUndoStack[this._editCellUndoStack.length - 1];
+        // 内容未变化：跳过，不入栈（避免空操作）
+        if (top && this._sameCellSnapshot(top.cell, snapshot)) return;
+        const now = performance.now();
+        // 时间窗口合并：500ms 内连续提交合并为栈顶一条，
+        // 避免「输入 abcdef 要按 6 次 Ctrl+Z」的过细粒度。
+        // 栈底（基准）永远不替换，只在 length > 1 时合并到栈顶。
+        if (top && this._editCellUndoStack.length > 1
+            && now - this._lastEditCommitTime < 500) {
+            top.cell = snapshot;
+            top.cursor = this.cursorAbsolutePosition;
+        } else {
+            this._editCellUndoStack.push({ cell: snapshot, cursor: this.cursorAbsolutePosition });
+            this._editCellRedoStack = [];
+        }
+        this._lastEditCommitTime = now;
+    }
+
+    /**
+     * 比较两个单格快照是否等价（null 表示单元格不存在）
+     *
+     * 复用整表比较逻辑，把单个格包装成一格数组即可，避免另写一套字段比较。
+     * @param {Cell | null} a - 快照 A
+     * @param {Cell | null} b - 快照 B
+     * @returns {boolean} 是否等价
+     * @private
+     */
+    private _sameCellSnapshot(a: Cell | null, b: Cell | null): boolean {
+        if (a === b) return true;
+        if (a === null || b === null) return false;
+        return this._valuesSnapshotsEqual([a], [b]);
+    }
+
+    /**
+     * 把单格快照回写到当前 values（供大表单格撤销/重做使用）
+     *
+     * 快照为 null 表示该状态下活动单元格不存在 → 从 values 中移除；
+     * 当前不存在而快照存在 → 追加回 values。回写后名称索引会在下次查询时惰性重建。
+     * @param {Cell | null} snapshot - 目标状态
+     * @private
+     */
+    private _applyEditCellState(snapshot: Cell | null): void {
+        const name = this.activedCell;
+        const index = this._values.findIndex(c => c.cell === name);
+        if (snapshot === null) {
+            if (index >= 0) this._values.splice(index, 1);
+        } else if (index >= 0) {
+            this._values[index] = snapshot.clone();
+        } else {
+            this._values.push(snapshot.clone());
+        }
+        // 名称索引立即清空：否则 getCellByName 可能命中被替换格的旧引用
+        this._cellIndex.clear();
+        this._indexedLength = -1;
+    }
+
+    /**
      * 进入编辑会话
      * 捕获编辑前的 values 快照与光标位置作为编辑内撤销栈的基准（栈底 index 0），
      * 并清空编辑内重做栈。应在 isEditting 置为 true 时调用。
@@ -1551,10 +1691,22 @@ export class DataCollection extends EventEmitter {
      * 且 `_undoEditStep` 会因栈深不足直接返回 false，行为一致。
      */
     public beginEditSession(): void {
-        this._editUndoStack = this._undoTrackingEnabled()
-            ? [{ values: this.cloneValues(this._values), cursor: this.cursorAbsolutePosition }]
-            : [];
+        if (this._undoTrackingEnabled()) {
+            this._editUndoStack = [{ values: this.cloneValues(this._values), cursor: this.cursorAbsolutePosition }];
+        } else {
+            // 大表：整表深拷贝关闭，改对活动单元格建立单格基准快照，
+            // 编辑内撤销/重做依然可用（见 _editCellUndoStack）。
+            const active = this.getCellByName(this.activedCell);
+            this._editCellUndoStack = [{
+                cell: active ? active.clone() : null,
+                cursor: this.cursorAbsolutePosition
+            }];
+        }
         this._editRedoStack = [];
+        this._editCellRedoStack = [];
+        // 新编辑会话：重置时间戳与类型，确保会话首次输入作为独立条目入栈。
+        this._lastEditCommitTime = 0;
+        this._lastEditCommitType = null;
     }
 
     /**
@@ -1578,6 +1730,8 @@ export class DataCollection extends EventEmitter {
         this._refreshBaseline();
         this._editUndoStack = [];
         this._editRedoStack = [];
+        this._editCellUndoStack = [];
+        this._editCellRedoStack = [];
     }
 
     /**
@@ -1591,12 +1745,26 @@ export class DataCollection extends EventEmitter {
      * @returns {boolean} 是否撤销成功
      */
     private _undoEditStep(): boolean {
+        // 大表单格记账模式
+        if (this._editUndoStack.length === 0) {
+            if (this._editCellUndoStack.length <= 1) return false;
+            const current = this._editCellUndoStack.pop()!;
+            this._editCellRedoStack.push(current);
+            const target = this._editCellUndoStack[this._editCellUndoStack.length - 1];
+            this._editRestoreCursor = target.cursor;
+            this._applyEditCellState(target.cell);
+            // 撤销是明确的操作边界：重置时间戳，使撤销后的下一次输入作为新栈顶条目，
+            // 不被合并到撤销前的最后操作（否则会丢失「撤销」这一意图）。
+            this._lastEditCommitTime = 0;
+            return true;
+        }
         if (this._editUndoStack.length <= 1) return false;
         const current = this._editUndoStack.pop()!;
         this._editRedoStack.push(current);
         const target = this._editUndoStack[this._editUndoStack.length - 1];
         this._editRestoreCursor = target.cursor;
         this._applyEditState(target.values);
+        this._lastEditCommitTime = 0;
         return true;
     }
 
@@ -1607,11 +1775,23 @@ export class DataCollection extends EventEmitter {
      * @returns {boolean} 是否重做成功
      */
     private _redoEditStep(): boolean {
+        // 大表单格记账模式
+        if (this._editUndoStack.length === 0) {
+            if (this._editCellRedoStack.length === 0) return false;
+            const state = this._editCellRedoStack.pop()!;
+            this._editCellUndoStack.push(state);
+            this._editRestoreCursor = state.cursor;
+            this._applyEditCellState(state.cell);
+            // 重做同样是明确的操作边界：重置时间戳。
+            this._lastEditCommitTime = 0;
+            return true;
+        }
         if (this._editRedoStack.length === 0) return false;
         const state = this._editRedoStack.pop()!;
         this._editUndoStack.push(state);
         this._editRestoreCursor = state.cursor;
         this._applyEditState(state.values);
+        this._lastEditCommitTime = 0;
         return true;
     }
 
@@ -1792,8 +1972,11 @@ export class DataCollection extends EventEmitter {
             this._pruneEmptyCells();
             this._fullStateUndoDepth--;
             this._suppressValuesUndo = prevSuppress;
-            // 结构操作可能重命名/增删单元格 → 索引与合并缓存失效
-            this.invalidateCellIndex();
+            // 着色/格式等属性操作不改名集合，只标记内容变化（O(1)），
+            // 避免每次操作都触发百万格索引重建。
+            // 结构操作（insertRows/insertCols 等重命名）自己调了 invalidateCellIndex。
+            // _pruneEmptyCells 删空格时也会调 invalidateCellIndex（改变了名集合）。
+            this.markContentChanged();
             // 仅最外层推入撤销记录；撤销/重做回写期间（_isApplyingUndo）不得入栈；
             // 「变化后」超过阈值时同样跳过（如把空表装载成几十万格）
             if (before !== null && this._undoTrackingEnabled() && !this._isApplyingUndo) {
@@ -2315,18 +2498,16 @@ export class DataCollection extends EventEmitter {
         const { startCol } = this.colHeaders.getVisibleStartCol();
         const len = this.colHeaders.length;
         const viewportRight = this.colHeaders.offsetWidth + this.visibleView.sheetWidth / this.zoom;
-        // 内容窄于视口时（循环不中断）视口覆盖整张表 → 结束列就是最后一列的列号
-        let endCol = len;
-        for (let i = startCol - 1; i < len - 1; i++) {
-            const col = this.colHeaders.getAt(i);
-            if (!col) break;
-            if (col.isHidden) continue;  // 跳过隐藏列
-            if (col.left + col.width >= viewportRight) {  // 列右边缘到达视口右边（含只露出一部分的列）
-                endCol = i + 1;   // 下标 → 1-based 列号
-                break;
-            }
+        // 二分找到第一个 left >= viewportRight 的列（0-based j），不存在则 j = len
+        // left 单调不减（隐藏列 left = 前一个可见列 right，不累加），故可二分
+        let lo = startCol - 1, hi = len - 1, j = len;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            const col = this.colHeaders.getAt(mid);
+            if (col && col.left >= viewportRight) { j = mid; hi = mid - 1; }
+            else lo = mid + 1;
         }
-        return { startCol, endCol: Math.max(startCol, endCol) };
+        return { startCol, endCol: Math.max(startCol, j) };
     }
     
     /**
@@ -2337,24 +2518,109 @@ export class DataCollection extends EventEmitter {
      *
      * 语义与 {@link getVisibleCols} 完全对称：`startRow` / `endRow` 都是
      * **1-based 行号**，`endRow` **包含「下边缘只露出一部分」的那一行**。
+     *
+     * 【性能约定，勿回退为「线性扫描跳过隐藏行」】
+     * 筛选后视口内可能有大量隐藏行（top = 前一个可见行 bottom，不累加），
+     * 线性扫描逐行 `continue` 会每帧跳过几万行。`top` 单调不减，改二分后 O(log N)。
      * @returns {{startRow: number, endRow: number}} 可见行的起止行号（1-based，含端点）
      */
     public getVisibleRows(): {startRow: number, endRow: number} {
         const { startRow } = this.rowHeaders.getVisibleStartRow();
         const len = this.rowHeaders.length;
         const viewportBottom = this.rowHeaders.offsetHeight + this.visibleView.sheetHeight / this.zoom;
-        // 内容矮于视口时（循环不中断）视口覆盖整张表 → 结束行就是最后一行的行号
-        let endRow = len;
-        for (let i = startRow - 1; i < len - 1; i++) {
-            const row = this.rowHeaders.getAt(i);
-            if (!row) break;
-            if (row.isHidden) continue;  // 跳过隐藏行
-            if (row.top + row.height >= viewportBottom) {  // 行底边缘到达视口下边（含只露出一部分的行）
-                endRow = i + 1;   // 下标 → 1-based 行号
-                break;
-            }
+        // 二分找到第一个 top >= viewportBottom 的行（0-based j），不存在则 j = len
+        // top 单调不减（隐藏行 top = 前一个可见行 bottom，不累加），故可二分
+        let lo = startRow - 1, hi = len - 1, j = len;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            const row = this.rowHeaders.getAt(mid);
+            if (row && row.top >= viewportBottom) { j = mid; hi = mid - 1; }
+            else lo = mid + 1;
         }
-        return { startRow, endRow: Math.max(startRow, endRow) };
+        // j = 第一个不在视口内的行（0-based）；视口最后一行行号 = j（1-based）
+        // j 之前可能包含若干隐藏行（top < viewportBottom），由 getVisibleCells 跳过
+        return { startRow, endRow: Math.max(startRow, j) };
+    }
+
+    /**
+     * 获取视口内所有可见行的行号数组（1-based）
+     *
+     * 利用 `rowHeaders.visibleRowIndices` 在「纯可见行」上二分定位视口起止，
+     * 只返回视口内的可见行行号。隐藏行不占位但行号不连续，按行号遍历会
+     * 跳过大量隐藏行号；本方法返回纯可见行行号，调用方直接遍历无需跳过。
+     *
+     * 复杂度 O(log 可见行数 + 视口内可见行数)，与隐藏行数量无关。
+     * @returns {number[]} 视口内可见行行号数组（1-based，升序）
+     */
+    public getVisibleRowNumbers(): number[] {
+        const visIdx = this.rowHeaders.visibleRowIndices;
+        if (visIdx.length === 0) return [];
+        const offset = this.rowHeaders.offsetHeight;
+        const viewportBottom = offset + this.visibleView.sheetHeight / this.zoom;
+        const headers = this.rowHeaders;
+        // 二分：在 visIdx 中找第一个 top >= viewportBottom 的（即第一个不在视口内的可见行）
+        let lo = 0, hi = visIdx.length - 1, j = visIdx.length;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            const row = headers.getAt(visIdx[mid]);
+            if (row && row.top >= viewportBottom) { j = mid; hi = mid - 1; }
+            else lo = mid + 1;
+        }
+        // 二分：在 visIdx 中找最后一个 top <= offset 的（即视口起始可见行）
+        let lo2 = 0, hi2 = visIdx.length - 1, k = -1;
+        while (lo2 <= hi2) {
+            const mid = (lo2 + hi2) >> 1;
+            const row = headers.getAt(visIdx[mid]);
+            if (row && row.top <= offset) { k = mid; lo2 = mid + 1; }
+            else hi2 = mid - 1;
+        }
+        // k = 最后一个 top <= offset 的可见行在 visIdx 中的位置
+        // 视口起始可见行：top 覆盖 offset 的行（top <= offset 但 top + height > offset）
+        // 与 getVisibleStartRow 语义一致：从 k 开始（k 的 top <= offset，k+1 的 top > offset）
+        // 若 k 的 top + height <= offset（k 已滚出视口），起始应为 k+1，但 k+1 仍在 [startIdx, endIdx) 区间内
+        // +1 冗余：最下一行多画一个可见行，避免内容紧挨视口底边看不清
+        const startIdx = Math.max(0, k < 0 ? 0 : k);
+        const endIdx = Math.min(visIdx.length, j + 1);
+        const result: number[] = [];
+        for (let i = startIdx; i < endIdx; i++) result.push(visIdx[i] + 1);
+        return result;
+    }
+
+    /**
+     * 获取视口内所有可见列的列号数组（1-based）
+     *
+     * 与 {@link getVisibleRowNumbers} 对称：在 `colHeaders.visibleColIndices`
+     * 上二分定位视口起止，只返回视口内的可见列列号。
+     * @returns {number[]} 视口内可见列列号数组（1-based，升序）
+     */
+    public getVisibleColNumbers(): number[] {
+        const visIdx = this.colHeaders.visibleColIndices;
+        if (visIdx.length === 0) return [];
+        const offset = this.colHeaders.offsetWidth;
+        const viewportRight = offset + this.visibleView.sheetWidth / this.zoom;
+        const headers = this.colHeaders;
+        // 二分：在 visIdx 中找第一个 left >= viewportRight 的（即第一个不在视口内的可见列）
+        let lo = 0, hi = visIdx.length - 1, j = visIdx.length;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            const col = headers.getAt(visIdx[mid]);
+            if (col && col.left >= viewportRight) { j = mid; hi = mid - 1; }
+            else lo = mid + 1;
+        }
+        // 二分：在 visIdx 中找最后一个 left <= offset 的（即视口起始可见列）
+        let lo2 = 0, hi2 = visIdx.length - 1, k = -1;
+        while (lo2 <= hi2) {
+            const mid = (lo2 + hi2) >> 1;
+            const col = headers.getAt(visIdx[mid]);
+            if (col && col.left <= offset) { k = mid; lo2 = mid + 1; }
+            else hi2 = mid - 1;
+        }
+        // +1 冗余：最右一列多画一个可见列，避免内容紧挨视口右边看不清
+        const startIdx = Math.max(0, k < 0 ? 0 : k);
+        const endIdx = Math.min(visIdx.length, j + 1);
+        const result: number[] = [];
+        for (let i = startIdx; i < endIdx; i++) result.push(visIdx[i] + 1);
+        return result;
     }
 
     /**
@@ -2366,15 +2632,24 @@ export class DataCollection extends EventEmitter {
      *   否则滚动到合并区域中部时该区域会被漏画。
      *
      * 复杂度 O(可见单元格数 + 合并单元格数)，与表格总规模无关。
+     *
+     * 【性能约定，勿回退为「按行号遍历跳过隐藏行/列」】
+     * 筛选后 startRow..endRow 之间可能夹杂大量隐藏行（top 不累加但仍占行号）。
+     * 按行号遍历即使每次 `continue`，几万隐藏行 × 几十列 = 每帧百万次循环判断，
+     * 是筛选后滚动卡顿的主因。改为遍历 {@link getVisibleRowNumbers} /
+     * {@link getVisibleColNumbers} 返回的「纯可见行/列号」，循环次数只与
+     * 视口内可见单元格数相关，与隐藏行数量无关。
      * @returns {Cell[]} 视口内需要绘制的单元格
      */
     public getVisibleCells(): Cell[] {
-        const { startCol, endCol } = this.getVisibleCols();
-        const { startRow, endRow } = this.getVisibleRows();
+        const rowNumbers = this.getVisibleRowNumbers();
+        const colNumbers = this.getVisibleColNumbers();
         const result: Cell[] = [];
         const seen = new Set<string>();
-        for (let r = startRow; r <= endRow; r++) {
-            for (let c = startCol; c <= endCol; c++) {
+        for (let ri = 0; ri < rowNumbers.length; ri++) {
+            const r = rowNumbers[ri];
+            for (let ci = 0; ci < colNumbers.length; ci++) {
+                const c = colNumbers[ci];
                 const name = this.getCellName(c, r);
                 const cell = this.getCellByName(name);
                 if (cell !== undefined) {
@@ -2385,6 +2660,8 @@ export class DataCollection extends EventEmitter {
         }
         // 合并区域：锚点可能位于视口左上方（如 A1:C3 而视口从 B2 开始）
         // 走列倒排索引 + 数值裁剪（不再对每个合并块做字符串 split/解析）
+        const { startCol, endCol } = this.getVisibleCols();
+        const { startRow, endRow } = this.getVisibleRows();
         const mergeRects = this.getVisibleMergeRects(startCol, endCol, startRow, endRow);
         for (let i = 0; i < mergeRects.length; i++) {
             const anchorName = mergeRects[i].anchor;
@@ -3742,12 +4019,27 @@ export class DataCollection extends EventEmitter {
 
     /**
      * 设置选中字符的字体
+     *
+     * 作用范围：
+     * - 编辑态下有字符选区：仅作用于选区字符；
+     * - 编辑态下只有光标（无选区）：作用于当前单元格的**全部字符**。
+     *   否则点击字体按钮会静默无效，也无法撤销，用户感知为「字体改不了」。
+     *
+     * 两种分支都经过 {@link commitValues}，编辑态下自动进入编辑内撤销栈，
+     * 可通过 Ctrl+Z / Ctrl+Y 撤销与重做。
+     *
      * @param fontStyle 字体样式
      */
     public setSelectedCharsFont(fontStyle: FontStyle): void {
-        const startIndex = this.getSelectedCharsStartIndex();
-        const endIndex = this.getSelectedCharsEndIndex();
-        const chars = this.getCellByName(this.activedCell)?.chars || [];
+        let startIndex = this.getSelectedCharsStartIndex();
+        let endIndex = this.getSelectedCharsEndIndex();
+        const cell = this.getCellByName(this.activedCell);
+        const chars = cell?.chars || [];
+        // 无选区时退化为「整格字符」作用域
+        if (startIndex === endIndex && chars.length > 0) {
+            startIndex = 0;
+            endIndex = chars.length;
+        }
         for (let i = startIndex; i < endIndex; i++) {
             const char = chars[i];
             if (char) {
@@ -4556,6 +4848,7 @@ export class DataCollection extends EventEmitter {
                 if (spanEnd >= atRow) cell.rowspan = cell.rowspan + count;
             }
         }
+        this.invalidateCellIndex(); // 重命名了 cell.cell，索引名→对象映射失效
         this.emit(DataEvents.VALUES_CHANGED, this._values);
     }
 
@@ -4586,6 +4879,7 @@ export class DataCollection extends EventEmitter {
                 if (spanEnd >= atCol) cell.colspan = cell.colspan + count;
             }
         }
+        this.invalidateCellIndex(); // 重命名了 cell.cell，索引名→对象映射失效
         this.emit(DataEvents.VALUES_CHANGED, this._values);
     }
 
@@ -4708,6 +5002,10 @@ export class DataCollection extends EventEmitter {
 
     /**
      * 设置指定范围行的隐藏状态
+     *
+     * 同步维护 {@link _hiddenRowsSet} 倒排索引：隐藏=true 加入集合，=false 移除。
+     * 筛选场景需遍历「当前已隐藏的行」做差量判定时，改为访问 {@link getHiddenRowsSet}
+     * 而非扫到总行数（百万级大表的卡顿主因）。
      * @param {number} startRow - 起始行号（1-based，含）
      * @param {number} endRow - 结束行号（1-based，含）
      * @param {boolean} hidden - 是否隐藏
@@ -4716,6 +5014,8 @@ export class DataCollection extends EventEmitter {
         for (let r = startRow; r <= endRow; r++) {
             const rh = this.rowHeaders.getAt(r - 1);
             if (rh) rh.isHidden = hidden;
+            if (hidden) this._hiddenRowsSet.add(r);
+            else this._hiddenRowsSet.delete(r);
         }
         // 重算可见行 top 位置（隐藏行不占位，下方行上移覆盖）+ 总高度
         this.rowHeaders.recalcRowPositions();
@@ -4726,9 +5026,13 @@ export class DataCollection extends EventEmitter {
             this.rowHeaders.offsetHeight = maxOffset;
         }
         if (hidden) {
-            // 隐藏：可见总高不足一屏时逐行补足，新行真实加入 rowHeaders（按可见总高判断，兼容自定义行高）
-            while (this.rowHeaders.allRowHeight < viewportHeight) {
-                this.rowHeaders.addRow(this.rowHeaders.length, this.rowHeaders.length + 1);
+            // 隐藏：可见总高不足一屏时一次性补足（按可见总高判断，兼容自定义行高）
+            // 【性能约定，勿回退为「while 逐行 addRow + recalcRowPositions」】
+            // 每次循环 addRow 末尾 + recalcRowPositions 都是 O(N)；补几十行 = O(N×几十)
+            const deficit = viewportHeight - this.rowHeaders.allRowHeight;
+            if (deficit > 0) {
+                const need = Math.ceil(deficit / DEFAULT_CELL_HEIGHT) + 1;
+                this.rowHeaders.addRow(this.rowHeaders.length, this.rowHeaders.length + need);
                 this.rowHeaders.recalcRowPositions();
             }
         } else {
@@ -4736,6 +5040,76 @@ export class DataCollection extends EventEmitter {
             // 本次取消隐藏的行受保护不参与收缩，否则取消隐藏尾部空行会立刻被删导致操作无效
             const protectedRows = new Set<number>();
             for (let r = startRow; r <= endRow; r++) protectedRows.add(r);
+            this.trimRowsToViewport(viewportHeight, protectedRows);
+        }
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
+    }
+
+    /**
+     * 取「当前已隐藏的行」集合引用（可变，筛选差量更新可直接增删）
+     *
+     * 由 {@link setRowsHidden} / {@link setRowHiddenFlag} 同步维护。
+     * 筛选（{@link Filter.applyFilter}）差量更新时用它替代「扫到总行数」的
+     * O(N) 全表扫描——百万行大表已隐藏行通常只有几千行。
+     * @returns {Set<number>} 已隐藏行号集合（1-based）
+     */
+    public getHiddenRowsSet(): Set<number> {
+        return this._hiddenRowsSet;
+    }
+
+    /**
+     * 仅改单行隐藏标记 + 维护索引，不做收尾
+     *
+     * 供筛选批量应用时逐行调用，全部改完后由 {@link finalizeRowVisibility}
+     * 统一做一次 recalc + clamp + 补足/收缩 + 广播。避免了「逐行调
+     * setRowsHidden」产生 N 次 recalc + N 次广播/重绘的卡顿。
+     * @param {number} row - 行号（1-based）
+     * @param {boolean} hidden - 是否隐藏
+     */
+    public setRowHiddenFlag(row: number, hidden: boolean): void {
+        const rh = this.rowHeaders.getAt(row - 1);
+        if (rh) rh.isHidden = hidden;
+        if (hidden) this._hiddenRowsSet.add(row);
+        else this._hiddenRowsSet.delete(row);
+    }
+
+    /**
+     * 批量应用行隐藏状态后做一次收尾
+     *
+     * 调用方应**先直接改 RowHeader.isHidden 标记**（同步维护 {@link _hiddenRowsSet}），
+     * 全部改完后调本方法做一次 recalcRowPositions + clamp + 补足/收缩 + 广播。
+     *
+     * 这是为了让筛选（applyFilter）能一次性应用所有需要变化的行段，避免
+     * 「分段调用 setRowsHidden」产生多次 recalc + 多次 emit/重绘——大表上
+     * 多段连续隐藏/取消隐藏会产生可感卡顿。
+     *
+     * @param {number} protectedStart - 受保护行段起点（1-based，取消隐藏时不参与尾部收缩）
+     * @param {number} protectedEnd - 受保护行段终点（1-based）
+     * @param {boolean} hadHide - 本次是否有「隐藏」操作（决定是否走补足分支）
+     * @param {boolean} hadUnhide - 本次是否有「取消隐藏」操作（决定是否走收缩分支）
+     */
+    public finalizeRowVisibility(
+        protectedStart: number, protectedEnd: number,
+        hadHide: boolean, hadUnhide: boolean
+    ): void {
+        this.rowHeaders.recalcRowPositions();
+        const viewportHeight = this.visibleView.sheetHeight / this.zoom;
+        const maxOffset = Math.max(0, this.rowHeaders.allRowHeight - viewportHeight);
+        if (this.rowHeaders.offsetHeight > maxOffset) {
+            this.rowHeaders.offsetHeight = maxOffset;
+        }
+        if (hadHide) {
+            // 一次性补足：避免 while 逐行 addRow + recalcRowPositions 的 O(N×补足行数)
+            const deficit = viewportHeight - this.rowHeaders.allRowHeight;
+            if (deficit > 0) {
+                const need = Math.ceil(deficit / DEFAULT_CELL_HEIGHT) + 1;
+                this.rowHeaders.addRow(this.rowHeaders.length, this.rowHeaders.length + need);
+                this.rowHeaders.recalcRowPositions();
+            }
+        }
+        if (hadUnhide) {
+            const protectedRows = new Set<number>();
+            for (let r = protectedStart; r <= protectedEnd; r++) protectedRows.add(r);
             this.trimRowsToViewport(viewportHeight, protectedRows);
         }
         this.emit(DataEvents.VALUES_CHANGED, this._values);
@@ -4823,9 +5197,12 @@ export class DataCollection extends EventEmitter {
             this.colHeaders.offsetWidth = maxOffset;
         }
         if (hidden) {
-            // 隐藏：可见总宽不足一屏时逐列补足，新列真实加入 colHeaders（按可见总宽判断，兼容自定义列宽）
-            while (this.colHeaders.allColWidth < viewportWidth) {
-                this.colHeaders.addCol(this.colHeaders.length, this.colHeaders.length + 1);
+            // 隐藏：可见总宽不足一屏时一次性补足（按可见总宽判断，兼容自定义列宽）
+            // 【性能约定，勿回退为「while 逐列 addCol + recalcColPositions」】
+            const deficit = viewportWidth - this.colHeaders.allColWidth;
+            if (deficit > 0) {
+                const need = Math.ceil(deficit / DEFAULT_CELL_WIDTH) + 1;
+                this.colHeaders.addCol(this.colHeaders.length, this.colHeaders.length + need);
                 this.colHeaders.recalcColPositions();
             }
         } else {

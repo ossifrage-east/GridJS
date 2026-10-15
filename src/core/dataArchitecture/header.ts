@@ -57,6 +57,15 @@ export class ColHeaders extends EventEmitter {
     private _offsetWidth: number = 0;
     /** 列宽度总和 */
     private _allColWidth: number = 0;
+    /**
+     * 可见列在 colHeaders 中的 0-based 索引数组
+     *
+     * 隐藏列不占位（left = 前一个可见列 right），但列号不连续：从列号遍历会
+     * 跳过大量隐藏列号，每帧几万次空转。这里维护「纯可见列索引」数组，
+     * 调用方对其二分定位 + 线性遍历，复杂度只与可见列数相关。
+     * 由 {@link recalcColPositions} 在末尾重建。
+     */
+    private _visibleColIndices: number[] = [];
 
     /**
      * 构造函数
@@ -127,22 +136,36 @@ export class ColHeaders extends EventEmitter {
      * @param {number} endCol - 结束列索引
      */
     public addCol(startCol: number, endCol: number): void {
+        let added = 0;
         for (let c = startCol; c < endCol; c++) {
             const colHeader = this.createColHeader(c);
             this.colHeaders.push(colHeader);
+            // 增量累加可见总宽 + 可见列索引（新列默认可见）
+            if (!colHeader.isHidden) {
+                added += colHeader.width;
+                this._visibleColIndices.push(this.colHeaders.length - 1);
+            }
         }
-        this.recalcAllColWidth();
+        this._allColWidth += added;
+        this.allColWidth = this._allColWidth;
     }
 
     /**
      * 重新计算可见列的宽度总和，排除隐藏列
+     *
+     * 一遍遍历同时算总宽 + 重建 {@link _visibleColIndices}，
+     * 替代旧实现的 `filter` + `reduce` 两遍遍历。文件打开、初始化等
+     * 调用本方法的路径都能保证可见列索引正确。
      * @returns {number} 可见列宽度总和
      */
     public recalcAllColWidth(): number {
-        const total = this.colHeaders
-            .filter((cur) => !cur.isHidden)
-            .reduce((acc, cur) => acc + cur.width, 0);
-        // 走 setter 发出 ALL_COL_WIDTH_CHANGED 事件，让 scroller 等监听方感知总宽变化
+        const visIdx: number[] = [];
+        let total = 0;
+        for (let i = 0; i < this.colHeaders.length; i++) {
+            const h = this.colHeaders[i];
+            if (!h.isHidden) { total += h.width; visIdx.push(i); }
+        }
+        this._visibleColIndices = visIdx;
         this.allColWidth = total;
         return total;
     }
@@ -151,12 +174,37 @@ export class ColHeaders extends EventEmitter {
      * 重算所有列的 left 位置（跳过隐藏列的 width 累加），使可见列紧密排列
      * 隐藏列的 left 被设为前一个可见列的 right（即被后续可见列覆盖位置），
      * 其 width 不再计入累计偏移，从而在视觉上"让位"给右侧可见列。
-     * 同时重算可见列宽度总和。
+     * 同时重算可见列宽度总和，并重建可见列索引数组。
+     *
+     * 【性能约定，勿回退为「末尾再调 recalcAllColWidth」】
+     * {@link applyColPositions} 已在一遍遍历中同时算出 left 与可见总宽，
+     * 这里直接用返回值写入 `_allColWidth`，省掉 `filter` + `reduce` 两遍额外遍历。
+     *
+     * 紧随其后用第二遍遍历重建 `_visibleColIndices`：applyColPositions 是 export
+     * 函数（解码存档也用），不在此处耦合「重建可见索引」副作用。
      */
     public recalcColPositions(): void {
-        applyColPositions(this.colHeaders);
-        this.recalcAllColWidth();
-    }    
+        this._allColWidth = applyColPositions(this.colHeaders);
+        this.allColWidth = this._allColWidth;
+        const visIdx: number[] = [];
+        const headers = this.colHeaders;
+        for (let i = 0; i < headers.length; i++) {
+            if (!headers[i].isHidden) visIdx.push(i);
+        }
+        this._visibleColIndices = visIdx;
+    }
+
+    /**
+     * 获取可见列在 colHeaders 中的 0-based 索引数组（按列号升序，已跳过隐藏列）
+     *
+     * 调用方对该数组二分定位视口起止 + 线性遍历，复杂度只与可见列数相关，
+     * 不会因筛选后大量隐藏列号导致每帧几万次空转。
+     * 数组在 {@link recalcColPositions} 末尾重建，返回的是内部引用（只读使用）。
+     * @returns {number[]} 可见列 0-based 索引数组
+     */
+    public get visibleColIndices(): number[] {
+        return this._visibleColIndices;
+    }
 
     /**
      * 获取可见列的起始索引
@@ -273,6 +321,16 @@ export class RowHeaders extends EventEmitter {
     private _offsetHeight: number = 0;
     /** 行高度总和 */
     private _allRowHeight: number = 0;
+    /**
+     * 可见行在 rowHeaders 中的 0-based 索引数组
+     *
+     * 隐藏行不占位（top = 前一个可见行 bottom），但行号不连续：从行号遍历会
+     * 跳过大量隐藏行号，每帧几万次空转。这里维护「纯可见行索引」数组，
+     * 调用方对其二分定位 + 线性遍历，复杂度只与可见行数相关。
+     * 由 {@link recalcRowPositions} 在末尾重建，{@link finalizeRowVisibility}
+     * 统一触发，故 setRowHiddenFlag 改标记后此数组尚未更新。
+     */
+    private _visibleRowIndices: number[] = [];
 
     /**
      * 构造函数
@@ -350,22 +408,36 @@ export class RowHeaders extends EventEmitter {
      * @param {number} endRow - 结束行索引
      */
     public addRow(startRow: number, endRow: number): void {
+        let added = 0;
         for (let r = startRow; r < endRow; r++) {
             const rowHeader = this.createRowHeader(r);
             this.rowHeaders.push(rowHeader);
+            // 增量累加可见总高 + 可见行索引（新行默认可见）
+            if (!rowHeader.isHidden) {
+                added += rowHeader.height;
+                this._visibleRowIndices.push(this.rowHeaders.length - 1);
+            }
         }
-        this.recalcAllRowHeight();
+        this._allRowHeight += added;
+        this.allRowHeight = this._allRowHeight;
     }
 
     /**
      * 重新计算可见行的高度总和，排除隐藏行
+     *
+     * 一遍遍历同时算总高 + 重建 {@link _visibleRowIndices}，
+     * 替代旧实现的 `filter` + `reduce` 两遍遍历。文件打开、初始化等
+     * 调用本方法的路径都能保证可见行索引正确，避免 drawGridLines/getVisibleCells 拿到空数组。
      * @returns {number} 可见行高度总和
      */
     public recalcAllRowHeight(): number {
-        const total = this.rowHeaders
-            .filter((cur) => !cur.isHidden)
-            .reduce((acc, cur) => acc + cur.height, 0);
-        // 走 setter 发出 ALL_ROW_HEIGHT_CHANGED 事件，让 scroller 等监听方感知总高变化
+        const visIdx: number[] = [];
+        let total = 0;
+        for (let i = 0; i < this.rowHeaders.length; i++) {
+            const h = this.rowHeaders[i];
+            if (!h.isHidden) { total += h.height; visIdx.push(i); }
+        }
+        this._visibleRowIndices = visIdx;
         this.allRowHeight = total;
         return total;
     }
@@ -374,11 +446,37 @@ export class RowHeaders extends EventEmitter {
      * 重算所有行的 top 位置（跳过隐藏行的 height 累加），使可见行紧密排列
      * 隐藏行的 top 被设为前一个可见行的 bottom（即被后续可见行覆盖位置），
      * 其 height 不再计入累计偏移，从而在视觉上"让位"给下方可见行。
-     * 同时重算可见行高度总和。
+     * 同时重算可见行高度总和，并重建可见行索引数组。
+     *
+     * 【性能约定，勿回退为「末尾再调 recalcAllRowHeight」】
+     * {@link applyRowPositions} 已在一遍遍历中同时算出 top 与可见总高，
+     * 这里直接用返回值写入 `_allRowHeight`，省掉 `filter` + `reduce` 两遍额外遍历。
+     *
+     * 紧随其后用第二遍遍历重建 `_visibleRowIndices`：applyRowPositions 是 export
+     * 函数（解码存档也用），不在此处耦合「重建可见索引」副作用；本方法在
+     * finalizeRowVisibility 统一入口调用，重建时机与可见性变更一致。
      */
     public recalcRowPositions(): void {
-        applyRowPositions(this.rowHeaders);
-        this.recalcAllRowHeight();
+        this._allRowHeight = applyRowPositions(this.rowHeaders);
+        this.allRowHeight = this._allRowHeight;
+        const visIdx: number[] = [];
+        const headers = this.rowHeaders;
+        for (let i = 0; i < headers.length; i++) {
+            if (!headers[i].isHidden) visIdx.push(i);
+        }
+        this._visibleRowIndices = visIdx;
+    }
+
+    /**
+     * 获取可见行在 rowHeaders 中的 0-based 索引数组（按行号升序，已跳过隐藏行）
+     *
+     * 调用方对该数组二分定位视口起止 + 线性遍历，复杂度只与可见行数相关，
+     * 不会因筛选后大量隐藏行号导致每帧几万次空转。
+     * 数组在 {@link recalcRowPositions} 末尾重建，返回的是内部引用（只读使用）。
+     * @returns {number[]} 可见行 0-based 索引数组
+     */
+    public get visibleRowIndices(): number[] {
+        return this._visibleRowIndices;
     }
     
     /**
@@ -595,26 +693,43 @@ function decodeAxis(
 
 /**
  * 重算列位置（`ColHeaders.recalcColPositions` 与稀疏解码共用同一套规则）
+ *
+ * 【性能约定，勿回退为「只算 left 不返回总宽」】
+ * 历史实现让 {@link ColHeaders.recalcColPositions} 末尾**再调一次**
+ * `recalcAllColWidth`（`filter` + `reduce` 额外两遍全量遍历）才得到可见总宽。
+ * 大表（百万行）下每次 `recalcColPositions` 要遍历三遍；这里合并为一遍
+ * 并返回可见总宽，让调用方直接用，不再额外遍历。
  * @param headers - 列头数组（就地修改 `left`）
+ * @returns {number} 可见列宽度总和（隐藏列不计入）
  */
-export function applyColPositions(headers: ColHeader[]): void {
+export function applyColPositions(headers: ColHeader[]): number {
     let left = 0;
+    let total = 0;
     for (const h of headers) {
         h.left = left;
-        if (!h.isHidden) left += h.width;
+        if (!h.isHidden) { left += h.width; total += h.width; }
     }
+    return total;
 }
 
 /**
  * 重算行位置（`RowHeaders.recalcRowPositions` 与稀疏解码共用同一套规则）
+ *
+ * 【性能约定，勿回退为「只算 top 不返回总高」】
+ * 与 {@link applyColPositions} 对称：合并「算 top」与「算可见总高」为一遍遍历，
+ * 返回可见行高度总和，让 {@link RowHeaders.recalcRowPositions} 不再额外调
+ * `recalcAllRowHeight`（省掉 `filter` + `reduce` 两遍全量遍历）。
  * @param headers - 行头数组（就地修改 `top`）
+ * @returns {number} 可见行高度总和（隐藏行不计入）
  */
-export function applyRowPositions(headers: RowHeader[]): void {
+export function applyRowPositions(headers: RowHeader[]): number {
     let top = 0;
+    let total = 0;
     for (const h of headers) {
         h.top = top;
-        if (!h.isHidden) top += h.height;
+        if (!h.isHidden) { top += h.height; total += h.height; }
     }
+    return total;
 }
 
 /** 列头 → 稀疏轴 */

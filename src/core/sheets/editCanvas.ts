@@ -693,25 +693,47 @@ export class EditCanvas extends Canvas {
     public updateCursor() {
         const { lineIndex, charIndex, editX, editY } = this.data.cursorPosition;
         const { editLeft, editTop, lines } = this.measureCellText(this.data.activedCell);
-        
+
+        const currentLine = lines[lineIndex];
         const currentCharIndex = this.data.toAbsoluteIndex({ lineIndex, charIndex });
-        const cellValue = this.data.getCellByName(this.data.activedCell)?.chars;
+        const cellChars = this.data.getCellByName(this.data.activedCell)?.chars;
+
+        // —— 光标高度：取光标相邻字符（光标右侧优先，行首/空行时取左侧）——
         let cursorHeight: number;
-        if (cellValue && cellValue.length > 0) {
-            // 优先使用当前字符的字体大小，如果 charIndex 超出范围则使用第一个或最后一个字符
-            const charInfo = cellValue[Math.min(Math.max(currentCharIndex - 1, 0), cellValue.length - 1)];
-            cursorHeight = charInfo?.fontSize 
-                ? Math.round(charInfo.fontSize * this.data.zoom)
+        if (cellChars && cellChars.length > 0) {
+            const refIndex = Math.min(currentCharIndex, cellChars.length - 1);
+            const refChar = cellChars[refIndex]
+                ?? cellChars[Math.max(currentCharIndex - 1, 0)];
+            cursorHeight = refChar?.fontSize
+                ? Math.round(refChar.fontSize * this.data.zoom)
                 : Math.round(DEFAULT_FONT_SIZE * this.data.zoom);
         } else {
             cursorHeight = Math.round(DEFAULT_FONT_SIZE * this.data.zoom);
         }
+
+        // —— 当前行最大字号：用于在混排行中找到行盒内的字体视觉中心 ——
+        // 行首绝对下标 = 当前绝对下标 - 行内下标；行文本可能带尾部 '\n'。
+        let lineMaxHeight = cursorHeight;
+        if (cellChars && currentLine) {
+            const lineStart = currentCharIndex - charIndex;
+            const lineEnd = lineStart + currentLine.text.replace(/\n$/, '').length;
+            for (let i = Math.max(lineStart, 0); i < Math.min(lineEnd, cellChars.length); i++) {
+                const size = cellChars[i]?.fontSize
+                    ? Math.round(cellChars[i].fontSize * this.data.zoom)
+                    : Math.round(DEFAULT_FONT_SIZE * this.data.zoom);
+                if (size > lineMaxHeight) lineMaxHeight = size;
+            }
+        }
+
         this.cursor.style.left = `${Math.round(editX + editLeft+ this.data.visibleView.rowHeaderWidth) - CELL_PADDING / 2}px`;
+        // 垂直居中对齐：
+        // 行盒内先按行最大字号居中（消化行间距 lineSpacing），再让光标相对
+        // 最大字号居中。光标条的上下中心由此与字体的上下中心重合。
         this.cursor.style.top = `${Math.round(editY + editTop + this.data.visibleView.colHeaderHeight
-            + lines[lineIndex].lineHeight
-            - cursorHeight) - CELL_PADDING}px`;
+            + (currentLine.lineHeight - lineMaxHeight) / 2
+            + (lineMaxHeight - cursorHeight) / 2)}px`;
         this.cursor.style.height = `${cursorHeight}px`;
-        
+
         // 启动光标闪烁
         this.startCursorBlink();
         this.notifyToolbarStateFromCursor();
