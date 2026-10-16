@@ -1,6 +1,7 @@
 # 大数据量 Excel 多线程解析方案建议
 
-> **文档性质：纯方案建议。** 本文不修改任何源码，仅基于对当前实现的阅读给出设计与落地建议。>   
+> **文档性质：纯方案建议。** 本文不修改任何源码，仅基于对当前实现的阅读给出设计与落地建议。
+>   
 > 适用对象：`src/utils/parser/`（xlsx / xls 解析链）与 `src/core/common/fileOpener.ts`（装载链）。
 
 ---
@@ -160,7 +161,8 @@ graph TB
 | `generate` | 主线程（造 `Cell[]`）         | **Worker**，但产物改为 **SoA 缓冲** | 不再造对象，改"编码"                                   |
 | 装载         | 主线程 `data.values = ...` | **主线程**，改渐进式                | 见第 9 节                                        |
 
-> 建议保留 `generate()` 这个名字与签名位置，但让它输出 `SheetBuffer`（列式）而非 `Cell[]`；>   
+> 建议保留 `generate()` 这个名字与签名位置，但让它输出 `SheetBuffer`（列式）而非 `Cell[]`；
+>   
 > 另设一个主线程侧的"水合器"把 `SheetBuffer` 视口片段转成 `Cell`。
 
 ---
@@ -1745,6 +1747,71 @@ npx tsc --noEmit 干净；npm run build 成功
 
 ---
 
+## 12.16 第十七轮：筛选按钮显隐跟不上（缓存失效被抹掉 + 复制破坏原数据）
+
+用户反馈：大数据量表格里点工具栏的「筛选」后，单元格上的筛选下拉箭头**有时候不显示、有时候不消失**。
+
+### 根因 A：筛选缓存的失效被 `_ensureCellIndex` 顺手抹掉
+
+`_filterCells`（带筛选标记的单元格列表）只在 `_rebuildCellIndex()` 里重算。
+而「挂/摘 `filter` 标记」既不改 `values.length`，也不置 `_indexStructurallyInvalid`，
+于是 `_ensureCellIndex()` 走的是「内容变了但结构没变」分支 —— 该分支**只刷世代标记、
+不重扫 `_filterCells`**，还会把 `_filterCellsEpoch` 刷回 `_valuesEpoch`，
+恰好抹掉 `invalidateFilterCells()` 的置脏意图：
+
+```
+invalidateFilterCells()  →  _filterCellsEpoch = -1
+                         →  _indexEpoch = -1        ← 有害
+_ensureCellIndex()       →  走 else-if（世代失效）
+                         →  _filterCellsEpoch = _valuesEpoch   ← 置脏被抹掉
+getFilterCells()         →  返回旧缓存
+```
+
+**「有时候」的来源**：
+- 加到**已存在**的格子（大表常见，表头行本来就有内容）→ `values.length` 不变 → 缓存停留在旧结论 → 不显示；
+- 加到**不存在**的格子 → `push` 使长度变化 → 下一帧触发重建 → 那一批又显示了；
+- 清除时格子仍有内容 → 长度不变 → 缓存仍含旧按钮 → 实例销毁不掉 → 不消失。
+
+### 根因 B：`copySelection()` 在原单元格上直接清了 `filter`
+
+```ts
+const _cell = this.getCellByName(name);   // values 里的**活引用**
+if (_cell) {
+    _cell.filter = undefined;             // 等于「复制一下就把原表筛选按钮删了」
+    selectedCells.push(_cell);
+}
+```
+
+而该路径既不改 `values.length` 也不置 `_indexStructurallyInvalid`，
+`_filterCells` 不会被刷新 → 按钮 DOM 仍留在屏上**看似正常**；
+直到下一次整份索引重建（编辑 / 插入行列 / 排序…）才凭空消失。
+这是「有时候不显示」的**延迟显形**版本，且它**破坏了原数据**。
+
+### 修复
+
+| # | 位置 | 改动 |
+|---|---|---|
+| 1 | `dataCollection.ts` | 新增 `_filterCellsDirty` 脏标记，由 `invalidateFilterCells()` 置位、`_rebuildFilterCells()` 清除 |
+| 2 | `invalidateFilterCells()` | **不再**篡改 `_indexEpoch`（它是索引内容世代，与筛选集合无关；置 -1 会让 `_ensureCellIndex` 走世代分支并把置脏抹掉） |
+| 3 | `_ensureCellIndex()` | 置脏**或**世代推进，**两者取或**才重扫 —— 只认脏会漏「只走 commitValues」的粘贴路径；只认世代会漏「原地改 filter 且未推进世代」的路径 |
+| 4 | 新增 `_rebuildFilterCells()` | 只对已存在单元格做一次线性扫描读 `filter`，**不**建 Map / 合并倒排，比 `_rebuildCellIndex` 便宜一个数量级 |
+| 5 | `_rebuildCellIndex()` | 顺带算出筛选列表后即清脏，避免紧接着再白扫一遍 |
+| 6 | `copySelection()` | 清筛选标记改在**克隆体**上做，剪贴板拿到副本、**原 `values` 分毫不动** |
+
+> 关键取舍：修复 3 让「数据变化后的首次查询」多付一次 O(N) 轻量扫描。
+> 这比 `_rebuildCellIndex`（建 Map + 合并倒排）便宜一个数量级，
+> 且稳态零成本 —— 换来的是**彻底消除「漏调失效」这一整类 bug**，
+> 不再依赖每个调用点都记得手动置脏。
+
+### 验证
+
+- 新增 **`test/test-filter-toggle.js` 29/29**：源码接线（脏标记存在 / 失效不碰 `_indexEpoch` / 置脏与世代取或 / 重扫不重建整份索引）＋ 动态行为（全填充 12 万格大表点击往返、已装载按钮清除无残留、整列无内容不挂按钮、复制不破坏原数据、复制后重建索引仍稳定）＋ 性能（6 次切换索引重建次数有界）。
+- **反证 3 条全部确认能失败**：`invalidateFilterCells` 改回只置 epoch → 6 条 FAIL；去掉 `_ensureCellIndex` 的重扫分支 → 6 条 FAIL；`copySelection` 改回直接清原格 → 2 条 FAIL（其中一条精确命中「重建索引后按钮凭空消失」）。
+- 全量 26 个测试文件：`test-filter-clear-and-visible.js` 由 63/70 → **67/72**（新增 3 条断言全通过，并修复 1 条原有失败），其余与基线逐项一致。
+  `npx tsc --noEmit` 干净；`npm run build` 成功。
+
+---
+
 ## 13. 度量与验收指标
 
 **打点位置**（用 `performance.mark/measure`）：
@@ -1857,3 +1924,7 @@ getCellByName(name):
   （交替「push/splice + 按名查找」= 每格重建一次整份索引）；② `getCellByName` 的**命中分支也要走失效判定**
   （否则拿到已从 `values` 删除的幽灵单元格）；③ 范围可预定的操作走 `runWithCellPatchUndo`（不受 10 万格阈值限制），
   范围不可预定的（删除行列）才走全量快照；④ 选中框背板必须 `clipRectToViewport`（否则大选区时画布超限静默变空白）。
+- **筛选缓存两条铁律**（第十七轮，见 12.16）：
+  ① `_filterCells` 只在 `_rebuildCellIndex()` 里重算，因此**任何**改 `filter` 的路径都必须让缓存失效 ——
+  置脏与世代推进**取或**兜底，且 `invalidateFilterCells()` **绝不能**碰 `_indexEpoch`（否则置脏会被世代刷新抹掉）；
+  ② 复制/剪贴板路径**只能**在克隆体上改属性 —— `getCellByName` 返回的是 `values` 里的**活引用**。

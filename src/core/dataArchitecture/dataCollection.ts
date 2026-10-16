@@ -180,6 +180,19 @@ export class DataCollection extends EventEmitter {
      */
     private _filterCellsEpoch: number = -1;
     /**
+     * 筛选标记集合已被**显式置脏**，下次取用前必须重扫一次
+     *
+     * 增删筛选标记既不改 `values.length`，也未必让 `_filterCellsEpoch` 与
+     * `_valuesEpoch` 拉开差距（挂/摘 `filter` 后往往紧跟一次 `markContentChanged()`，
+     * 两者会同步推进），因此**单靠世代无法判定**「缓存里的按钮列表是否还准」。
+     * 曾有实现只置 `_filterCellsEpoch = -1`，而 `_ensureCellIndex` 的
+     * 「内容变了但结构没变」分支会顺手把它刷回 `_valuesEpoch`，
+     * 于是返回的是**不含/仍含新按钮的旧缓存** —— 表现为
+     * 「点筛选后按钮不显示 / 清筛选后按钮不消失」。故引入本标记，
+     * 由 {@link invalidateFilterCells} 置位、{@link _rebuildFilterCells} 清除。
+     */
+    private _filterCellsDirty: boolean = true;
+    /**
      * 「列号 → 该列上最后一个**有文本**的行号」缓存（1-based，含）
      *
      * 供筛选按钮的显隐判定（{@link hasContentBelow}）做 **O(1)** 查询。
@@ -1138,6 +1151,7 @@ export class DataCollection extends EventEmitter {
         this._wideMergeRects = wideMergeRects;
         this._filterCells = filterCells;
         this._filterCellsEpoch = this._valuesEpoch;
+        this._filterCellsDirty = false;   // 本方法已顺带重算出筛选列表
         this._indexedLength = values.length;
         this._indexEpoch = this._valuesEpoch;
     }
@@ -1150,11 +1164,45 @@ export class DataCollection extends EventEmitter {
         if (this._values.length !== this._indexedLength || this._indexStructurallyInvalid) {
             this._rebuildCellIndex();
             this._indexStructurallyInvalid = false;
-        } else if (this._indexEpoch !== this._valuesEpoch) {
-            // 内容变了但结构没变：只刷新世代标记，不重建索引
-            this._indexEpoch = this._valuesEpoch;
-            this._filterCellsEpoch = this._valuesEpoch;
+            return;   // _rebuildCellIndex 已同步筛选缓存并清脏
         }
+        // 下面两个条件任一成立，都意味着「筛选标记集合可能已经变了」：
+        // - `_filterCellsDirty`：显式失效（增删筛选标记既不改长度也不推进世代）；
+        // - 世代推进：任何数据变化，含粘贴/格式刷等**只走 commitValues** 的路径
+        //   （它们原地改写目标格的 filter，既不置脏也不改长度，只能靠世代兜底）。
+        //
+        // ⚠️ 历史实现在这里只刷世代标记、**不重扫 `_filterCells`**，
+        // 于是缓存会长期停留在旧结论上：新加的按钮建不出来（不显示）、
+        // 已删的按钮实例销毁不掉（不消失），且只在下一次整份索引重建时
+        // 才突然对上 —— 这就是用户说的「有时候」。
+        //
+        // 重扫只是一次 values 线性扫描（逐个读 `filter` 字段），
+        // 比 `_rebuildCellIndex`（建 Map + 合并倒排）便宜一个数量级；
+        // 且仅在世代推进后的首次查询发生，稳态零成本。
+        if (this._filterCellsDirty || this._indexEpoch !== this._valuesEpoch) {
+            // 内容变了但结构没变：不重建整份索引，只刷世代标记并重扫筛选列表
+            this._indexEpoch = this._valuesEpoch;
+            this._rebuildFilterCells();
+        }
+    }
+
+    /**
+     * 重扫 `values` 收集带筛选标记的单元格（刷新 {@link _filterCells} 缓存）
+     *
+     * 只对已存在的单元格做一次线性扫描，不建 Map、不建合并倒排，
+     * 因此代价远低于 {@link _rebuildCellIndex}。由 {@link _ensureCellIndex}
+     * 在 {@link _filterCellsDirty} 置位时调用。
+     * @private
+     */
+    private _rebuildFilterCells(): void {
+        const values = this._values;
+        const filterCells: Cell[] = [];
+        for (let i = 0; i < values.length; i++) {
+            if (values[i].filter !== undefined) filterCells.push(values[i]);
+        }
+        this._filterCells = filterCells;
+        this._filterCellsEpoch = this._valuesEpoch;
+        this._filterCellsDirty = false;
     }
 
     /**
@@ -1180,7 +1228,9 @@ export class DataCollection extends EventEmitter {
      * @returns {boolean} 本世代是否可能存在筛选按钮（false = 一定没有）
      */
     public hasFilterCells(): boolean {
-        return this._filterCellsEpoch !== this._valuesEpoch || this._filterCells.length > 0;
+        return this._filterCellsDirty
+            || this._filterCellsEpoch !== this._valuesEpoch
+            || this._filterCells.length > 0;
     }
 
     /**
@@ -1193,14 +1243,21 @@ export class DataCollection extends EventEmitter {
      * - {@link getFilterCells} 里 `_ensureCellIndex()` 会认为索引仍是最新的，
      *   直接返回**不含新按钮**的旧缓存数组 —— 按钮就再也建不出来了。
      *
-     * 因此这里让 {@link _filterCellsEpoch} 与 {@link _ensureCellIndex} 的失效条件
-     * **对齐**（都置为 -1）：一次显式失效同时覆盖「要不要问」与「问出来是什么」两个入口。
-     * 注意**不要**在这里自增 `_valuesEpoch` —— 那会让整个单元格索引（含合并倒排）
-     * 一并失效重建，代价远大于收益。
+     * 因此这里同时置位 {@link _filterCellsDirty}（由 {@link _ensureCellIndex}
+     * 负责真正重扫）与失效 {@link _filterCellsEpoch}，一次显式调用即覆盖
+     * 「要不要问」与「问出来是什么」两个入口。
+     *
+     * ⚠️ **不要**再去动 `_indexEpoch`：它是「单元格索引内容世代」的标记，
+     * 与筛选标记集合无关；置 -1 只会让 `_ensureCellIndex` 走「内容变了但结构没变」
+     * 分支，而该分支会把 `_filterCellsEpoch` 刷回 `_valuesEpoch`，
+     * 恰好抹掉这里的置脏意图（历史 bug：按钮不显示/不消失）。
+     *
+     * 同样注意**不要**在这里自增 `_valuesEpoch` —— 那会让整个单元格索引
+     * （含合并倒排）一并失效重建，代价远大于收益。
      */
     public invalidateFilterCells(): void {
+        this._filterCellsDirty = true;
         this._filterCellsEpoch = -1;
-        this._indexEpoch = -1;
     }
 
     /**
@@ -2589,41 +2646,66 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
-     * 汇总矩形区域**外轮廓**上的边框线宽
+     * 汇总合并区域**外轮廓**上的边框（线宽 + 颜色）
      *
-     * 合并会把区域内除锚点外的格子整体删掉，它们的边框若不聚合就永久丢失
-     * （用户看到的是「合并后边框少了一截」）。Excel 的语义是：**只有落在区域
-     * 外轮廓上的那些边**才保留，内部网格线随合并消失——故这里只取四条边。
+     * 合并单元格在视觉上就是一个大格：内部各格的边框（以及网格线）由渲染层的
+     * 遮挡层盖掉，**只有落在区域外轮廓上的那些边**才画出来（Excel 语义）。
      *
-     * 同一条边上多个格子线宽不一致时取第一个非空值（锚点只有一套边框字段，
+     * 【纯查询，勿改回「写进锚点」】本函数只**读**区域内各格的边框并聚合，不写
+     * 任何数据 —— 合并因此不必改锚点的边框字段，取消合并也就不存在「还原」问题：
+     * 各格自己的边框一直原样躺在 `values` 里，只需清掉 colspan/rowspan，主屏的
+     * 画线函数（`drawCellBorder` + `drawGridLines`）就会把它们连续地画出来。
+     *
+     * 同一条边上多个格子线宽不一致时取第一个非空值（一条边只有一组字段，
      * 无法表达「逐段不同」）。
      * @param {number} minCol - 起始列（1-based）
      * @param {number} maxCol - 结束列（1-based，含）
      * @param {number} minRow - 起始行（1-based）
      * @param {number} maxRow - 结束行（1-based，含）
-     * @returns 四条边的线宽（无边框的边为 undefined）
-     * @private
+     * @returns {{ top?: number; bottom?: number; left?: number; right?: number; color?: string }}
+     *   四条边的线宽（无边框的边为 undefined）与轮廓边框色
      */
-    private collectOutlineBorders(minCol: number, maxCol: number, minRow: number, maxRow: number):
-        { top?: number; bottom?: number; left?: number; right?: number } {
-        const outline: { top?: number; bottom?: number; left?: number; right?: number } = {};
+    public getMergedOutlineBorders(minCol: number, maxCol: number, minRow: number, maxRow: number):
+        { top?: number; bottom?: number; left?: number; right?: number; color?: string } {
+        const outline: { top?: number; bottom?: number; left?: number; right?: number; color?: string } = {};
+        const noteColor = (c: Cell): void => {
+            if (outline.color === undefined && c.borderColor) outline.color = c.borderColor;
+        };
         for (let col = minCol; col <= maxCol && outline.top === undefined; col++) {
             const c = this.getCellByName(this.getCellName(col, minRow));
-            if (c && c.borderTopWidth) outline.top = c.borderTopWidth;
+            if (c && c.borderTopWidth) { outline.top = c.borderTopWidth; noteColor(c); }
         }
         for (let col = minCol; col <= maxCol && outline.bottom === undefined; col++) {
             const c = this.getCellByName(this.getCellName(col, maxRow));
-            if (c && c.borderBottomWidth) outline.bottom = c.borderBottomWidth;
+            if (c && c.borderBottomWidth) { outline.bottom = c.borderBottomWidth; noteColor(c); }
         }
         for (let row = minRow; row <= maxRow && outline.left === undefined; row++) {
             const c = this.getCellByName(this.getCellName(minCol, row));
-            if (c && c.borderLeftWidth) outline.left = c.borderLeftWidth;
+            if (c && c.borderLeftWidth) { outline.left = c.borderLeftWidth; noteColor(c); }
         }
         for (let row = minRow; row <= maxRow && outline.right === undefined; row++) {
             const c = this.getCellByName(this.getCellName(maxCol, row));
-            if (c && c.borderRightWidth) outline.right = c.borderRightWidth;
+            if (c && c.borderRightWidth) { outline.right = c.borderRightWidth; noteColor(c); }
         }
         return outline;
+    }
+
+    /**
+     * 判断单元格是否携带「会被合并遮挡、且取消合并后需要复原」的绘制信息
+     *
+     * 即边框与底色 —— 这两样在合并态下被离屏遮挡层盖住，取消合并时要原样回来。
+     * 用它决定合并时该格子是**留下**（保真）还是**删除**（纯空格子，留着只会让
+     * 大表合并后 values 平白膨胀几十万条）。
+     * @param {Cell} cell - 待判定的单元格
+     * @returns {boolean} 有边框或底色时为 true
+     * @private
+     */
+    private hasPaintStyle(cell: Cell): boolean {
+        return !!(
+            cell.backgroundColor ||
+            cell.borderTopWidth || cell.borderBottomWidth ||
+            cell.borderLeftWidth || cell.borderRightWidth
+        );
     }
 
     /**
@@ -3047,23 +3129,38 @@ export class DataCollection extends EventEmitter {
             // 让索引世代失效，后续每次查找都要重建整份索引（O(N)）→ O(选区 × N)。
             const source = this.findSourceCell(minCol, maxCol, minRow, maxRow);
             const sourceCopy = source ? source.clone() : null;
-            const outline = this.collectOutlineBorders(minCol, maxCol, minRow, maxRow);
             const anchorName = this.getCellName(minCol, minRow);
             const anchor = this.getCellByName(anchorName);
+            // 【数据保真，勿改回「整格删掉 + 事后还原」】
+            // 合并区内部那些**带边框 / 底色**的格子必须原样留在 values 里：
+            // 它们是「取消合并后线要连起来」的唯一依据。合并态下它们看不见，
+            // 是渲染层用离屏画布遮挡掉的（见 sheetCanvas.drawMergedCellCover），
+            // 不是在这里删掉的；取消合并只需清掉 colspan/rowspan，
+            // 主屏画线函数就会把它们和网格线一起连续地画出来。
             const toRemove = new Set<string>();
+            const keepers: Cell[] = [];
             for (let row = minRow; row <= maxRow; row++) {
                 for (let col = minCol; col <= maxCol; col++) {
                     if (col === minCol && row === minRow) continue;
                     const name = this.getCellName(col, row);
-                    if (this.getCellByName(name)) toRemove.add(name);
+                    const cell = this.getCellByName(name);
+                    if (!cell) continue;
+                    if (this.hasPaintStyle(cell)) keepers.push(cell);
+                    else toRemove.add(name);
                 }
             }
 
             // ── 阶段二：结构性修改（此后不再按名查找）──
             this._removeCellsByNames(toRemove);
+            // 留下的格子只清「会在合并态里露出来的东西」：文字与筛选按钮。
+            // 边框/底色是取消合并时要复原的信息，一个字节都不能动。
+            for (let i = 0; i < keepers.length; i++) {
+                keepers[i].chars = [];
+                keepers[i].filter = undefined;
+            }
             const target = anchor || sourceCopy || new Cell();
             if (anchor) {
-                // 源格内容整体覆盖锚点（源格可能就是被删掉的某个格子，故用克隆）
+                // 源格内容整体覆盖锚点（源格可能就是被清空的某个格子，故用克隆）
                 if (sourceCopy) {
                     Object.assign(target, sourceCopy);
                     target.cell = anchorName;
@@ -3074,14 +3171,6 @@ export class DataCollection extends EventEmitter {
             }
             target.colspan = colspan;
             target.rowspan = rowspan;
-            // 外轮廓边框：**锚点自己的四边优先**（Excel 语义：合并区沿用左上角单元格的
-            // 边框，A1 的四边在合并后就是 A1:C3 的四边）；锚点缺哪条边，再用区域内
-            // 落在同一条轮廓边上的格子的边框补齐（用户给整个区域加了外框时，
-            // 只有 C3 带右边框之类也很常见）。区域内部的网格线随合并消失。
-            target.borderTopWidth = (anchor && anchor.borderTopWidth) || outline.top;
-            target.borderBottomWidth = (anchor && anchor.borderBottomWidth) || outline.bottom;
-            target.borderLeftWidth = (anchor && anchor.borderLeftWidth) || outline.left;
-            target.borderRightWidth = (anchor && anchor.borderRightWidth) || outline.right;
             this.invalidateCellIndex();
         });
     }
@@ -3132,52 +3221,25 @@ export class DataCollection extends EventEmitter {
         // 取消合并同样只影响原合并区 → 走局部补丁撤销（大表下也可 Ctrl+Z / Ctrl+Y）
         this.runWithCellPatchUndo('取消合并单元格', { minCol, maxCol, minRow, maxRow }, () => {
             // ── 阶段一：只读（索引稳态，getCellByName 全 O(1)）──
-            // 必须在 push 之前把区域内已有格子全部查出来：下面会一边遍历一边补建
-            // 缺失的格子，若此时再按名查找，每 push 一个就重建一次整份索引（O(N)）。
-            const bg = topLeftCell.backgroundColor;
-            // 合并区的四边边框：取消合并后**只应出现在区域外轮廓上**。
-            // 历史实现把它们原样复制到区域内每一格 → 每个格子都变成「四边全有」，
-            // 取消合并后立刻长出一整片网格状粗线（用户反馈的「边框显示有问题」）。
-            const edge = {
-                top: topLeftCell.borderTopWidth,
-                bottom: topLeftCell.borderBottomWidth,
-                left: topLeftCell.borderLeftWidth,
-                right: topLeftCell.borderRightWidth,
-            };
-            const topLeftName = this.getCellName(minCol, minRow);
-            const existing = new Map<string, Cell>();
+            const existing: Cell[] = [];
             for (let r = 0; r < rowspan; r++) {
                 for (let c = 0; c < colspan; c++) {
-                    const name = this.getCellName(minCol + c, minRow + r);
-                    const cell = this.getCellByName(name);
-                    if (cell) existing.set(name, cell);
+                    const cell = this.getCellByName(this.getCellName(minCol + c, minRow + r));
+                    if (cell) existing.push(cell);
                 }
             }
 
             // ── 阶段二：结构性修改（此后不再按名查找）──
-            for (let r = 0; r < rowspan; r++) {
-                for (let c = 0; c < colspan; c++) {
-                    const name = this.getCellName(minCol + c, minRow + r);
-                    let cell = existing.get(name);
-                    if (!cell) {
-                        cell = new Cell();
-                        cell.cell = name;
-                        this._values.push(cell);
-                    }
-                    cell.colspan = undefined;
-                    cell.rowspan = undefined;
-                    if (name === topLeftName) {
-                        // 左上角：保留内容与全部样式（含四边边框，它就在区域轮廓上）
-                        continue;
-                    }
-                    cell.chars = [];
-                    cell.backgroundColor = bg;
-                    // 只给「落在外轮廓上」的那几条边着色，内部一律无边框
-                    cell.borderTopWidth = r === 0 ? edge.top : undefined;
-                    cell.borderBottomWidth = r === rowspan - 1 ? edge.bottom : undefined;
-                    cell.borderLeftWidth = c === 0 ? edge.left : undefined;
-                    cell.borderRightWidth = c === colspan - 1 ? edge.right : undefined;
-                }
+            // 【只清跨度，不下发任何样式】区域内各格的边框与底色一直原样留在
+            // values 里（合并时就没有删它们，见 executeMergeCells 的说明），
+            // 所以取消合并后**不需要**还原、也不需要补建缺失的格子：
+            // 主屏的 drawCellBorder（逐格自己的边框）+ drawGridLines（整行整列的
+            // 网格线）会把竖线横线连续地画出来 —— 这正是「取消合并后线断续」的
+            // 根治办法。历史上在这里「按外轮廓下发 / 逐格四边下发」的两种写法
+            // 都必然错一半（外框区域凭空长网格、网格区域丢内部线），已全部删除。
+            for (let i = 0; i < existing.length; i++) {
+                existing[i].colspan = undefined;
+                existing[i].rowspan = undefined;
             }
             this.invalidateCellIndex();
         });
@@ -3233,30 +3295,36 @@ export class DataCollection extends EventEmitter {
             // ── 阶段一：只读 ──
             const anchors: Array<Cell | undefined> = [];
             const sources = new Map<string, Cell>();
-            const outlines = new Map<string, { top?: number; bottom?: number; left?: number; right?: number }>();
             const anchorNames: string[] = [];
             const toRemove = new Set<string>();
+            const keepers: Cell[] = [];
             for (let col = minCol; col <= maxCol; col++) {
                 const anchorName = this.getCellName(col, minRow);
                 anchorNames.push(anchorName);
                 const source = this.findSourceCell(col, col, minRow, maxRow);
                 if (source) sources.set(anchorName, source.clone());
-                outlines.set(anchorName, this.collectOutlineBorders(col, col, minRow, maxRow));
                 anchors.push(this.getCellByName(anchorName));
                 for (let row = minRow; row <= maxRow; row++) {
                     if (row === minRow) continue;
                     const name = this.getCellName(col, row);
-                    if (this.getCellByName(name)) toRemove.add(name);
+                    const cell = this.getCellByName(name);
+                    if (!cell) continue;
+                    if (this.hasPaintStyle(cell)) keepers.push(cell);
+                    else toRemove.add(name);
                 }
             }
 
             // ── 阶段二：结构性修改 ──
             this._removeCellsByNames(toRemove);
+            // 同 {@link executeMergeCells}：带边框/底色的格子留着保真，只清文字与筛选
+            for (let i = 0; i < keepers.length; i++) {
+                keepers[i].chars = [];
+                keepers[i].filter = undefined;
+            }
             for (let i = 0; i < anchorNames.length; i++) {
                 const name = anchorNames[i];
                 const anchor = anchors[i];
                 const sourceCopy = sources.get(name);
-                const outline = outlines.get(name);
                 const target = anchor || sourceCopy || new Cell();
                 if (anchor) {
                     if (sourceCopy) {
@@ -3269,10 +3337,6 @@ export class DataCollection extends EventEmitter {
                 }
                 target.colspan = 1;
                 target.rowspan = rowspan;
-                target.borderTopWidth = (anchor && anchor.borderTopWidth) || (outline && outline.top);
-                target.borderBottomWidth = (anchor && anchor.borderBottomWidth) || (outline && outline.bottom);
-                target.borderLeftWidth = (anchor && anchor.borderLeftWidth) || (outline && outline.left);
-                target.borderRightWidth = (anchor && anchor.borderRightWidth) || (outline && outline.right);
             }
             this.invalidateCellIndex();
         });
@@ -3327,30 +3391,36 @@ export class DataCollection extends EventEmitter {
             // ── 阶段一：只读 ──
             const anchors: Array<Cell | undefined> = [];
             const sources = new Map<string, Cell>();
-            const outlines = new Map<string, { top?: number; bottom?: number; left?: number; right?: number }>();
             const anchorNames: string[] = [];
             const toRemove = new Set<string>();
+            const keepers: Cell[] = [];
             for (let row = minRow; row <= maxRow; row++) {
                 const anchorName = this.getCellName(minCol, row);
                 anchorNames.push(anchorName);
                 const source = this.findSourceCell(minCol, maxCol, row, row);
                 if (source) sources.set(anchorName, source.clone());
-                outlines.set(anchorName, this.collectOutlineBorders(minCol, maxCol, row, row));
                 anchors.push(this.getCellByName(anchorName));
                 for (let col = minCol; col <= maxCol; col++) {
                     if (col === minCol) continue;
                     const name = this.getCellName(col, row);
-                    if (this.getCellByName(name)) toRemove.add(name);
+                    const cell = this.getCellByName(name);
+                    if (!cell) continue;
+                    if (this.hasPaintStyle(cell)) keepers.push(cell);
+                    else toRemove.add(name);
                 }
             }
 
             // ── 阶段二：结构性修改 ──
             this._removeCellsByNames(toRemove);
+            // 同 {@link executeMergeCells}：带边框/底色的格子留着保真，只清文字与筛选
+            for (let i = 0; i < keepers.length; i++) {
+                keepers[i].chars = [];
+                keepers[i].filter = undefined;
+            }
             for (let i = 0; i < anchorNames.length; i++) {
                 const name = anchorNames[i];
                 const anchor = anchors[i];
                 const sourceCopy = sources.get(name);
-                const outline = outlines.get(name);
                 const target = anchor || sourceCopy || new Cell();
                 if (anchor) {
                     if (sourceCopy) {
@@ -3363,10 +3433,6 @@ export class DataCollection extends EventEmitter {
                 }
                 target.colspan = colspan;
                 target.rowspan = 1;
-                target.borderTopWidth = (anchor && anchor.borderTopWidth) || (outline && outline.top);
-                target.borderBottomWidth = (anchor && anchor.borderBottomWidth) || (outline && outline.bottom);
-                target.borderLeftWidth = (anchor && anchor.borderLeftWidth) || (outline && outline.left);
-                target.borderRightWidth = (anchor && anchor.borderRightWidth) || (outline && outline.right);
             }
             this.invalidateCellIndex();
         });
@@ -3555,12 +3621,48 @@ export class DataCollection extends EventEmitter {
         if (startCol < 0 || startRow < 0) {
             return { left: 0, top: 0, width: 0, height: 0 };
         }
-        const { left: startLeft, top: startTop } = this.calculateCellRect(startCol, startRow);
-        const { left: endLeft, top: endTop, width: endWidth, height: endHeight } = this.calculateCellRect(endCol, endRow);
+        // 【勿回退为 calculateCellRect】
+        // 选区矩形必须是「行列号本身对应的那块格子」的并集，端点的格子若落在合并区域内，
+        // 由 calculateCellRect 取矩形会锚到合并区左上角并按 colspan/rowspan 放大 →
+        // 整个高亮框被平移/撑大，跑到选区之外（行头/列头点击整行整列时最明显）。
+        // 规范选区（见 setSelectedRange）必然完整包含所相交的合并区域，此时两种取法等价，
+        // 故此处改用网格矩形：无论选区是否规范，高亮范围都恒等于所选行列范围。
+        const { left: startLeft, top: startTop } = this.getCellGridRect(startCol, startRow);
+        const { left: endLeft, top: endTop, width: endWidth, height: endHeight } = this.getCellGridRect(endCol, endRow);
         const width = endLeft + endWidth - startLeft;
         const height = endTop + endHeight - startTop;
 
         return { left: startLeft, top: startTop, width, height };
+    }
+
+    /**
+     * 单元格的**网格矩形**：只按行列几何取位置与尺寸，**不做合并区域展开**
+     *
+     * 与 {@link calculateCellRect} 的唯一区别在合并区域上：后者命中合并区域时会把坐标锚到
+     * 合并区左上角、并按 colspan/rowspan 累加宽高 —— 那是「绘制合并单元格本体」和
+     * 「活动单元格高亮挖洞」需要的语义；而选区、边框这类「按行列号取矩形」的场景需要的是
+     * 网格本身的几何，否则端点落在合并区内时会连带把矩形平移/放大（例：选区 = 第 2 行整行，
+     * A 列存在 A1:A3 纵向合并 → 锚点到第 1 行且高度多算 2 行，高亮整体跑到选区上方）。
+     * @param {number} col - 列号（1-based）
+     * @param {number} row - 行号（1-based）
+     * @returns {{ left: number, top: number, width: number, height: number }} 网格矩形（超出有效范围时收敛到边界；越界取不到则为全 0）
+     */
+    public getCellGridRect(col: number, row: number): { left: number, top: number, width: number, height: number } {
+        const realCol = Math.min(Math.max(1, col), Math.max(1, this.colHeaders.length));
+        const realRow = Math.min(Math.max(1, row), Math.max(1, this.rowHeaders.length));
+        const colHeader = this.colHeaders.getAt(realCol - 1);
+        const rowHeader = this.rowHeaders.getAt(realRow - 1);
+        // 行/列数组可能在「切换/清空文件」后被收缩：取不到时返回空矩形，
+        // 由调用方（drawSelectedRect）按零尺寸跳过绘制，避免读取 undefined 抛错
+        if (!colHeader || !rowHeader) {
+            return { left: 0, top: 0, width: 0, height: 0 };
+        }
+        return {
+            left: colHeader.left - this.colHeaders.offsetWidth,
+            top: rowHeader.top - this.rowHeaders.offsetHeight,
+            width: colHeader.width,
+            height: rowHeader.height
+        };
     }
 
     /**
@@ -3634,7 +3736,10 @@ export class DataCollection extends EventEmitter {
     public getAnchorRect(): { col: number, row: number, left: number, top: number, width: number, height: number } {
         const endCell = this.selection!.split(':')[1] ? this.selection!.split(':')[1] : this.activedCell;
         const { col, row } = this.getCellColAndRow(endCell);
-        const { left: endLeft, top: endTop, width: endWidth, height: endHeight } = this.calculateCellRect(col, row);
+        // 锚点必须落在**选中框右下角**（见 getSelectedRect 的网格矩形取值），
+        // 故同样按网格矩形取端点：用 calculateCellRect 会在端点落于合并区内时
+        // 把锚点拖到合并区右下角，与画出来的选中框错位。
+        const { left: endLeft, top: endTop, width: endWidth, height: endHeight } = this.getCellGridRect(col, row);
         const width = DEFAULT_SELECTED_BORDER_WIDTH * 2;
         const height = DEFAULT_SELECTED_BORDER_WIDTH * 2;
         const left = endLeft + endWidth - width + 2;
@@ -3748,8 +3853,16 @@ export class DataCollection extends EventEmitter {
             for (const rowOff of visibleRowOffsets) {
                 const _cell = this.getCellByName(`${this.getColName(colOff + startCol)}${rowOff + startRow}`);
                 if ( _cell ) {
-                    _cell.filter = undefined; // 移除筛选条件
-                    selectedCells.push(_cell);
+                    // ⚠️ 必须在**克隆体**上清筛选标记，不能直接改 _cell：
+                    // `getCellByName` 返回的是 `values` 里的活引用，原地把 `filter`
+                    // 置空等于「复制一下就把原表的筛选按钮删了」。因为这一路径既不改
+                    // `values.length` 也不置 `_indexStructurallyInvalid`，`_filterCells`
+                    // 缓存不会被刷新，按钮 DOM 仍留在屏上看似正常；之后任何一次
+                    // 索引重建（编辑、插入行列、排序…）才会让它凭空消失 ——
+                    // 表现为「筛选按钮有时候不显示」。
+                    const snapshot = _cell.clone();
+                    snapshot.filter = undefined; // 剪贴板不携带筛选条件
+                    selectedCells.push(snapshot);
                 }
             }
         }
@@ -4480,52 +4593,57 @@ export class DataCollection extends EventEmitter {
         const selectedCells = this.getSelectedCells();
         const { col: startCol, row: startRow } = this.getCellColAndRow(selectedCells.at(0));
         const { col: endCol, row: endRow } = this.getCellColAndRow(selectedCells.at(-1));
-        selectedCells.forEach(_cell => {      
+        selectedCells.forEach(_cell => {
             const {col, row} = this.getCellColAndRow(_cell);
-            let borderTopWidth, borderBottomWidth, borderLeftWidth, borderRightWidth;
+            // 用 boolean 标记本格四条边哪些需要本次设置；未标记的保留原值，避免误清空。
+            // 旧实现把未赋值的 borderTopWidth 等当作 undefined 赋给 cell，会清掉选区内部
+            // 已有宽度为 1 的边框，导致 BorderOuter/WideOuter/Bottom/Top/Left/Right
+            // 这六种"只设外部/单边"的操作意外改写了内部单元格的边框样式。
+            let setTop = false, setBottom = false, setLeft = false, setRight = false;
+            let borderTopWidth: number | undefined, borderBottomWidth: number | undefined,
+                borderLeftWidth: number | undefined, borderRightWidth: number | undefined;
             if (cellBorderStyle === CellBorderStyle.BorderNone) {
-                borderTopWidth = undefined;
-                borderBottomWidth = undefined;
-                borderLeftWidth = undefined;
-                borderRightWidth = undefined;
+                setTop = setBottom = setLeft = setRight = true;
+                // 四条边都清空（undefined）
             } else if (cellBorderStyle === CellBorderStyle.BorderAll) {
-                borderTopWidth = 1;
-                borderBottomWidth = 1;
-                borderLeftWidth = 1;
-                borderRightWidth = 1;
+                setTop = setBottom = setLeft = setRight = true;
+                borderTopWidth = borderBottomWidth = borderLeftWidth = borderRightWidth = 1;
             } else if (cellBorderStyle === CellBorderStyle.BorderOuter) {
-                if (startRow === row) borderTopWidth = 1;
-                if (endRow === row) borderBottomWidth = 1;
-                if (startCol === col) borderLeftWidth = 1;
-                if (endCol === col) borderRightWidth = 1;
+                if (startRow === row) { setTop = true; borderTopWidth = 1; }
+                if (endRow === row) { setBottom = true; borderBottomWidth = 1; }
+                if (startCol === col) { setLeft = true; borderLeftWidth = 1; }
+                if (endCol === col) { setRight = true; borderRightWidth = 1; }
             } else if (cellBorderStyle === CellBorderStyle.BorderWideOuter) {
-                if (startRow === row) borderTopWidth = 2;
-                if (endRow === row) borderBottomWidth = 2;
-                if (startCol === col) borderLeftWidth = 2;
-                if (endCol === col) borderRightWidth = 2;
+                if (startRow === row) { setTop = true; borderTopWidth = 2; }
+                if (endRow === row) { setBottom = true; borderBottomWidth = 2; }
+                if (startCol === col) { setLeft = true; borderLeftWidth = 2; }
+                if (endCol === col) { setRight = true; borderRightWidth = 2; }
             } else if (cellBorderStyle === CellBorderStyle.BorderBottom) {
-                if (endRow === row) borderBottomWidth = 1;
+                if (endRow === row) { setBottom = true; borderBottomWidth = 1; }
             } else if (cellBorderStyle === CellBorderStyle.BorderTop) {
-                if (startRow === row) borderTopWidth = 1;
+                if (startRow === row) { setTop = true; borderTopWidth = 1; }
             } else if (cellBorderStyle === CellBorderStyle.BorderLeft) {
-                if (startCol === col) borderLeftWidth = 1;
+                if (startCol === col) { setLeft = true; borderLeftWidth = 1; }
             } else if (cellBorderStyle === CellBorderStyle.BorderRight) {
-                if (endCol === col) borderRightWidth = 1;
+                if (endCol === col) { setRight = true; borderRightWidth = 1; }
             }
+
+            // 局部边框模式：本格四条边都不需要改时跳过，避免触碰选区内部格子的原有边框
+            if (!setTop && !setBottom && !setLeft && !setRight) return;
 
             const cell = this.getCellByName(_cell);
             if (cell) {
-                cell.borderTopWidth = borderTopWidth;
-                cell.borderBottomWidth = borderBottomWidth;
-                cell.borderLeftWidth = borderLeftWidth;
-                cell.borderRightWidth = borderRightWidth;
+                if (setTop) cell.borderTopWidth = borderTopWidth;
+                if (setBottom) cell.borderBottomWidth = borderBottomWidth;
+                if (setLeft) cell.borderLeftWidth = borderLeftWidth;
+                if (setRight) cell.borderRightWidth = borderRightWidth;
             } else {
                 const newCell = new Cell();
                 newCell.cell = _cell;
-                newCell.borderTopWidth = borderTopWidth;
-                newCell.borderBottomWidth = borderBottomWidth;
-                newCell.borderLeftWidth = borderLeftWidth;
-                newCell.borderRightWidth = borderRightWidth;
+                if (setTop) newCell.borderTopWidth = borderTopWidth;
+                if (setBottom) newCell.borderBottomWidth = borderBottomWidth;
+                if (setLeft) newCell.borderLeftWidth = borderLeftWidth;
+                if (setRight) newCell.borderRightWidth = borderRightWidth;
                 this.values.push(newCell);
             }
         })
@@ -4923,7 +5041,9 @@ export class DataCollection extends EventEmitter {
      * @returns {boolean} 是否存在筛选按钮
      */
     public validataFilter(): boolean {
-        if (this._filterCellsEpoch === this._valuesEpoch && this._values.length === this._indexedLength) {
+        if (!this._filterCellsDirty
+            && this._filterCellsEpoch === this._valuesEpoch
+            && this._values.length === this._indexedLength) {
             return this._filterCells.length > 0;
         }
         return this.getFilterCells().length > 0;

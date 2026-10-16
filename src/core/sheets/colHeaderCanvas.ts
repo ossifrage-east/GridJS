@@ -236,7 +236,13 @@ export class ColHeaderCanvas extends Canvas {
             this._lastAppliedWidth = this.data.startWidth;
         }
         this.data.activedCell = `${this.data.getColName(col)}${row}`;
-        this.data.selection = `${this.data.activedCell}:${this.data.getColName(col)}${this.data.rowHeaders.length}`;
+        // 【勿回退为直接写 `selection = {col}1:{col}{末行}`】
+        // 列头点击 = 整列选区，但必须与「单元格点击 / 拖选」同源，经 setSelectedRange 归一化：
+        // 该列内若有横向合并（如 A1:C1），选区与之部分相交，会被扩到合并区域完整范围
+        // （列 A~C），从而维持「选区永不半覆盖合并区域」这一不变式。
+        // 若直接写死单列选区，getSelectedRect 会按合并锚点取端点矩形 —— 左边界左移到列 A、
+        // 宽度按 colspan 累加，高亮多覆盖一列，与列头高亮的列号、乃至实际点中的列都对不上。
+        this.data.setSelectedRange(col, 1, col, this.data.rowHeaders.length);
         this.scrollCellIntoView(col, row);
     }
 

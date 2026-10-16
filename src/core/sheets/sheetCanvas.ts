@@ -162,9 +162,13 @@ export class SheetCanvas extends Canvas {
         const { startCol, endCol } = this.data.getVisibleCols();
         const { startRow, endRow } = this.data.getVisibleRows();
         this.drawCellBgColor(cells);
-        this.drawAllMergedCellBackground(startCol, endCol, startRow, endRow);
-        this.drawCellsText(cells);
         this.drawCellBorder(cells);
+        // 合并区遮挡必须在**边框之后、文字之前**：
+        //  - 之后：合并区内部各格的边框此刻刚被 drawCellBorder 画上去，
+        //    只有压在它上面才能被离屏画布整块盖掉（只留最外圈）；
+        //  - 之前：合并区的文字要画在遮挡层之上，否则会被一起盖没。
+        this.drawMergedCellCover(startCol, endCol, startRow, endRow);
+        this.drawCellsText(cells);
         // 图片是浮动对象：画在网格内容之上、选区框之下（否则选中框会被图盖住看不见）
         this.drawImages();
         if (this.data.startLocation === MouseLocation.IN_ANCHOR) {
@@ -778,37 +782,84 @@ export class SheetCanvas extends Canvas {
     }
 
     /**
-     * 绘制所有合并单元格背景
+     * 用离屏画布「盖住」每一个可见合并区域，只留最外圈的边框
+     *
+     * 合并单元格在视觉上就是一个大格，但数据层**并没有**删掉内部那些带边框/底色的
+     * 格子（删了就再也还原不回来，正是「取消合并后线断续」的根因）。所以这里在渲染层
+     * 做遮挡：把合并区整块不透明地铺上锚点底色，盖掉
+     *   ① 穿过区域内部的网格线（drawGridLines 画的全表竖线/横线）、
+     *   ② 内部各格自己的边框（drawCellBorder 刚画上去的）、
+     *   ③ 内部各格与锚点不一致的底色，
+     * 再沿区域**外轮廓**重画那四条边（线宽取轮廓上各格的边框，
+     * 见 {@link DataCollection.getMergedOutlineBorders}）。
+     *
+     * 取消合并时因此什么都不用下发：清掉 colspan/rowspan 后，各格自己的边框原样还在，
+     * 主屏的 drawCellBorder + drawGridLines 自然把竖线横线连续地画出来。
      *
      * 隐藏行列不绘制；合并单元格跨越隐藏列/行时只绘制可见部分。
      *
      * 【性能约定，勿回退】只处理与视口相交的合并区域（走列倒排索引），
      * 不要再对「全表所有合并块」逐个调用矩形计算 —— 那会退化成 O(合并数²)，
-     * 实测 8000 处合并时单帧 3.8 秒。
+     * 实测 8000 处合并时单帧 3.8 秒。离屏画布按尺寸复用（{@link Canvas.offscreen}）。
+     *
+     * 【视口裁剪，勿回退为「按整个合并区建离屏画布」】合并区常常远大于屏幕，
+     * 超限后 OffscreenCanvas 会静默变空白（Chrome 单边 65535px、总像素 2^28）。
      * @param {number} startCol - 视口起始列号（1-based）
      * @param {number} endCol - 视口结束列号（1-based）
      * @param {number} startRow - 视口起始行号（1-based）
      * @param {number} endRow - 视口结束行号（1-based）
      */
-    public drawAllMergedCellBackground(startCol: number, endCol: number, startRow: number, endRow: number) {
+    public drawMergedCellCover(startCol: number, endCol: number, startRow: number, endRow: number) {
         const MergedCells = this.data.getVisibleMergeRects(startCol, endCol, startRow, endRow);
+        if (MergedCells.length === 0) return;
+        const zoom = this.data.zoom;
+        const dpr = window.devicePixelRatio;
+        const viewport = { width: this.data.visibleView.sheetWidth, height: this.data.visibleView.sheetHeight };
         for (const mergedCell of MergedCells) {
-            const startCell = mergedCell.anchor;  // 获取左上角单元格地址
             // 隐藏行列不绘制；跨隐藏列/行时只取可见部分
             const rect = this.getVisibleCellRect(mergedCell.startCol, mergedCell.startRow);
             if (!rect) continue;
-            // 绘制合并单元格背景
+            const clip = clipRectToViewport(
+                { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+                viewport
+            );
+            if (!clip) continue;
+
+            // ── 遮挡层：不透明整块铺底色，盖掉内部网格线与内部各格的边框/底色 ──
+            // 内缩 1 CSS px：区域**边界**上的线属于「外面」（相邻格子的边框、
+            // 以及下面要重画的外轮廓），不该被盖住；而内部的网格线离边界至少一整列/行，
+            // 内缩 1px 完全不影响遮挡效果。
+            const coverLeft = clip.left + 1;
+            const coverTop = clip.top + 1;
+            const coverWidth = clip.width - 1;
+            const coverHeight = clip.height - 1;
+            if (coverWidth > 0 && coverHeight > 0) {
+                const anchor = this.data.getCellByName(mergedCell.anchor);
+                const backgroundColor = anchor?.backgroundColor || DEFAULT_CELL_BG_COLOR;
+                const { offscreenCanvas, offscreenCtx } =
+                    this.offscreen(coverWidth * zoom * dpr, coverHeight * zoom * dpr);
+                offscreenCtx.clearRect(0, 0, offscreenCanvas.width, offscreenCanvas.height);
+                offscreenCtx.fillStyle = backgroundColor;
+                offscreenCtx.fillRect(0, 0, offscreenCanvas.width, offscreenCanvas.height);
+                this.ctx.drawImage(offscreenCanvas,
+                    Math.round(coverLeft * zoom * dpr), Math.round(coverTop * zoom * dpr));
+            }
+
+            // ── 外轮廓：只画区域最外圈那四条边 ──
+            const outline = this.data.getMergedOutlineBorders(
+                mergedCell.startCol, mergedCell.endCol, mergedCell.startRow, mergedCell.endRow);
+            if (!outline.top && !outline.bottom && !outline.left && !outline.right) continue;
+            const left = rect.left * zoom;
+            const top = rect.top * zoom;
+            const width = rect.width * zoom;
+            const height = rect.height * zoom;
+            const anchor = this.data.getCellByName(mergedCell.anchor);
             this.ctx.save();
-            this.ctx.clearRect(Math.round(rect.left * this.data.zoom + 1),
-                                Math.round(rect.top * this.data.zoom + 1),
-                                Math.round(rect.width * this.data.zoom - 1), 
-                                Math.round(rect.height * this.data.zoom - 1));
-            const backgroundColor = this.data.getCellByName(startCell)?.backgroundColor || DEFAULT_CELL_BG_COLOR;
-            this.ctx.fillStyle = backgroundColor;
-            this.fillRect(rect.left * this.data.zoom + 1,
-                            rect.top * this.data.zoom + 1,
-                            rect.width * this.data.zoom - 1, 
-                            rect.height * this.data.zoom - 1);
+            this.ctx.strokeStyle = (anchor && anchor.borderColor) || outline.color || 'black';
+            if (outline.top) this.drawLine(left, top, left + width, top, outline.top);
+            if (outline.bottom) this.drawLine(left, top + height, left + width, top + height, outline.bottom);
+            if (outline.left) this.drawLine(left, top, left, top + height, outline.left);
+            if (outline.right) this.drawLine(left + width, top, left + width, top + height, outline.right);
             this.ctx.restore();
         }
     }

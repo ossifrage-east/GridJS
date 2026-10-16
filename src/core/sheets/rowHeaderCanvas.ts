@@ -289,7 +289,13 @@ export class RowHeaderCanvas extends Canvas {
             this._lastAppliedHeight = this.data.startHeight;
         }
         this.data.activedCell = `${this.data.getColName(col)}${row}`;
-        this.data.selection = `${this.data.activedCell}:${this.data.getColName(this.data.colHeaders.length)}${row}`;
+        // 【勿回退为直接写 `selection = A{row}:{末列}{row}`】
+        // 行头点击 = 整行选区，但必须与「单元格点击 / 拖选」同源，经 setSelectedRange 归一化：
+        // 该行内若有纵向合并（如 A5:A8），选区与之部分相交，会被扩到合并区域完整范围
+        // （行 5~8），从而维持「选区永不半覆盖合并区域」这一不变式。
+        // 若直接写死单行选区，getSelectedRect 会按合并锚点取端点矩形 —— 锚点上移到行 5、
+        // 高度按 rowspan 累加，高亮整体上移/变高，与行头高亮的行号、乃至实际点中的行都对不上。
+        this.data.setSelectedRange(1, row, this.data.colHeaders.length, row);
         this.scrollCellIntoView(col, row);
     }
 
