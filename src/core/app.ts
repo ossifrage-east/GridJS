@@ -31,6 +31,7 @@ import { Split } from "./common/split";
 import { Navigator } from "./common/navigator";
 import { FileTree, FileNode, FileMovePlan } from "./common/fileTree";
 import { FileOpener } from "./common/fileOpener";
+import { PYEditor } from "./assistant/pyEditor";
 import { Sheets } from "./sheets/sheets";
 import { DataCollection } from "./dataArchitecture/dataCollection";
 import { IndexDB } from "./dataArchitecture/indexDB";
@@ -48,7 +49,7 @@ const NAV_WIDTH_KEY_PREFIX = 'nav-content-width:';
 /**
  * 当前打开文件在 IndexDB 中的设置键
  *
- * 值 = 文件**路径**（含扩展名，如 `归档/销售数据.xlsx`）：刷新后据此决定主页面显示哪个文件。
+ * 值 = 文件**路径**（含扩展名，如 `归档/销售数据.grid`）：刷新后据此决定主页面显示哪个文件。
  * 存路径而不是文件名：不同目录下的同名文件是两个独立文件，只存名字无法区分该恢复哪一个。
  * 它只是「上次看的是哪一个」的记忆，**文件是否存在以文件树为准**
  * （见 {@link App.restoreActivedFile}），因此记忆失效（文件被删 / 被改名）时
@@ -100,6 +101,7 @@ export class App {
     private navigator!: Navigator;
     private fileTree!: FileTree;
     private fileOpener!: FileOpener;
+    private pyEditor!: PYEditor;
 
     /**
      * 打开历史（文件**路径**，越靠前越近）
@@ -213,6 +215,7 @@ export class App {
             // IndexDB 不可用时仅跳过状态恢复，页签元素已创建，继续挂载各页签内容
         }
         await this.initFileTree(navigator);
+        this.initPyEditor(navigator);
         this.initZoomSlider();   // 缩放滑块须在导航面板之后挂载：DOM 顺序即视觉顺序（面板在上、滑块在下）
     }
 
@@ -349,6 +352,11 @@ export class App {
         // 文件打开器：负责「打开」按钮与主页面拖放，解析成功后把文件登记到文件树
         this.fileOpener = new FileOpener({
             data: this.data,
+            // 同名冲突去重：不同原始后缀换算后可能得到同一原生名
+            // （`test_sample.xls` 与 `test_sample.xlsx` 都 → `test_sample.grid`），
+            // 由文件树在根目录内判冲突并给出加序号后的名称（`test_sample1.grid`），
+            // 保证每个打开的文件都有独立的树节点与存档，不会互相覆盖
+            resolveName: (nativeName: string) => this.fileTree.resolveOpenedFileName(nativeName),
             // 从本机打开的文件只有文件名（浏览器不暴露所在目录），因此它是
             // 根目录下的文件 —— 与「路径」语义天然一致（根目录下路径 ≡ 文件名）
             onOpened: (fileName: string) => {
@@ -375,7 +383,7 @@ export class App {
             onChange: (nodes: FileNode[]) => this.persistFileTree(nodes),
             // 内容桥：新增 / 复制 / 改名 / 移动 / 删除文件时同步数据库中该文件的内容。
             // 参数一律是**路径**（含扩展名、相对根节点）：存档键由 toSheetKey 换算
-            // （只去原生 `.xlsx` 后缀，其它后缀保留，见 toArchiveKey），
+            // （只去原生 `.grid` 后缀，其它后缀保留，见 toArchiveKey），
             // 因此不同目录的同名文件、同目录的同名不同后缀文件，各自拥有独立存档。
             content: {
                 create: (paths: string[]) => this.ensureFileContents(paths),
@@ -386,7 +394,7 @@ export class App {
         });
         navigator.navContentItemMount(NAV_PANEL[0], this.fileTree.getElements().container);   // NAV_PANEL[0] 即「文件」
         // 「定位」的目标是「主页面正在显示的那个文件」。
-        // `activedSheetName` 是**存档键**（`.xlsx` 去后缀、其它后缀保留），
+        // `activedSheetName` 是**存档键**（`.grid` 去后缀、其它后缀保留），
         // 树的定位匹配（{@link FileTree.findByName}）既能按路径精确命中带后缀的键，
         // 也支持「无后缀查询 → 路径去扩展名」的兜底，因此两种形态都能对上；
         // 从本机打开的单个文件没有目录，键与路径名相同，同样能定位到。
@@ -403,11 +411,23 @@ export class App {
     }
 
     /**
+     * 初始化「脚本」页签：Python 编辑器
+     *
+     * 编辑器内容与状态由组件自身持久化（见 {@link PYEditor}），
+     * 这里只负责把组件挂进导航内容区。
+     * @param navigator - 右侧导航器实例
+     */
+    private initPyEditor(navigator: Navigator): void {
+        this.pyEditor = new PYEditor({ data: this.data });
+        navigator.navContentItemMount(NAV_PANEL[2], this.pyEditor.getElements().container);   // NAV_PANEL[2] 即「脚本」
+    }
+
+    /**
      * 恢复「上次打开的文件」（页面刷新后）
      *
      * **文件树是文件的唯一来源**，记忆只是「上次看的是哪一个」：
      * - 树里一个文件都没有（首次使用，或上次把文件删到一个不剩）→ 打开一个空白
-     *   Excel 并把 `sheet1.xlsx` 登记进树（见 {@link openBlankFile}）；
+     *   Excel 并把 `sheet1.grid` 登记进树（见 {@link openBlankFile}）；
      * - 记忆里的文件仍在树中 → 恢复它：装载其内容、登记并高亮；
      * - 记忆缺失，或所指文件已不在树中（被删 / 被改名）→ 退回树里的第一个文件，
      *   而不是凭记忆造出一个树里没有的文件。
@@ -419,7 +439,7 @@ export class App {
         try {
             await this.data.dataLoaded;
 
-            // 树里一个文件都没有：给用户一个可直接编辑的空白文件（需求：补 sheet1.xlsx）
+            // 树里一个文件都没有：给用户一个可直接编辑的空白文件（需求：补 sheet1.grid）
             const files = this.fileTree.listFiles();
             if (files.length === 0) {
                 await this.openBlankFile();
@@ -452,7 +472,7 @@ export class App {
      *
      * 用于「刷新后树里一个文件都没有」：默认工作表（`sheet1`）本身就是这个文件的
      * 空表，因此同名时不切换、主页面保持空白；被占用时（如同名文件夹）按命名规则
-     * 取 `sheet2.xlsx` 并切换过去。
+     * 取 `sheet2.grid` 并切换过去。
      */
     private async openBlankFile(): Promise<void> {
         const displayName = this.fileTree.nextFileName();
@@ -519,16 +539,16 @@ export class App {
     /**
      * 把文件**路径**换算为内容存档键（IndexedDB `values` / `images` 库的键）
      *
-     * 规则见 {@link toArchiveKey}：只去掉应用原生表格后缀（`.xlsx`），其它后缀保留。
-     * - `归档/销售数据.xlsx` → `归档/销售数据`
-     * - `报表.xlsx` → `报表`、`报表.docx` → `报表.docx`（同名不同后缀互不干扰）
+     * 规则见 {@link toArchiveKey}：只去掉应用原生表格后缀（`.grid`），其它后缀保留。
+     * - `归档/销售数据.grid` → `归档/销售数据`
+     * - `报表.grid` → `报表`、`报表.text` → `报表.text`（同名不同后缀互不干扰）
      *
      * **必须只由路径决定**：早期版本按「树里当前是否有同基名冲突」来决定是否保留后缀，
-     * 但删除同名的兄弟文件后冲突消失、键立刻漂移（`报表.xlsx` → `报表`），
+     * 但删除同名的兄弟文件后冲突消失、键立刻漂移（`报表.grid` → `报表`），
      * 致使「打开时写入的键」与「删除/回退时读的键」不一致 —— 删不掉、回退到空白。
      * 存档键是路径的纯函数，才能保证任何时刻都指向同一份存档。
      *
-     * 存量兼容：`.xlsx` 的键与历史完全一致（`sheet1.xlsx` → `sheet1`），无需迁移；
+     * 存量兼容：`.grid` 的键与历史 `.xlsx` 完全一致（`sheet1.grid` / `sheet1.xlsx` → `sheet1`），无需迁移；
      * 历史遗留的其它后缀存档（键为去扩展名）由 {@link reconcileValueStore} 一次性迁移。
      * @param path - 文件路径（含扩展名，相对根节点）
      * @returns {string} 存档键；名称为空时返回空串
@@ -691,7 +711,7 @@ export class App {
                     this.data.messageBox.success(`已删除当前文件，已回到 ${fallback}`);
                 } else {
                     // 一个文件都不剩：清掉高亮与「当前文件」记忆。
-                    // 此后刷新时树里没有文件 → 按需求补一个空白 sheet1.xlsx，而不是复活已删的文件。
+                    // 此后刷新时树里没有文件 → 按需求补一个空白 sheet1.grid，而不是复活已删的文件。
                     this.fileTree.setActivedFileName('');
                     this.settingsDb.deleteSetting(ACTIVED_FILE_KEY).catch(() => {
                         // 记忆清理失败不影响交互
@@ -767,12 +787,12 @@ export class App {
      * 图片记录（独立的 `images` 对象存储）一并按「无归属即删」清理，
      * 但**不补建**：没有图片的文件本来就不该有图片记录（补一条空记录只会白占空间）。
      *
-     * 归属判定用**路径键**（{@link toSheetKey}）：`归档/销售数据.xlsx` 与
-     * `销售数据.xlsx` 是两个不同的文件，因此也是两个不同的存档。
+     * 归属判定用**路径键**（{@link toSheetKey}）：`归档/销售数据.grid` 与
+     * `销售数据.grid` 是两个不同的文件，因此也是两个不同的存档。
      *
      * 先做一次**存量键迁移**：`toArchiveKey` 之前「一律去扩展名」，现在改为
-     * 「只去原生 `.xlsx`、其它后缀保留」。因此历史上从本机打开的 `.docx` / `.xls` 等
-     * 文件，其存档键从 `报表` 变成 `报表.docx`——这里把旧键的存档搬到新键，
+     * 「只去原生 `.grid`、其它后缀保留」。因此历史上从本机打开的 `.text` / `.demo` 等
+     * 文件，其存档键从 `报表` 变成 `报表.text`——这里把旧键的存档搬到新键，
      * 再删旧键，避免升级后这些文件看起来「内容空了」。
      */
     private async reconcileValueStore(): Promise<void> {
@@ -781,7 +801,7 @@ export class App {
             for (const path of this.fileTree.listFiles()) {
                 const key = this.toSheetKey(path);
                 const legacy = stripExtension(path).trim();
-                if (!key || !legacy || key === legacy) continue;   // 原生 .xlsx：键未变
+                if (!key || !legacy || key === legacy) continue;   // 原生 .grid：键未变
                 const moved = await this.settingsDb.getValue(legacy);
                 if (!moved || moved === '{}') continue;            // 旧键无内容，无需迁移
                 const current = await this.settingsDb.getValue(key);

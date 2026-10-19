@@ -12,14 +12,17 @@ import { Char } from "../dataArchitecture/char";
 import { ColHeader, RowHeader } from "../dataArchitecture/header";
 import { DataCollection } from "../dataArchitecture/dataCollection";
 import { DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH } from "../constant";
-import { toArchiveKey } from "../../utils/fileName";
+import { toArchiveKey, toNativeFileName } from "../../utils/fileName";
 import { parseWorkbook } from "../../utils/parser/parserClient";
 import type { ExtractedImage } from "../../utils/parser/sheetParser";
 import { DocumentParser } from "../../utils/parser/documentParser";
 import '../style/fileOpener.scss';
 
 /**
- * 支持打开的文件扩展名
+ * 支持打开的文件扩展名（**仅这 6 种**）
+ *
+ * 打开后统一换算为应用的原生后缀（见 {@link toNativeFileName}）：
+ * `xls/xlsx → grid`、`doc/docx → text`、`ppt/pptx → demo`。
  */
 export const SUPPORTED_EXTENSIONS = ['xlsx', 'xls', 'docx', 'doc', 'pptx', 'ppt'] as const;
 
@@ -52,6 +55,17 @@ export interface FileOpenerOptions {
     onOpened?: (fileName: string) => void;
     /** 文件打开失败回调（参数为提示信息） */
     onError?: (message: string) => void;
+    /**
+     * 文件名去重回调
+     *
+     * 打开时**不同原始后缀可能换算成同一原生名**：`test_sample.xls` 与
+     * `test_sample.xlsx` 都换算为 `test_sample.grid`（同理 `doc/docx → .text`、
+     * `ppt/pptx → .demo`）。由外部（文件树）在此检测冲突并给出「当前目录内不冲突」
+     * 的名称（冲突时加序号）。缺省（未提供）时原样使用换算后的原生名。
+     * @param nativeName - 换算后的原生文件名（如 `test_sample.grid`）
+     * @returns {string} 当前目录内不冲突的文件名
+     */
+    resolveName?: (nativeName: string) => string;
 }
 
 /**
@@ -67,6 +81,13 @@ export interface FileOpenerOptions {
  *   完整还原值、样式、合并区域与行列尺寸；
  * - **docx / doc / pptx / ppt**：经 {@link DocumentParser} 提取纯文本，
  *   按行写入 A 列（首个非空段落作为标题同步为工作表名）。
+ *
+ * 无论真实格式如何，登记到文件树与存档键一律使用**原生文件名**
+ * （`报表.xlsx` → `报表.grid`，见 {@link toNativeFileName}），
+ * 与「新建文件」产出同一套后缀，使树里的命名统一。
+ * 换算后若与树中已有文件重名（不同原始后缀会撞成同一原生名，如
+ * `test_sample.xls` 与 `test_sample.xlsx`），交由
+ * {@link FileOpenerOptions.resolveName} 去重（加序号），装载与登记都用去重后的名字。
  *
  * 装载整体作为一次全量状态撤销操作记录（可用 Ctrl+Z 撤销打开动作），
  * 并落库持久化，保证刷新后仍是刚打开的文件内容。
@@ -182,7 +203,22 @@ export class FileOpener {
         }
         const extension = (file.name.toLowerCase().split('.').pop() ?? '') as SupportedExtension;
 
-        // 解析 → 装载 → 通知外部登记文件树。
+        // 登记到文件树、以及工作表名（存档键）都用**原生文件名**：把真实格式换算为应用后缀
+        // （`报表.xlsx` → `报表.grid`、`说明.docx` → `说明.text`、`路演.pptx` → `路演.demo`），
+        // 使「打开进来的文件」与「新建出来的文件」在树里呈现同一套命名。
+        // 解析仍按真实扩展名分派（见 {@link parse}）。
+        // 换算后**还不算最终名**：不同原始后缀会撞成同一原生名，最终名在装载前经
+        // {@link FileOpenerOptions.resolveName} 去重（见下）。
+        const nativeName = toNativeFileName(file.name);
+
+        // 解析 → 去重命名 → 装载 → 通知外部登记文件树。
+        //
+        // 【为什么「去重命名 + 装载 + 登记」必须在同一个同步段（单个 then 回调）里做完】
+        // 去重命名要看到「此前已登记进树的节点」才能判冲突；而装载（存档键）与登记
+        // （树节点名）又**必须用同一个最终名**，否则节点名为 `test_sample1.grid`、
+        // 存档却写在 `test_sample` 上，同一个文件两份身份。
+        // 若把它们拆到多个 then 回调，两个文件同时打开时（一次拖入 xls 与 xlsx）
+        // 两段之间会被对方的回调插入，仍会双双拿到未去重的名字而互相覆盖。
         //
         // 【为什么这里不再 `syncValuesToDB()`（性能约定，请勿加回）】
         // 原先装载完立刻整表序列化 + 写库，对大文件来说等于「刚读完一遍，马上再
@@ -194,8 +230,11 @@ export class FileOpener {
         // 而「切换 / 改名 / 复制」这类必须先把旧表无条件固化再操作的流程，
         // 仍由 syncValuesToDB() 强制落库兜底。
         this.parse(file, extension)
-            .then((document) => this.applyDocument(file.name, document))
-            .then(() => this.options.onOpened?.(file.name))
+            .then((document) => {
+                const finalName = this.options.resolveName?.(nativeName) ?? nativeName;
+                this.applyDocument(finalName, document);
+                this.options.onOpened?.(finalName);
+            })
             .catch((error: unknown) => {
                 const reason = error instanceof Error ? error.message : String(error);
                 this.options.onError?.(`打开「${file.name}」失败：${reason}`);
@@ -251,9 +290,9 @@ export class FileOpener {
      * 文件树根目录下的文件 —— 存档键由同一个 {@link toArchiveKey} 换算，
      * 与文件树给出的路径天然一致（不同目录的同名文件才会带上目录前缀）。
      *
-     * ⚠️ 这里**不能**用 `stripExtension`：`报表.xlsx` 与 `报表.docx` 去扩展名后都是
+     * ⚠️ 这里**不能**用 `stripExtension`：`报表.grid` 与 `报表.text` 去扩展名后都是
      * `报表`，会把两个文件写到同一个存档键上（后打开的覆盖先打开的）。
-     * @param {string} fileName - 文件名
+     * @param {string} fileName - **原生**文件名（如 `报表.grid`，由 {@link toNativeFileName} 换算）
      * @param {OpenedDocument} document - 待装载数据
      * @private
      */

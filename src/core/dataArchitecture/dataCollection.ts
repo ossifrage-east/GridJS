@@ -472,6 +472,17 @@ export class DataCollection extends EventEmitter {
     /** 大表编辑期间的单格重做栈 */
     private _editCellRedoStack: { cell: Cell | null; cursor: number }[] = [];
     /**
+     * 本次编辑会话的视图锚点（在 {@link beginEditSession} 时捕获）
+     *
+     * 必须在编辑**开始**时捕获，不能在 {@link endEditSession} 时才采：
+     * 以「点击另一个单元格结束编辑」为例，鼠标处理是先把 `activedCell` 改成新点的
+     * 格子、随后才由 IS_EDITTING_CHANGED 触发 endEditSession —— 此刻采到的
+     * `activedCell` 已经是新格子，而 `selection` 还停留在被编辑格的选区，二者错位。
+     * 用这份错位锚点做撤销，就会出现「选中框跟随到被编辑格、活动格却留在新格子上」
+     * （用户反馈：撤销/重做后按任意键编辑的不是被操作的单元格）。
+     */
+    private _editSessionAnchor: UndoAnchor | null = null;
+    /**
      * 编辑内撤销/重做后应恢复到的光标绝对索引。
      * 由 _undoEditStep/_redoEditStep 写入，供 editCanvas 在重测 lines、
      * 定位光标时读取（光标定位必须发生在 lines 刷新之后）。
@@ -481,11 +492,11 @@ export class DataCollection extends EventEmitter {
      * 当前选中的工作表名称
      *
      * 同时也是**当前打开文件的存档键**（换算见 `utils/fileName` 的 `toArchiveKey`：
-     * 只去掉原生 `.xlsx` 后缀，其它后缀保留完整路径，
-     * 如 `归档/销售数据.xlsx` → `归档/销售数据`、`报表.docx` → `报表.docx`）。
+     * 只去掉原生 `.grid` 后缀，其它后缀保留完整路径，
+     * 如 `归档/销售数据.grid` → `归档/销售数据`、`报表.text` → `报表.text`）。
      *
      * 默认值 `sheet1` 对应**默认空白文件**：文件树在「刷新后一个文件都没有」时会补一个
-     * `sheet1.xlsx`，其存档键正是这里的 `sheet1`，因此初次装载的这张空表就是那个空白
+     * `sheet1.grid`，其存档键正是这里的 `sheet1`，因此初次装载的这张空表就是那个空白
      * 文件的内容，不会另外多出一条无归属的存档。
      */
     private _activedSheetName: string = 'sheet1';
@@ -1854,6 +1865,10 @@ export class DataCollection extends EventEmitter {
      * 且 `_undoEditStep` 会因栈深不足直接返回 false，行为一致。
      */
     public beginEditSession(): void {
+        // 在编辑开始时捕获视图锚点：此刻 activedCell 与 selection 都指向被编辑的
+        // 那一个单元格，二者一致；推迟到结束时再采会因鼠标已改动 activedCell 而错位
+        // （见 _editSessionAnchor 字段注释）。
+        this._editSessionAnchor = this._captureAnchor();
         if (this._undoTrackingEnabled()) {
             this._editUndoStack = [{ values: this.cloneValues(this._values), cursor: this.cursorAbsolutePosition }];
         } else {
@@ -1883,11 +1898,14 @@ export class DataCollection extends EventEmitter {
         // 结束时统一清扫，使折叠入撤销栈的「最终值」与快照基准均不含空单元格。
         // 大表（栈为空）同样要清扫，否则空壳 Cell 会随编辑不断累积。
         this._pruneEmptyCells();
+        // 用编辑开始时捕获的锚点（见 _editSessionAnchor）：结束时才采会因鼠标
+        // 已把 activedCell 改到新点的格子上，与仍是旧选区的 selection 错位，
+        // 导致撤销后按键编辑的不是被操作的单元格。兜底取当前锚点应对异常缺省。
+        const anchor = this._editSessionAnchor ?? this._captureAnchor();
         if (this._editUndoStack.length > 0) {
             const preEdit = this._editUndoStack[0].values;
             const final = this.cloneValues(this._values);
             if (!this._valuesSnapshotsEqual(preEdit, final)) {
-                const anchor = this._captureAnchor();
                 this.undoManager.push({
                     type: 'values', data: { before: this.cloneValues(preEdit), after: final },
                     timestamp: Date.now(), label: '编辑内容', anchorBefore: anchor, anchorAfter: anchor
@@ -1905,7 +1923,6 @@ export class DataCollection extends EventEmitter {
             const before = [{ cell: name, data: first.cell }];
             const after = [{ cell: name, data: current ? current.clone() : null }];
             if (this._cellPatchesEqual(before, after) === false) {
-                const anchor = this._captureAnchor();
                 this.undoManager.push({
                     type: 'cellPatch', data: { before, after },
                     timestamp: Date.now(), label: '编辑内容', anchorBefore: anchor, anchorAfter: anchor
@@ -1917,6 +1934,8 @@ export class DataCollection extends EventEmitter {
         this._editRedoStack = [];
         this._editCellUndoStack = [];
         this._editCellRedoStack = [];
+        // 会话结束即作废本会话锚点，避免被下一次编辑会话误用
+        this._editSessionAnchor = null;
     }
 
     /**
@@ -3094,11 +3113,73 @@ export class DataCollection extends EventEmitter {
         // 光靠回写时那次广播画不到新位置。
         const anchor = isUndo ? action.anchorBefore : action.anchorAfter;
         this._revealAnchor(anchor);
+        // activedCell 指向「本次撤销/重做操作的单元格」（影响面首格）：
+        // 锚点恢复的是操作前/后的光标位置，与「被操作格」未必同格（如在 A1 选中后
+        // 撤销 F10 的输入，锚点会把活动格留在 A1）；选区仍按锚点恢复，
+        // 活动格单独落到操作发生处
+        const targetCell = this._resolveUndoTargetCell(action, isUndo);
+        if (targetCell) {
+            this.activedCell = targetCell;
+            const { col, row } = this.getCellColAndRow(targetCell);
+            if (isFinite(col) && isFinite(row) && col >= 1 && row >= 1) {
+                this.scrollCellIntoView(col, row);
+            }
+        }
         this.emit(DataEvents.VALUES_CHANGED, this._values);
         // 回写完成后广播快照恢复事件：activedCell/selection 与当前值相同时
         // updateProperty 不会发出差量事件（ACTIVED_CELL_CHANGED 等），
         // 依赖差量事件刷新外观的工具栏分区需监听本事件同步按钮状态
         this.emit(DataEvents.SNAPSHOT_RESTORED, action, isUndo);
+    }
+
+    /**
+     * 推导撤销/重做「操作发生的单元格」（影响面首格），供 activedCell 跳转
+     *
+     * 各快照类型记录的数据不同，取法也不同：
+     * - cellPatch / statePatch：补丁列表首格（行优先排序的第一个格子）。
+     *   两侧都要看：区域原本**没有格子**时（给空白区域着色、合并空白区），
+     *   撤销方向取 `before` 会得到空列表，而该区域本来也没有可跳的格子名，
+     *   必须回退到 `after` 才能拿到目标格；
+     * - structural：行操作取 A{at}（首列），列操作取 {at}列1行（首行）；
+     * - sortPermutation：置换范围首位置（positions 为 0-based，需 +1）；
+     * - fullState：快照内记录的 activedCell；
+     * - values 及未知类型：返回 null，保持锚点恢复的活动格。
+     * @param {UndoAction} action - 操作对象
+     * @param {boolean} isUndo - true=撤销，false=重做
+     * @returns {string | null} 目标单元格名，无法推导时为 null
+     */
+    private _resolveUndoTargetCell(action: UndoAction, isUndo: boolean): string | null {
+        const side = isUndo ? 'before' : 'after';
+        const data = action.data as Record<string, any>;
+        switch (action.type) {
+            case 'cellPatch': {
+                const before = data?.before as CellPatchEntry[] | undefined;
+                const after = data?.after as CellPatchEntry[] | undefined;
+                return before?.[0]?.cell ?? after?.[0]?.cell ?? null;
+            }
+            case 'statePatch': {
+                const before = data?.before as StatePatchSnapshot | undefined;
+                const after = data?.after as StatePatchSnapshot | undefined;
+                return before?.cells?.[0]?.cell ?? after?.cells?.[0]?.cell ?? null;
+            }
+            case 'structural': {
+                const cmd = data as unknown as StructuralSnapshot;
+                if (cmd.op === 'insertRows' || cmd.op === 'deleteRows') return this.getCellName(1, cmd.at);
+                return this.getCellName(cmd.at, 1);
+            }
+            case 'sortPermutation': {
+                const perm = data as unknown as SortPermutationSnapshot;
+                const first = perm.positions?.[0];
+                if (first === undefined) return null;
+                return perm.axis === 'column' ? this.getCellName(1, first + 1) : this.getCellName(first + 1, 1);
+            }
+            case 'fullState': {
+                const snapshot = data?.[side] as FullStateSnapshot | undefined;
+                return snapshot?.activedCell ?? null;
+            }
+            default:
+                return null;
+        }
     }
 
     /**

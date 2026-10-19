@@ -47,6 +47,7 @@ export const NAV_PANEL: string[] = ['文件', '工具', '脚本']
 export const NAV_CONTENT_WIDTH: Record<string, number> = {
     '文件': 360,
     '工具': 360,
+    '脚本': 480,
 };
 export const TOOLBAR_TABS = {
     START:'开始',
@@ -144,6 +145,18 @@ export const FILE_TREE_CLASS_NAMES = {   // 定义文件树（「文件」导航
     ACTIVED: 'is-actived',
     DRAG_DISABLED: 'is-drag-disabled',
     DROP_TARGET: 'is-drop-target',
+}
+
+export const PY_EDITOR_CLASS_NAMES = {   // 定义 Python 编辑器（「脚本」导航页）类名
+    CONTAINER: 'py-editor',
+    TOOLBAR: 'py-editor-toolbar',
+    TITLE: 'py-editor-title',
+    STATUS: 'py-editor-status',
+    BODY: 'py-editor-body',
+    GUTTER: 'py-editor-gutter',
+    CODE: 'py-editor-code',
+    HIGHLIGHT: 'py-editor-highlight',
+    INPUT: 'py-editor-input',
 }
 
 export const MENU_CLASS_NAMES = {

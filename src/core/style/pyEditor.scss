@@ -1,0 +1,120 @@
+/*  # python 编辑器（「脚本」导航页）的 SCSS 文件
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+*/
+
+.py-editor {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #ffffff;
+}
+
+.py-editor-toolbar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 10px;
+    border-bottom: 1px solid #e0e0e0;
+    background: #f5f5f5;
+    font-size: 12px;
+    color: #333;
+    user-select: none;
+}
+
+.py-editor-title {
+    font-weight: 600;
+}
+
+.py-editor-status {
+    color: #888;
+}
+
+.py-editor-body {
+    flex: 1;
+    display: flex;
+    /* flex 子项默认 min-height:auto 会撑破容器导致滚动失效，必须显式归零 */
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* 高亮层 / 输入层 / 行号栏必须使用完全一致的排版参数，
+   透明输入层的文字才能与高亮层逐字符对齐（见 pyEditor.ts 的方案说明） */
+.py-editor-gutter,
+.py-editor-highlight,
+.py-editor-input {
+    font-family: Consolas, 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 20px;
+    tab-size: 4;
+}
+
+.py-editor-gutter {
+    flex: none;
+    margin: 0;
+    padding: 8px 8px 8px 4px;
+    min-width: 32px;
+    text-align: right;
+    background: #f7f7f7;
+    color: #999999;
+    border-right: 1px solid #e8e8e8;
+    overflow: hidden;
+    user-select: none;
+}
+
+.py-editor-code {
+    position: relative;
+    flex: 1;
+    /* 同上：允许收缩，滚动才能生效 */
+    min-width: 0;
+    overflow: hidden;
+}
+
+.py-editor-highlight,
+.py-editor-input {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    margin: 0;
+    padding: 8px;
+    border: 0;
+    white-space: pre;
+}
+
+.py-editor-highlight {
+    /* 滚动条只出现在输入层；本层滚动位置由 JS 同步（pyEditor.syncScroll） */
+    overflow: hidden;
+    color: #333333;
+    /* 选择、右键菜单等事件全部穿透到输入层 */
+    pointer-events: none;
+}
+
+.py-editor-input {
+    background: transparent;
+    /* 文字本体透明，实际显示的是下方高亮层；光标必须保持可见 */
+    color: transparent;
+    caret-color: #333333;
+    resize: none;
+    outline: none;
+    overflow: auto;
+}
+
+/* 输入层文字透明，选区背景需半透明以透出下方的高亮配色 */
+.py-editor-input::selection {
+    background: rgba(173, 214, 255, 0.6);
+}
+
+/* ===== 语法高亮配色（VS Code 浅色系） ===== */
+.py-tok-keyword { color: #0000ff; }
+.py-tok-builtin { color: #267f99; }
+.py-tok-string { color: #a31515; }
+.py-tok-comment { color: #008000; }
+.py-tok-number { color: #098658; }
+.py-tok-decorator { color: #af00db; }

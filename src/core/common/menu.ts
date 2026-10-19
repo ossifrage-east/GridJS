@@ -92,6 +92,48 @@ export class Menu extends EventEmitter {
     }
 
     /**
+     * 把菜单收敛到视口内，避免靠近屏幕右边缘 / 下边缘时被裁掉
+     *
+     * 分两步：
+     * 1. 高度上限：内容比视口还高时收窄 `max-height` 到视口以内（超出部分靠菜单自身
+     *    `overflow-y: auto` 滚动），保证上下两头都能看全；能装下时清除内联值、回到
+     *    SCSS 的默认上限，避免上一次的收窄值残留影响后续较小的菜单。
+     * 2. 平移：测量菜单在视口中的实际位置，右 / 下溢出时向内平移，菜单比视口还宽 /
+     *    高时优先保证左 / 上边缘可见。
+     *
+     * 为什么用「平移增量」而不是把 left/top 直接写成视口坐标：菜单是 `position: absolute`，
+     * 定位基准是定位祖先（如 `.split-pre`）而非视口，若祖先不在视口原点，直接写视口坐标会
+     * 整体偏移；只调整相对当前值的增量则与祖先位置无关，任何容器下都成立。
+     * @private
+     */
+    private fitToViewport(): void {
+        if (!this.container.classList.contains('show')) {
+            return;
+        }
+        const margin = 4;   // 菜单与屏幕边缘的最小留白
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+
+        // 1. 高度上限：先清除内联值以取回 SCSS 默认上限，再按视口收紧
+        this.container.style.maxHeight = '';
+        const available = vh - margin * 2;
+        if (this.container.offsetHeight > available) {
+            this.container.style.maxHeight = `${available}px`;
+        }
+
+        // 2. 平移：依据当前视口位置计算需要内移的增量
+        const rect = this.container.getBoundingClientRect();
+        const left = parseFloat(this.container.style.left) || 0;
+        const top = parseFloat(this.container.style.top) || 0;
+        let dx = rect.right > vw - margin ? vw - margin - rect.right : 0;
+        if (rect.left + dx < margin) dx = margin - rect.left;
+        let dy = rect.bottom > vh - margin ? vh - margin - rect.bottom : 0;
+        if (rect.top + dy < margin) dy = margin - rect.top;
+        if (dx !== 0) this.container.style.left = `${left + dx}px`;
+        if (dy !== 0) this.container.style.top = `${top + dy}px`;
+    }
+
+    /**
      * 设置菜单位置
      * @private
      */
@@ -102,6 +144,7 @@ export class Menu extends EventEmitter {
         const { top, left, height } = this.hasMenu.getBoundingClientRect();
         this.container.style.top = `${top + height + 3}px`;
         this.container.style.left = `${left}px`;
+        this.fitToViewport();
     }
 
     /**
@@ -117,7 +160,8 @@ export class Menu extends EventEmitter {
      * 在指定视口坐标处打开右键菜单
      *
      * 与 openMenu 不同：不依赖触发元素定位（无箭头旋转），
-     * 直接以鼠标坐标作为菜单左上角位置。
+     * 直接以鼠标坐标作为菜单左上角位置；随后经 {@link fitToViewport} 收敛，
+     * 保证靠近屏幕右 / 下边缘时菜单仍完整可见（不会溢出被裁）。
      * @param {number} clientX - 视口X坐标（contextmenu 事件的 clientX）
      * @param {number} clientY - 视口Y坐标（contextmenu 事件的 clientY）
      * @param {HTMLElement} element - 菜单内容元素
@@ -132,6 +176,7 @@ export class Menu extends EventEmitter {
         this.container.style.top = `${clientY}px`;
         this.container.style.left = `${clientX}px`;
         this.container.appendChild(element);
+        this.fitToViewport();
     }
 }
 

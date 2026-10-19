@@ -905,6 +905,22 @@ export class SheetCanvas extends Canvas {
      */
     public handleMouseMove(e: MouseEvent) {
         const { x: sheetX, y: sheetY } = this.getGeometry(e.clientX, e.clientY);
+
+        // 单元格拖选越过内容区左 / 上边沿（光标进入行头 / 列头区域）时，接管为
+        // 向左 / 上自动滚动并把选区延伸到被滚出的上一列 / 上一行，直至第 1 列 / 行。
+        // 【勿并入下面的越界守卫】那条守卫是给「行 / 列头拖选」用的：往左 / 上拖拽
+        // 若也直接忽略，选区就会卡在首个可见列 / 行（往右 / 下靠 getSheetCell 钳到
+        // 最后可见行列 + scrollCellIntoView 的 `left + width > 可见宽` 分支能自动延伸，
+        // 左 / 上缺少等价分支）。行 / 列头拖选（startLocation 在表头）保持原样。
+        if (this.data.isMouseDown
+            && this.data.startLocation === MouseLocation.IN_CELL
+            && (sheetX < 0 || sheetY < 0)) {
+            this.handleSelectionEdgeScroll(sheetX, sheetY);
+            // 复位命中缓存：回到内容区后同一格仍需重新触发（overCell 相同会短路）
+            this.data.overCell = { col: 0, row: 0 };
+            return;
+        }
+
         // 【坐标越界守卫，勿删】mousemove 绑定在 document 上（sheets.ts），本方法会
         // 收到落在行头/列头区域的事件（x<0 / y<0）。此时 getSheetCell 走 x<0 / y<0
         // 边界分支返回 IN_ROW_HEADER / IN_COL_HEADER，且其「合并覆盖」会把行/列号
@@ -943,6 +959,73 @@ export class SheetCanvas extends Canvas {
             this.data.setSelection(location, col, row);
             this.scrollCellIntoView(col, row);
         }        
+    }
+
+    /**
+     * 单元格拖选贴近内容区左 / 上边沿时的反向自动滚动
+     *
+     * 向右 / 下拖拽时 getSheetCell 会把越界坐标钳到「最后可见列 / 行」，再由
+     * scrollCellIntoView 的 `left + width > 可见宽` 分支逐列 / 逐行把更后的列 / 行
+     * 纳入选区；向左 / 上时首可见列 / 行的左 / 上边缘恒为 0、不满足该分支，于是
+     * 选区卡在首可见列 / 行。这里补上镜像：滚动目标取「首可见列 / 行 - 1」，借
+     * scrollCellIntoView 的 `left < 0` 分支把它对齐到视口左 / 上沿，逐次向前推进；
+     * 若左侧 / 上方已无更多可见列 / 行则直接钳到第 1 列 / 行。全程按单元格语义，
+     * 不转成整行 / 整列，故 location 固定传 {@link MouseLocation.IN_CELL}。
+     *
+     * 【勿改用 selection 字符串反推端点】选区经 setSelectedRange 归一化后，`':'`
+     * 之后恒为**右下角**（max），向左 / 上拖拽时拿到的不是当前活动端点；且单格选区
+     * （如首帧就拖出行头）根本没有 `':'`。这里一律用**纯几何**命中取当前光标落点，
+     * 再对越界的那一侧做覆盖，既不怕单体格也不怕对角拖拽。
+     * @param sheetX 内容区坐标X（<0 表示光标已越过左边沿进入行头）
+     * @param sheetY 内容区坐标Y（<0 表示光标已越过上边沿进入列头）
+     * @private
+     */
+    private handleSelectionEdgeScroll(sheetX: number, sheetY: number): void {
+        // 纯几何落点：sheetX<0 时 getSheetCell 会把列钳到 1、sheetY<0 时把行钳到 1，
+        // 未越界的一侧（如往左拖入行头时 sheetY>=0）则给出光标所在的实际行 / 列，
+        // 正好是当前拖拽应保持的另一维端点。
+        const geo = this.data.getSheetCell(sheetX, sheetY, { rawGeometry: true });
+        let col = geo.col;
+        let row = geo.row;
+
+        if (sheetX < 0) {
+            const prevCol = this.previousVisibleCol(this.data.getVisibleCols().startCol);
+            col = prevCol > 0 ? prevCol : 1;   // 左侧已无更多可见列时钳到第 1 列
+        }
+        if (sheetY < 0) {
+            const prevRow = this.previousVisibleRow(this.data.getVisibleRows().startRow);
+            row = prevRow > 0 ? prevRow : 1;
+        }
+
+        this.data.setSelection(MouseLocation.IN_CELL, col, row);
+        this.scrollCellIntoView(col, row);
+        this.updateCursorStyle(MouseLocation.IN_CELL);
+    }
+
+    /**
+     * 查找首个可见列之前最近的一个可见列（1-based）
+     * @param firstShownCol - 首个可见列号（1-based，{@link DataCollection.getVisibleCols} 的 startCol）
+     * @returns {number} 上一可见列号；其左侧已无可见列时返回 0
+     * @private
+     */
+    private previousVisibleCol(firstShownCol: number): number {
+        for (let c = firstShownCol - 2; c >= 0; c--) {
+            if (!this.data.colHeaders.getAt(c).isHidden) return c + 1;
+        }
+        return 0;
+    }
+
+    /**
+     * 查找首个可见行之前最近的一个可见行（1-based）
+     * @param firstShownRow - 首个可见行号（1-based，{@link DataCollection.getVisibleRows} 的 startRow）
+     * @returns {number} 上一可见行号；其上方已无可见行时返回 0
+     * @private
+     */
+    private previousVisibleRow(firstShownRow: number): number {
+        for (let r = firstShownRow - 2; r >= 0; r--) {
+            if (!this.data.rowHeaders.getAt(r).isHidden) return r + 1;
+        }
+        return 0;
     }
 
     /**

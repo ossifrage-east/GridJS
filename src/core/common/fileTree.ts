@@ -70,31 +70,30 @@ export interface FileNode {
  * 与 FileOpener.SUPPORTED_EXTENSIONS 保持一致（此处为展示用的菜单项文案）
  */
 const NEW_FILE_MENU_ITEMS = [
-    { todo: 'XLSX', text: '新建XLSX' },
-    // { todo: 'XLS', text: '新建XLS' },
-    { todo: 'DOCX', text: '新建DOCX' },
-    // { todo: 'DOC', text: '新建DOC' },
-    { todo: 'PPTX', text: '新建PPTX' },
-    // { todo: 'PPT', text: '新建PPT' },
+    { todo: 'XLSX', text: '新建表格' },
+    { todo: 'DOCX', text: '新建文档' },
+    { todo: 'PPTX', text: '新建演示文稿' },
 ];
 
 /**
  * 新建文件的初始名称
  *
- * 基础名自带序号（`sheet1.xlsx` / `doc1.docx` / `ppt1.pptx`），
- * 当前目录内重名时**递增其中的数字**（`sheet1.xlsx` → `sheet2.xlsx` …）。
+ * 应用的原生后缀只有三种（见 `utils/fileName` 的 `NATIVE_EXTENSIONS`）：
+ * `grid`（表格）/ `text`（文档）/ `demo`（演示文稿）。
+ * 基础名自带序号（`sheet1.grid` / `doc1.text` / `ppt1.demo`），
+ * 当前目录内重名时**递增其中的数字**（`sheet1.grid` → `sheet2.grid` …）。
  */
 const NEW_FILE_BASE_NAMES: Record<string, string> = {
-    XLSX: 'sheet1.xlsx',
-    DOCX: 'doc1.docx',
-    PPTX: 'ppt1.pptx',
+    XLSX: 'sheet1.grid',
+    DOCX: 'doc1.text',
+    PPTX: 'ppt1.demo',
 };
 
 /**
  * 文件内容搬迁计划项
  *
  * 树只认识**路径**，而文件内容存在外部（IndexedDB 的 `values` 库，键为
- * 「去根目录的完整路径」，如 `归档/销售数据.xlsx` → `归档/销售数据`）。
+ * 「去根目录的完整路径」，如 `归档/销售数据.grid` → `归档/销售数据`）。
  * 因此「文件（或其祖先文件夹）的路径变了 / 被复制了 / 被删除了」这类副作用一律以
  * **路径**告知外部，由外部换算成存档键后执行。
  *
@@ -268,10 +267,10 @@ const DEFAULT_FILE_NODES: FileNode[] = [
  *   右键文件夹时「新建」作用于该文件夹，右键文件时作用于其所在文件夹。
  * - 命名规则：新建时**仅当当前目录内同名冲突才递增序号** ——
  *   文件夹无冲突用基础名（`新建文件夹`），冲突时追加序号（`新建文件夹1`…）；
- *   文件基础名自带序号（`sheet1.xlsx` / `doc1.docx` / `ppt1.pptx`），
- *   冲突时递增其中的数字（`sheet1.xlsx` → `sheet2.xlsx` …）。
+ *   文件基础名自带序号（`sheet1.grid` / `doc1.text` / `ppt1.demo`），
+ *   冲突时递增其中的数字（`sheet1.grid` → `sheet2.grid` …）。
  *   粘贴 / 复制重名时用同一套规则（{@link uniqueName}）：名称里带数字就递增它
- *   （`doc1.docx` → `doc2.docx`），否则追加序号（`报表.xlsx` → `报表1.xlsx`）。
+ *   （`doc1.text` → `doc2.text`），否则追加序号（`报表.grid` → `报表1.grid`）。
  * - 双击文件节点：由 {@link FileTreeOptions.onActivate} 交给外部装载内容到主页面；
  *   主页面已显示该文件时不产生任何变化（由外部保证）。
  * - 当前文件高亮：主页面正在显示的文件由 {@link setActivedFileName} /
@@ -390,9 +389,9 @@ export class FileTree {
     /**
      * 生成当前目录内可用的文件名称
      *
-     * 规则：基础名自带序号（{@link NEW_FILE_BASE_NAMES}，如 `sheet1.xlsx`），
-     * 当前目录已存在同名时**递增其中的数字**：`sheet1.xlsx` → `sheet2.xlsx` → …
-     * 序号自基础名的数字起步，因此删除 `sheet2.xlsx` 后再新建会重新得到 `sheet2.xlsx`，
+     * 规则：基础名自带序号（{@link NEW_FILE_BASE_NAMES}，如 `sheet1.grid`），
+     * 当前目录已存在同名时**递增其中的数字**：`sheet1.grid` → `sheet2.grid` → …
+     * 序号自基础名的数字起步，因此删除 `sheet2.grid` 后再新建会重新得到 `sheet2.grid`，
      * 与文件夹命名（{@link availableName}）「以目录实际内容为准」的风格一致。
      * @private
      * @param {string} todo - 菜单动作标识（XLSX / DOCX / PPTX）
@@ -806,7 +805,7 @@ export class FileTree {
         if (current !== moved && !this.isDescendantView(moved, current)) return;
 
         for (let i = 0; i < oldPaths.length; i++) {
-            // 用**存档键**比对（而不是去扩展名）：`报表.xlsx` 与 `报表.docx` 去扩展名后都是
+            // 用**存档键**比对（而不是去扩展名）：`报表.grid` 与 `报表.text` 去扩展名后都是
             // `报表`，会把另一个同名文件误判成当前文件。activedFileName 可能是键也可能是路径，
             // 而 toArchiveKey 是幂等的「路径 → 键」映射，两边过一遍即可精确对齐。
             if (toArchiveKey(oldPaths[i]) === toArchiveKey(this.activedFileName)) {
@@ -1177,7 +1176,7 @@ export class FileTree {
 
         const plans: FileMovePlan[] = [];
         // 目标目录路径：粘贴时用「目标节点作为目录」的路径作为其中文件的所属目录。
-        // 根节点「工作区」是容器而非目录，其路径为 `''`（否则会得到「工作区/x.xlsx」）
+        // 根节点「工作区」是容器而非目录，其路径为 `''`（否则会得到「工作区/x.grid」）
         const targetDir = this.containerPathOf(target);
         this.clipboard.forEach((node, index) => {
             // 粘贴保留原名称：仅当目标目录已存在同名节点时才追加序号去重
@@ -1230,7 +1229,7 @@ export class FileTree {
         targetName?: string
     ): void {
         const sourcePath = sourceDir ? `${sourceDir}/${source.name}` : source.name;
-        // 顶层节点可能因目标目录同名而被去重改名（`台账.xlsx` → `台账1.xlsx`），
+        // 顶层节点可能因目标目录同名而被去重改名（`台账.grid` → `台账1.grid`），
         // 此时目标路径的第一段必须用改名后的名字，否则内容桥会去搬一个不存在的新键
         const name = targetName ?? source.name;
         const targetPath = targetDir ? `${targetDir}/${name}` : name;
@@ -1269,7 +1268,7 @@ export class FileTree {
      * 计算节点的所属目录路径（不含自身名称）
      *
      * 根节点「工作区」不计入路径 —— 它就是整个树的容器，
-     * 因此根下的文件路径即其文件名（如 `sheet1.xlsx`），与「默认空白文件」一致。
+     * 因此根下的文件路径即其文件名（如 `sheet1.grid`），与「默认空白文件」一致。
      * @private
      * @param {TreeNodeView | null} view - 节点（可为 null，返回空串）
      * @returns {string} 目录路径；根目录下为空串
@@ -1302,7 +1301,7 @@ export class FileTree {
      *
      * 与 {@link pathWithSelf} 的唯一区别是**根节点「工作区」返回空串** ——
      * 它是整棵树的容器，不是真实目录，其名称不该出现在任何路径里
-     * （否则粘贴到根目录会产出 `工作区/台账.xlsx` 这样的路径）。
+     * （否则粘贴到根目录会产出 `工作区/台账.grid` 这样的路径）。
      * @private
      * @param {TreeNodeView} view - 目录节点
      * @returns {string} 目录路径；根节点返回空串
@@ -1437,7 +1436,7 @@ export class FileTree {
         if (wasActived) {
             // 当前文件可能就是被改名的文件本身，也可能是它（作为文件夹）的某个子孙
             for (let i = 0; i < oldPaths.length; i++) {
-                // 同上：按存档键精确比对，避免 `报表.xlsx` / `报表.docx` 互相误判
+                // 同上：按存档键精确比对，避免 `报表.grid` / `报表.text` 互相误判
                 if (toArchiveKey(oldPaths[i]) === toArchiveKey(this.activedFileName)) {
                     this.activedFileName = newPaths[i];
                     break;
@@ -1736,7 +1735,7 @@ export class FileTree {
      * 计算根目录「工作区」下下一个可用的新文件名
      *
      * 与右键「新建文件」共用同一套命名规则（{@link availableFileName}），
-     * 因此默认得到 `sheet1.xlsx`（同名被占用时递增序号）。
+     * 因此默认得到 `sheet1.grid`（同名被占用时递增序号）。
      * 供外部在「刷新后树里一个文件都没有」时补一个默认空白文件用。
      * @param {string} [todo='XLSX'] - 文件类型标识（XLSX / DOCX / PPTX）
      * @returns {string} 可用的文件显示名（含扩展名）
@@ -1782,22 +1781,46 @@ export class FileTree {
     }
 
     /**
+     * 为「从本机打开的文件」解析一个在根目录内不冲突的文件名
+     *
+     * 打开时**不同原始后缀可能换算成同一原生名**：`test_sample.xls` 与
+     * `test_sample.xlsx` 都换算为 `test_sample.grid`（同理 `doc/docx → .text`、
+     * `ppt/pptx → .demo`）。若不去重，第二个文件会被 {@link showActivedFile} 当成
+     * 「树里已有同名节点」而复用，同时写入同一个存档键 —— 表现为「新文件不进树、
+     * 内容覆盖掉先打开的那个」。
+     *
+     * 这里按与新建 / 粘贴一致的规则（{@link uniqueName}）在冲突时加序号：
+     * 名称内无数字则追加序号（`test_sample.grid` → `test_sample1.grid`），
+     * 名称内已有数字则递增该数字（`报告2.grid` → `报告3.grid`）。
+     *
+     * ⚠️ 调用方必须把返回名**同时**用于装载（存档键）与登记（树节点），二者一致
+     * 才能保证「一节点一存档」。
+     * @param {string} name - 换算后的原生文件名（如 `test_sample.grid`）
+     * @returns {string} 根目录内不冲突的文件名
+     */
+    public resolveOpenedFileName(name: string): string {
+        const target = this.rootViews[0];
+        if (!target?.childrenBox) return name;
+        return this.uniqueName(target, name);
+    }
+
+    /**
      * 按路径 / 名称在整棵树中查找节点
      *
      * 匹配规则（不区分大小写，按优先级）：
-     * 1. **完整路径一致**（`归档/销售数据.xlsx`）—— 最精确，可区分同名文件；
-     * 2. 名称完全一致（`销售数据.xlsx`）；
-     * 3. 「去掉扩展名后」一致 —— 树中节点是 `sheet1.xlsx`，而主页面记录的是
-     *    工作表键（`.xlsx` 去后缀，见 `utils/fileName` 的 `toArchiveKey`），
+     * 1. **完整路径一致**（`归档/销售数据.grid`）—— 最精确，可区分同名文件；
+     * 2. 名称完全一致（`销售数据.grid`）；
+     * 3. 「去掉扩展名后」一致 —— 树中节点是 `sheet1.grid`，而主页面记录的是
+     *    工作表键（`.grid` 去后缀，见 `utils/fileName` 的 `toArchiveKey`），
      *    两者必须能互相定位。
      *
-     * ⚠️ **扩展名敏感优先于扩展名无关**：`报表.xlsx` 与 `报表.docx` 是**两个不同的文件**，
+     * ⚠️ **扩展名敏感优先于扩展名无关**：`报表.grid` 与 `报表.text` 是**两个不同的文件**，
      * 必须分别命中各自的节点。历史实现把「去扩展名后一致」与「名称一致」放在同一档，
-     * 于是查找 `报表.docx` 时也会命中 `报表.xlsx`（两者去扩展名都是 `报表`），
+     * 于是查找 `报表.text` 时也会命中 `报表.grid`（两者去扩展名都是 `报表`），
      * 导致打开同名不同后缀的文件时**复用错节点、新文件不进树**。
      *
      * 因此第 3 档只在**查询名本身没有扩展名**时才启用 —— 它存在的意义就是让
-     * 「工作表名（`销售数据`）」这类无后缀键能定位到「显示文件名（`销售数据.xlsx`）」，
+     * 「工作表名（`销售数据`）」这类无后缀键能定位到「显示文件名（`销售数据.grid`）」，
      * 而不是让两个都带后缀的名字互相串台。
      *
      * 同名时文件优先于文件夹。路径命中优先于名称命中：否则两个不同目录下的
@@ -1810,7 +1833,7 @@ export class FileTree {
         const key = name.trim().toLowerCase();
         if (!key) return null;
         const bare = stripExtension(key);
-        // 查询名自带扩展名时，禁止回落到「去扩展名」档：`报表.docx` 不该命中 `报表.xlsx`
+        // 查询名自带扩展名时，禁止回落到「去扩展名」档：`报表.text` 不该命中 `报表.grid`
         const queryHasExt = extractExtension(key) !== '';
         const byPath: TreeNodeView[] = [];
         const byName: TreeNodeView[] = [];
@@ -1928,9 +1951,9 @@ export class FileTree {
      * 在指定父节点下生成不重复的名称（粘贴 / 登记文件时用于兜底去重）
      *
      * 重名规则与「新建文件」{@link availableFileName} 保持一致：
-     * - 文件名中带数字（`sheet1.xlsx` / `doc1.docx`）→ **递增其中的数字**：
-     *   复制 `doc1.docx` 得到 `doc2.docx`（而不是 `doc11.docx`）；
-     * - 文件名中无数字（`报表.xlsx`）→ 在扩展名前追加序号：`报表1.xlsx`；
+     * - 文件名中带数字（`sheet1.grid` / `doc1.text`）→ **递增其中的数字**：
+     *   复制 `doc1.text` 得到 `doc2.text`（而不是 `doc11.text`）；
+     * - 文件名中无数字（`报表.grid`）→ 在扩展名前追加序号：`报表1.grid`；
      * - 文件夹名（`新建文件夹` / `归档`）→ 追加序号：`归档1`。
      * @private
      * @param {TreeNodeView} parent - 父节点

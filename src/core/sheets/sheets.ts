@@ -460,6 +460,13 @@ export class Sheets extends EventEmitter {
      * @param e 鼠标事件对象
      */
     private handleMouseMove(e: MouseEvent): void {
+        // 拖拽已开始但漏收了 mouseup（典型场景：在本窗口外抬起鼠标后再移回页面）：
+        // 此时左键已不再按下（e.buttons 位 0），必须按抬起收尾，否则 isGridDragging
+        // 仍为 true，选区会继续跟随鼠标（事件源在窗口外时 document 收不到 mouseup）。
+        if (this.isGridDragging && (e.buttons & 1) === 0) {
+            this.handleMouseUp(e);
+            return;
+        }
         // 无表格拖拽进行中且事件源自交互控件时放行：不阻止其默认行为，
         // 使输入框内按住拖动选择文本仍可用；拖拽进行中则保持原有接管逻辑
         if (!this.isGridDragging && this.isFromInteractiveControl(e)) return;
