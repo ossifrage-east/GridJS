@@ -133,9 +133,11 @@ export class Filter {
         }
         // 全部显示：清除本列筛选条件（作为可撤销步骤，嵌套在外层操作时折叠为其一步），
         // 按钮恢复默认色，内容清单恢复全部内容
+        // 'headers' 档：筛选只改「行隐藏标记 + 条件注册表」，不动 values，
+        // 大表下因此照样可撤销（代价与表头数成正比，与百万格无关）
         this.data.runWithFullStateUndo('清除筛选', () => {
             this.data.clearFilterCondition(col);
-        });
+        }, 'headers');
         this.setFilterButtonActive(false);
         this.updateContentTips();
     };
@@ -820,7 +822,9 @@ export class Filter {
             const rest = Math.max(0, totalRows - upper);
             if (rest > 0 && keepContents.has('')) matchedRows += rest;
             this.setFilterButtonActive(matchedRows < contentRows + rest);
-        });
+            // 'headers' 档：筛选只改「行隐藏标记 + 条件注册表」，不动 values，
+            // 大表下因此照样可撤销（代价与表头数成正比，与百万格无关）
+        }, 'headers');
     }
 
     /**

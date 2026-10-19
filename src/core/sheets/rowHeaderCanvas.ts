@@ -5,7 +5,7 @@ import { CELL_PADDING, DEFAULT_ANCHOR_SELECTED_BORDER_COLOR, DEFAULT_CELL_BG_COL
     ROW_HEADER_PADDING,
     MouseLocation} from "../constant";
 import { Canvas, CanvasOptions } from "./canvas";
-import { FullStateSnapshot } from "../../utils/undoManager";
+import { ContinuousUndoSnapshot } from "../../utils/undoManager";
 import { Hidden } from "../assistant/hidden";
 
 
@@ -16,8 +16,8 @@ export class RowHeaderCanvas extends Canvas {
     private _resizeRafId: number | null = null;
     /** 拖拽行高：最近一次实际应用的高度（用于跳过未跨像素的重复更新） */
     private _lastAppliedHeight: number | null = null;
-    /** 拖拽行高：手势开始时的全量状态快照（mouseup 时提交撤销） */
-    private _resizeUndoBefore: FullStateSnapshot | null = null;
+    /** 拖拽行高：手势开始时的基准快照（小表全量/大表 headers 补丁档，mouseup 时提交撤销） */
+    private _resizeUndoBefore: ContinuousUndoSnapshot | null = null;
     /** 隐藏行悬停指示按钮（上下双三角）：鼠标悬停到「分割线且下方紧邻隐藏行」时显示 */
     private hiddenIndicator: Hidden;
     /** 行号宽度测量缓存键（`字体串\0行号文本`），未变化时跳过 measureText */
@@ -288,15 +288,21 @@ export class RowHeaderCanvas extends Canvas {
             this._resizeUndoBefore = this.data.beginContinuousUndo();
             this._lastAppliedHeight = this.data.startHeight;
         }
-        this.data.activedCell = `${this.data.getColName(col)}${row}`;
-        // 【勿回退为直接写 `selection = A{row}:{末列}{row}`】
-        // 行头点击 = 整行选区，但必须与「单元格点击 / 拖选」同源，经 setSelectedRange 归一化：
-        // 该行内若有纵向合并（如 A5:A8），选区与之部分相交，会被扩到合并区域完整范围
-        // （行 5~8），从而维持「选区永不半覆盖合并区域」这一不变式。
-        // 若直接写死单行选区，getSelectedRect 会按合并锚点取端点矩形 —— 锚点上移到行 5、
-        // 高度按 rowspan 累加，高亮整体上移/变高，与行头高亮的行号、乃至实际点中的行都对不上。
-        this.data.setSelectedRange(1, row, this.data.colHeaders.length, row);
-        this.scrollCellIntoView(col, row);
+        // 活动格**跳过合并单元格**：行头点击恒取第 1 列，而首列最常被纵向合并
+        // （如 A5:A8）；活动格落进合并区后，选中框上挖的透明洞会变成整个合并块
+        // 那么大（getActivedRect 走合并锚点语义），整行高亮被挖掉一大片。
+        this.data.activedCell = this.data.resolveHeaderActiveCell(col, row, 'row');
+        // 行头点击 = **精确的**整行选区（`expandMerges = false`）
+        // 【语义】点第 5 行头要的就是「第 5 行这一整行」，该行中间有没有纵向合并
+        // （如 A5:A8）与用户意图无关；若按合并区域归一化，选中的会变成第 5~8 行，
+        // 于是「查找范围」「复制内容」「删除行」全都跟着错一整块。
+        // 高亮的正确性不依赖归一化：getSelectedRect 只用网格矩形取端点
+        // （见那里的说明），因此单行选区照样精确地贴在所点的那一行上。
+        this.data.setSelectedRange(1, row, this.data.colHeaders.length, row, false);
+        // 滚到**活动格**（而非点击处的第 1 列）：活动格可能已被挪到别的列，
+        // 保证它连同选中框一起落在屏幕里。
+        const active = this.data.getCellColAndRow(this.data.activedCell);
+        this.scrollCellIntoView(active.col, active.row);
     }
 
     /**
@@ -326,8 +332,12 @@ export class RowHeaderCanvas extends Canvas {
             || this.data.startLocation === MouseLocation.IN_All_SELECT
             || (this.data.overCell.col === col && this.data.overCell.row === row)
         ) return;
-        if (this.data.startLocation === MouseLocation.IN_ROW_HEADER
-            && (this.data.overCell.col !== col && this.data.overCell.row !== row) ) {
+        // 行头拖选：与列头（colHeaderCanvas.handleMouseMove）保持一致，
+        // 每次 mousemove 都更新选区。
+        // 【勿加回 overCell 守卫】行头拖选时 col 恒为 1（行头 x 坐标不变），
+        // 「col 不同且 row 不同」的守卫在第二次移动起永假 → 选区冻结在
+        // 第一格，拖拽选行完全失效。
+        if (this.data.startLocation === MouseLocation.IN_ROW_HEADER) {
             this.data.overCell = { col, row };
             this.data.setSelection(location, col, row);
         }

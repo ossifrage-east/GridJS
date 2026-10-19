@@ -11,6 +11,7 @@ import { DataEvents, TOOLBAR_CLASS_NAME } from "../../constant";
 import { BtnBase } from "../../common/button";
 import { Menu } from "../../common/menu";
 import { DataCollection } from "../../dataArchitecture/dataCollection";
+import { openFindReplace } from "./searchDialog";
 
 /**
  * SectionProcess 构造选项接口
@@ -189,11 +190,16 @@ export class SectionProcess {
                 if (todo.includes('MenuOpen')) {
                     this.menu.openMenu(searchBtn.getElements().container);
                     this.menu.addMenuElement(searchBtn.getElements().menuContainer);
-                } else {
-                    
+                } else if (todo.includes('replace')) {
+                    // 判断顺序：'replace' 在前 —— 'replace'.includes('search') 为 false，
+                    // 但反过来写（先判 search）会让 todo='replace' 被 'search' 分支截胡
+                    // （真实菜单项的 todo 就是 'replace'，不含 'search' 字样，但保持
+                    // 「特殊的分支先判」这一顺序，后续加 'search-in-range' 之类的条目不会踩坑）
+                    this.openSearchDialog('replace');
+                } else if (todo.includes('search')) {
+                    this.openSearchDialog('find');
                 }
-            }
-        });
+            }        });
         this.toolbars = {
             calculateBtn,
             sortBtn,
@@ -204,6 +210,22 @@ export class SectionProcess {
     }
     
     
+    /**
+     * 打开查询 / 替换对话框
+     *
+     * 核心数据能力都在 DataCollection（range 解析 / 命中扫描 / 字符级替换 / 跳转滚动），
+     * 这里只是把**全局共享**的那个对话框拉起来并切到目标页签。
+     *
+     * 用共享实例而非每次 `new`：Ctrl+F / Ctrl+H 走的是同一个入口，各自新建会得到
+     * 两个互不感知的对话框（快捷键打开时菜单那个不隐藏）。对话框内部结构只建一次、
+     * 隐藏不销毁，因此再次打开会保留页签、关键字与命中位置。
+     * @param {'find' | 'replace'} mode - 目标页签
+     * @private
+     */
+    private openSearchDialog(mode: 'find' | 'replace'): void {
+        openFindReplace(this.data, mode);
+    }
+
     /**
      * 设置工具栏状态
      * @private

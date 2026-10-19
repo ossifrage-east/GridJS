@@ -179,16 +179,30 @@ export class BtnBase extends EventEmitter {
 
         if (this.options.menuContent) {
             this.setMenuContent();
+            // 菜单可能被**别人**关掉（全局 document 点击、右键菜单、其它按钮抢开），
+            // 此时箭头已被 Menu.closeMenu 复位，但本按钮的 `isOpen` 不会自动跟着变 ——
+            // 状态一旦分叉，下次点击按钮就会「翻转成打开」却发出 MenuClose。
+            // 订阅 close 事件把 isOpen 拉回真实状态（closeMenu 每次都 emit('close')）。
+            this.menu.on('close', () => { this.isOpen = false; });
         }
 
         this.container.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            this.menu.closeMenu();
+            // 【勿无条件调 closeMenu()】：它会把**本按钮即将打开**的菜单一起拆掉
+            // （清空容器 + 移除 show + emit('close')），而 emit('close') 又会让下面
+            // 订阅的回调把 `isOpen` 归零 → 每次都读成「未打开」，于是永远只发 MenuOpen、
+            // 第二次点击也关不上菜单。这里只关**别人**的菜单。
+            if (this.menu.hasMenu && this.menu.hasMenu !== this.container) {
+                this.menu.closeMenu();
+            }
             if (!this.options.separate) {
                 if (this.options.ashow) {
-                    this.isOpen = this.arrowElement.style.transform === 'rotate(180deg)' ? true : false;
                     this.isOpen = !this.isOpen;
+                    if (!this.isOpen) {
+                        // 收起：真正关闭菜单（清内容 + 复位箭头 + 广播 close）
+                        this.menu.closeMenu();
+                    }
                     // 与 separate 分支保持一致：发出 `${toDo}MenuOpen` / `${toDo}MenuClose`（带前缀），
                     // 旧代码以 includes('MenuOpen') 判断不受影响，严格匹配前缀的新代码才能正确收到
                     this.todo(`${this.options.toDo}${this.isOpen ? 'MenuOpen' : 'MenuClose'}`);
@@ -197,15 +211,17 @@ export class BtnBase extends EventEmitter {
                 }
             } else {
                 if (this.iconElement.contains(e.target as Node)) {
-                    if (this.options.ashow) {
-                        if (this.isOpen) this.todo(`${this.options.toDo}MenuClose`);
+                    if (this.options.ashow && this.isOpen) {
+                        // 点图标 = 执行动作并顺手收起菜单（不再弹回菜单）
                         this.isOpen = false;
+                        this.menu.closeMenu();
+                        this.todo(`${this.options.toDo}MenuClose`);
                     }
                     this.todo(`${this.options.toDo}`);
                 } else if (this.textElement.contains(e.target as Node)) {
                     if (this.options.ashow) {
-                        this.isOpen = this.arrowElement.style.transform === 'rotate(180deg)' ? true : false;
                         this.isOpen = !this.isOpen;
+                        if (!this.isOpen) this.menu.closeMenu();
                         this.todo(`${this.options.toDo}${this.isOpen ? 'MenuOpen' : 'MenuClose'}`);
                     }
                 }

@@ -19,6 +19,7 @@ import { Char } from "../dataArchitecture/char";
 import { Cell } from "../dataArchitecture/cell";
 import { Canvas, CanvasOptions } from "./canvas";
 import { CursorPosition, LineText } from "../dataArchitecture/cellContent";
+import { openFindReplace } from "../toolbar/start/searchDialog";
 
 
 
@@ -218,8 +219,11 @@ export class EditCanvas extends Canvas {
      * @public
      */
     public drawEditCellsText(cell: string) {
-        const i = this.data.values.findIndex((item) => item.cell === cell); // 单元格索引
-        if (i === -1) return;
+        // 【勿写成 `values.findIndex(v => v.cell === cell)`】那是 O(N) 线性扫描，
+        // 而本方法在打字过程中逐字符重绘 —— 百万格表上每次按键要扫百万条。
+        // 取格一律走 getCellByName（O(1) 倒排索引）。
+        const target = this.data.getCellByName(cell);
+        if (!target) return;
 
         const { col, row } = this.data.getCellColAndRow(cell);
         // 获取单元格尺寸
@@ -232,14 +236,14 @@ export class EditCanvas extends Canvas {
 
         const { contentWidth, contentHeight, lines } = this.measureCellText(cell); 
         
-        const backgroundColor = this.data.values[i]?.backgroundColor || 'whitesmoke';
+        const backgroundColor = target.backgroundColor || 'whitesmoke';
         this.ctx.save();
         this.ctx.fillStyle = backgroundColor;
         this.fillRect(0, 0, contentWidth, contentHeight);
         this.ctx.restore();
         // 复制主canvas的绘图上下文设置
-        const letterSpacing = this.data.values[i]?.letterSpacing || 0;
-        const lineSpacing = this.data.values[i]?.lineSpacing || 0;
+        const letterSpacing = target.letterSpacing || 0;
+        const lineSpacing = target.lineSpacing || 0;
         this.ctx.textAlign = 'left';
         this.ctx.textBaseline = 'bottom';
         // 在editCanvas上绘制文本（使用editX/editY确保与非编辑模式对齐）
@@ -909,6 +913,22 @@ export class EditCanvas extends Canvas {
      * @public
      */
     public handleKeyDown(e: KeyboardEvent): void {
+        // 查找 / 替换快捷键（Ctrl+F / Ctrl+H，macOS 为 Cmd+F / Cmd+H）
+        //
+        // 【必须在下面「输入框聚焦就 return」之前处理】：对话框打开着的时候焦点
+        // 就在它自己的输入框里，一旦被那条守卫拦掉，Ctrl+F 切页签 / Ctrl+H 切到
+        // 替换页就永远不生效。也必须在 activedCell 判空之前，保证没有活动单元格时
+        // 仍能唤起查找。
+        // preventDefault 是必要的：否则会同时触发浏览器自带的「页内查找」。
+        if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
+            const shortcutKey = e.key ? e.key.toLowerCase() : '';
+            if (shortcutKey === 'f' || shortcutKey === 'h') {
+                e.preventDefault();
+                openFindReplace(this.data, shortcutKey === 'h' ? 'replace' : 'find');
+                return;
+            }
+        }
+
         if (!this.data.activedCell) return;
         // 焦点位于其它可编辑元素（如打印预览面板的输入框）时，忽略表格的键盘处理：
         // 避免在这些输入框中打字误触发单元格编辑，或拦截复制/粘贴/撤销等快捷键。
@@ -949,7 +969,10 @@ export class EditCanvas extends Canvas {
                         this.drawEditCellsText(this.data.activedCell);
                         this.data.cursorAbsolutePosition = caretIndex;
                     } else {
-                        this.data.cutSelection();
+                        // 非编辑态单元格级剪切：与工具栏/右键菜单同口径包裹，
+                        // 大表按选区稀疏补丁记账，保证快捷键操作也可撤销/重做
+                        this.data.runWithFullStateUndo('剪切', () => this.data.cutSelection(), 'selection');
+                        this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
                     }
                     return;
                 case 'v':
@@ -971,7 +994,9 @@ export class EditCanvas extends Canvas {
                             this.data.cursorAbsolutePosition = caretIndex;
                         }
                     } else {
-                        this.data.pasteSelection();
+                        // 非编辑态单元格级粘贴：'paste' 档按粘贴目标矩形记账，大表同样可撤销/重做
+                        this.data.runWithFullStateUndo('粘贴', () => this.data.pasteSelection(), 'paste');
+                        this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
                     }
                     return;
                 case 'z':
@@ -1088,14 +1113,24 @@ export class EditCanvas extends Canvas {
                     case "Backspace": // 删除键处理
                         e.preventDefault();
                         if (!this.isComposing) { // 不在输入法组合状态时才处理
-                            for (const cell of this.data.getSelectedCells()) {
-                                const cellIndex = this.data.values.findIndex(v => v.cell === cell);
-                                if (cellIndex >= 0) {
-                                    this.data.values[cellIndex].chars = [];
+                            // 【必须包 runWithFullStateUndo，勿直接 commitValues()】
+                            // commitValues 以 _lastValuesSnapshot 为「变化前」基准，
+                            // 而大表下该基准被刻意置 null（整表深拷贝实测 1.7 秒），
+                            // 于是这条路在大表上**一条撤销记录都不记** ——
+                            // 表现就是「大表里按 Delete 删掉的内容撤不回来」。
+                            // 走 'selection' 档：影响面就是当前选区，代价与选区格数成正比。
+                            this.data.runWithFullStateUndo('删除内容', () => {
+                                for (const name of this.data.getSelectedCells()) {
+                                    // 【勿写 values.findIndex(v => v.cell === name)】O(N) 线性扫描 × 选中格数，
+                                    // 大表上是一次几十亿次的空转。取格一律走 getCellByName（O(1)）。
+                                    const cell = this.data.getCellByName(name);
+                                    if (cell) cell.chars = [];
                                 }
-                            }
+                            }, 'selection');
+                            // runWithFullStateUndo 只打内容变化标记、不广播（重绘由调用方驱动），
+                            // 这里补一次 VALUES_CHANGED 让主画布重画（app.ts 监听它排程重绘）。
+                            this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
                         }
-                        this.data.commitValues();
                         break;
                     case 'Enter' : // 处理回车键
                         // 移动到下一行

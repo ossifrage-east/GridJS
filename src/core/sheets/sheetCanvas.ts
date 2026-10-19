@@ -880,12 +880,19 @@ export class SheetCanvas extends Canvas {
             this.drawAnchorSelcetedRect();
         } else {
             this.data.activedCell = `${this.data.getColName(col)}${row}`;
-            const mergedCells = this.data.getMergedCells();
-            for (const mergedCell of mergedCells) {
-                if (mergedCell.includes(`${this.data.getColName(col)}${row}`)) {
-                    this.data.selection = mergedCell;
-                    return;
-                }
+            // 命中合并区域 → 选区取整块（**几何判定**，见 DataCollection.getMergedRangeAt）
+            //
+            // 【勿回退为 `mergedCells.find(v => v.includes(name))`】那是**字符串包含**：
+            // 点 B2 会命中 'B22:D24'（含子串 'B2'）、点 D2 同样命中（'D24' 含 'D2'），
+            // 于是选中框跑到二十行开外毫不相关的合并块上（test_sample.xls 实测）。
+            const mergedRange = this.data.getMergedRangeAt(col, row);
+            if (mergedRange !== null) {
+                // 活动格必须落在**合并锚点**上，而不是被合并覆盖的那个格子：
+                // 覆盖格的 colspan/rowspan 归零，编辑光标与填充柄无处安放；
+                // 且 getActivedRect 会把透明洞挖成整个合并块那么大。
+                this.data.activedCell = mergedRange.split(':')[0];
+                this.data.selection = mergedRange;
+                return;
             }
             this.data.selection = `${this.data.activedCell}:${this.data.activedCell}`;
         }
@@ -898,7 +905,26 @@ export class SheetCanvas extends Canvas {
      */
     public handleMouseMove(e: MouseEvent) {
         const { x: sheetX, y: sheetY } = this.getGeometry(e.clientX, e.clientY);
-        const { location, col, row } = this.data.getSheetCell(sheetX, sheetY);
+        // 【坐标越界守卫，勿删】mousemove 绑定在 document 上（sheets.ts），本方法会
+        // 收到落在行头/列头区域的事件（x<0 / y<0）。此时 getSheetCell 走 x<0 / y<0
+        // 边界分支返回 IN_ROW_HEADER / IN_COL_HEADER，且其「合并覆盖」会把行/列号
+        // 吸附到合并锚点（如 A1:C54 覆盖下第 4 行 A4 → 锚点 A1），再经 setSelection
+        // 的行/列头分支把选区改写成 A1:AO{起始行} / A{起始列}:AO1 —— 行/列头拖选
+        // 时选区被重置到合并锚点（用户反馈：不能跳到合并单元格的位置作为选择依据）。
+        // 行头/列头拖选由各自画布的 handleMouseMove 负责（行列号不经合并覆盖）；
+        // 这里越界即忽略，保留向下/右越界时 getSheetCell 钳到最后可见行列的
+        // 「拖选出视口自动延伸」行为。
+        if (sheetX < 0 || sheetY < 0) return;
+        // 行/列头拖选进行中（鼠标从行/列头拖入内容区，e.target 已变成本画布，
+        // 行/列头画布的 mousemove 因 e.target 守卫不再更新选区，只能由这里接管）：
+        // 必须用**纯几何**行列号，跳过 getSheetCell 的锚点/合并吸附 —— 首列纵向
+        // 合并（A1:A3）会把经过行吸附到锚点行，首行横向合并同理，导致整行/整列
+        // 选区端点被合并块错误锚定（用户需求：仅选对应行/列，忽略合并影响）。
+        // setSelection 的行/列头分支本就传 expandMerges=false，两端语义一致。
+        const headerDragging = this.data.isMouseDown
+            && (this.data.startLocation === MouseLocation.IN_ROW_HEADER
+                || this.data.startLocation === MouseLocation.IN_COL_HEADER);
+        const { location, col, row } = this.data.getSheetCell(sheetX, sheetY, headerDragging ? { rawGeometry: true } : undefined);
         this.updateCursorStyle(this.data.isMouseDown ? this.data.startLocation : location);  // 更新光标样式
         if (e.button !== 0 || !this.data.isMouseDown
             || this.data.isEditting
@@ -935,7 +961,14 @@ export class SheetCanvas extends Canvas {
         this.data.MouseStartY = 0;
         this.data.startRow = 1;
         this.data.startHeight = 0;
-        if (this.data.brushMode) this.data.exeBrush();
+        if (this.data.brushMode) {
+            // 格式刷落刷：影响面 = 当前目标选区，'selection' 档按选区捕获稀疏补丁，
+            // 大表同样可撤销/重做（exeBrush 单格分支内部调 pasteFormatOnly，
+            // 嵌套的记账捕获会自动折叠到本层，只产生一条记录）。
+            this.data.runWithFullStateUndo('格式刷', () => this.data.exeBrush(), 'selection');
+            // 包裹抑制了 exeBrush 内部 commitValues 的自动广播，补一次驱动重绘
+            this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
+        }
     }
 
     /**

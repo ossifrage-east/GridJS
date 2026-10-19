@@ -6,7 +6,7 @@ import { VisibleView } from "./visibleView";
 import { CELL_PADDING, DataEvents, DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, DEFAULT_SELECTED_BORDER_WIDTH, MouseLocation } from "../constant";
 import { EventEmitter } from "../../utils/eventEmitter";
 import { IndexDB } from "./indexDB";
-import { UndoManager, UndoAction, FullStateSnapshot, CellPatchEntry } from "../../utils/undoManager";
+import { UndoManager, UndoAction, FullStateSnapshot, CellPatchEntry, UndoAnchor, StatePatchSnapshot, StructuralSnapshot, ContinuousUndoSnapshot, SortPermutationSnapshot } from "../../utils/undoManager";
 import { ClipboardManager } from "../../utils/clipboardManager";
 import { MessageBox } from "../common/message";
 import { MatrixSorter, type SortConfig } from "./matrixSorter";
@@ -33,6 +33,78 @@ export interface MergeRect {
     endCol: number;
     /** 结束行号（1-based，含） */
     endRow: number;
+}
+
+/**
+ * 查询 / 替换的作用范围矩形（1-based 闭区间）
+ *
+ * 是**数值**矩形而非 `'A1:C9'` 字符串：扫描循环里每格都要用它做比较，
+ * 字符串形态每次都得重新解析。字符串只在「输入/展示」两端出现
+ * （见 {@link DataCollection.resolveSearchRect} / {@link DataCollection.formatRect}）。
+ */
+export interface SheetRect {
+    /** 起始列号（1-based，含） */
+    startCol: number;
+    /** 起始行号（1-based，含） */
+    startRow: number;
+    /** 结束列号（1-based，含） */
+    endCol: number;
+    /** 结束行号（1-based，含） */
+    endRow: number;
+}
+
+/**
+ * 查询 / 替换的匹配选项
+ *
+ * 查询与替换共用同一套选项对象是硬要求：若两边算法不一致，
+ * 会出现「查得到但替换不掉」（或反过来）的错位。
+ */
+export interface SearchMatchOptions {
+    /** 区分大小写（默认 false） */
+    matchCase?: boolean;
+    /** 单元格内容**完全匹配**才算命中（默认 false，即「包含即命中」） */
+    matchEntire?: boolean;
+    /** 通配符模式：`?` 匹配单个字符、`*` 匹配任意长度字符串（默认 false，关键字按字面量处理） */
+    useWildcard?: boolean;
+}
+
+/**
+ * 一条查询命中
+ *
+ * `text` 是命中**当时**的单元格文本快照：替换发生之后（无论「替换」还是「全部替换」）
+ * UI 都应当重新查一次，拿着旧快照继续展示会显示过期内容。
+ */
+export interface SearchHit {
+    /** 单元格名称（如 `'B3'`） */
+    cell: string;
+    /** 列号（1-based） */
+    col: number;
+    /** 行号（1-based） */
+    row: number;
+    /** 命中时的单元格全文 */
+    text: string;
+}
+
+/**
+ * 稀疏扫描的候选格（内部用，不对外暴露）
+ *
+ * 与 {@link SearchHit} 的差别是多了 `ref`（`values` 里的**活引用**，替换阶段直接改它）
+ * 与 `key`（行优先序号，仅用于排序）。分开定义是为了不让「活引用」泄进公开的命中项里：
+ * 命中项会被对话框长期持有，带着一个可写的数据引用迟早出事。
+ */
+interface ScanCandidate {
+    /** 单元格引用（`values` 里的活引用） */
+    ref: Cell;
+    /** 单元格名称 */
+    cell: string;
+    /** 列号（1-based） */
+    col: number;
+    /** 行号（1-based） */
+    row: number;
+    /** 逐字符对齐的文本（与 `Cell.getText()` 结果一致） */
+    text: string;
+    /** 行优先序号 = `(row - startRow) * width + (col - startCol)` */
+    key: number;
 }
 
 /**
@@ -305,6 +377,18 @@ export class DataCollection extends EventEmitter {
      * 在十万格量级上还感觉不到，到了几十万格，每一次结构操作都会变成肉眼可见的停顿。
      */
     private static readonly LARGE_TABLE_UNDO_CELLS = 100000;
+    /**
+     * 大表下「按影响面记账」的单次影响面上限（格子数）
+     *
+     * 大表关掉整表快照后，可撤销性改由**影响面补丁**提供（见 {@link runWithFullStateUndo}
+     * 的 `scope` 参数）。补丁的代价与影响面格数成正比，因此仍需一道上限兜底：
+     * 用户 Ctrl+A 全选后在百万格的表上「清除内容」，影响面就是整表，
+     * 为它记账等于绕回整表快照（1.9M 格实测 1.7 秒 + 上百 MB）。
+     *
+     * 2 万格的实测成本约 10 ms / 几 MB，正好卡在「整行整列、一大片手选区域」
+     * 都还能记账、而全选这种文档级操作会退化成不可撤销的位置。
+     */
+    private static readonly LARGE_TABLE_PATCH_CELLS = 20000;
     /**
      * 合并区域进「列倒排索引」的最大跨列数
      *
@@ -1637,7 +1721,12 @@ export class DataCollection extends EventEmitter {
         }
         const after = this.cloneValues(this._values);
         if (!this._isApplyingUndo && !this._valuesSnapshotsEqual(before, after)) {
-            this.undoManager.pushValuesSnapshot(this.cloneValues(before), this.cloneValues(after));
+            // values setter 不碰选区，故前后锚点取同一份即可（仍挂上，供撤销后滚动定位）
+            const anchor = this._captureAnchor();
+            this.undoManager.push({
+                type: 'values', data: { before: this.cloneValues(before), after: this.cloneValues(after) },
+                timestamp: Date.now(), anchorBefore: anchor, anchorAfter: anchor
+            });
         }
         this._lastValuesSnapshot = after;
         this.emit(DataEvents.VALUES_CHANGED, this._values);
@@ -1798,7 +1887,29 @@ export class DataCollection extends EventEmitter {
             const preEdit = this._editUndoStack[0].values;
             const final = this.cloneValues(this._values);
             if (!this._valuesSnapshotsEqual(preEdit, final)) {
-                this.undoManager.pushValuesSnapshot(this.cloneValues(preEdit), final);
+                const anchor = this._captureAnchor();
+                this.undoManager.push({
+                    type: 'values', data: { before: this.cloneValues(preEdit), after: final },
+                    timestamp: Date.now(), label: '编辑内容', anchorBefore: anchor, anchorAfter: anchor
+                });
+            }
+        } else if (this._editCellUndoStack.length > 0) {
+            // 大表：整表快照关闭，编辑内用「单格快照」记账（见 _commitEditCellState）。
+            // 编辑会话结束时必须把它**提升**为文档级撤销记录 ——
+            // 否则退出编辑后这段编辑就从撤销栈里消失了，
+            // 表现为「大表里改完一个格，Ctrl+Z 毫无反应」（test_sample.xlsx 实测）。
+            // 只涉及活动格一个格子，成本 O(1)，与整表大小无关。
+            const first = this._editCellUndoStack[0];
+            const name = first.cell ? first.cell.cell : this._activedCell;
+            const current = this.getCellByName(name);
+            const before = [{ cell: name, data: first.cell }];
+            const after = [{ cell: name, data: current ? current.clone() : null }];
+            if (this._cellPatchesEqual(before, after) === false) {
+                const anchor = this._captureAnchor();
+                this.undoManager.push({
+                    type: 'cellPatch', data: { before, after },
+                    timestamp: Date.now(), label: '编辑内容', anchorBefore: anchor, anchorAfter: anchor
+                });
             }
         }
         this._refreshBaseline();
@@ -1917,6 +2028,41 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 捕获当前「视图锚点」（活动单元格 + 选区）
+     *
+     * 撤销/重做必须把视口带回操作发生的那块区域：否则在百万行表里撤销第 8000 行
+     * 的修改，画面仍停在第 1 行，用户看到的是「什么都没发生」。
+     * 锚点刻意**不塞进**任何一种数据快照里，而是挂在 {@link UndoAction} 上 ——
+     * 三种快照类型（values / fullState / cellPatch / statePatch）由此共用同一套
+     * 捕获与回写逻辑，不必各自加字段。
+     * @returns {UndoAnchor} 当前视图锚点
+     */
+    private _captureAnchor(): UndoAnchor {
+        return { activedCell: this._activedCell, selection: this._selection };
+    }
+
+    /**
+     * 回写视图锚点并把选区卷进可视区
+     *
+     * 两步都不能省：
+     * 1. 恢复 `activedCell` / `selection` —— 走 setter，差量事件驱动工具栏同步；
+     * 2. {@link scrollCellIntoView} 到活动格 —— 只恢复选区不滚动的话，
+     *    百万行表里撤销后选择框仍在屏幕外，等于没恢复。
+     * 滚动目标取**活动格**而非选区左上角：活动格就是用户当时的落点，
+     * 且它必然落在选区内，滚到它即保证「选择框有一块在屏内」。
+     * @param {UndoAnchor | undefined} anchor - 待恢复的锚点；undefined（旧快照）时不动选区
+     * @returns {boolean} 是否发生了滚动
+     */
+    private _revealAnchor(anchor: UndoAnchor | undefined): boolean {
+        if (!anchor || !anchor.activedCell) return false;
+        this.activedCell = anchor.activedCell;
+        if (anchor.selection) this.selection = anchor.selection;
+        const { col, row } = this.getCellColAndRow(anchor.activedCell);
+        if (!isFinite(col) || !isFinite(row) || col < 1 || row < 1) return false;
+        return this.scrollCellIntoView(col, row);
+    }
+
+    /**
      * 捕获当前全量状态快照（values + 行/列表头 + 网格线 + 活动单元格 + 选区 + 筛选条件）
      * 所有字段均为深拷贝，与当前数据完全解耦。
      * @returns {FullStateSnapshot} 全量状态快照
@@ -2022,19 +2168,70 @@ export class DataCollection extends EventEmitter {
      * 时，**嵌套层不捕获任何快照**（其变更已包含在最外层快照的 after 中），
      * 整个复合操作折叠为一步撤销——同时也避免了对同一份数据重复深拷贝。
      *
-     * 大表语义（见 {@link LARGE_TABLE_UNDO_CELLS}）：操作前**或**操作后的表格超过阈值时
-     * 完全不捕获快照，该操作不入撤销栈（视为文档级操作）。
-     * 前后都要判断：装载第二个大文件时「操作前」就已经是大表，
+     * 大表语义（见 {@link LARGE_TABLE_UNDO_CELLS}）：整表快照这条路被关掉，改由
+     * `scope` 决定是否用**影响面补丁**记账（见 {@link StatePatchSnapshot}）：
+     * - `'auto'`（默认）：大表下完全不记账 —— 与历史行为一致，
+     *   用于影响面会溢出选区的操作（插入/删除整行整列会把下方/右侧所有格子重映射，
+     *   只还原选区那一块会留下自相矛盾的数据）。
+     * - `'selection'`：以**当前选区**为影响面记补丁，适用于「改的只有选区里的格子」
+     *   的操作（清除内容、设置格式、剪切…）。影响面超过
+     *   {@link LARGE_TABLE_PATCH_CELLS} 时放弃记账（退化为文档级操作），绝不硬扛。
+     * - `'headers'`：只记行/列表头 + 网格线 + 图片 + 筛选，不记格子 ——
+     *   适用于**根本不动 values** 的操作（隐藏/取消隐藏行列、调整行高列宽、切换网格线）。
+     * - `'paste'`：以**粘贴落点**为影响面（见 {@link getPasteTargetRect}）。
+     *   粘贴不能沿用 `'selection'`：用户常选中 1 格却粘贴一大块剪贴板，
+     *   影响面会溢出选区，只还原选区那一块会留下自相矛盾的数据。
+     * - `'shiftLeft'` / `'shiftUp'`：以**平移波及带**为影响面 ——
+     *   「删除并左移/上移」「插入并右移/下移」会把选区右侧/下方的可见内容
+     *   整体搬动（溢出端丢弃），只记选区那一块会留下自相矛盾的数据；
+     *   影响面取「选区起点 → 内容边界」的矩形（内容边界用 O(1) 的
+     *   {@link getContentBounds}，多记的格子前后相等、回写时是无害的空转），
+     *   超 {@link LARGE_TABLE_PATCH_CELLS} 时放弃记账。
+     * - `'filters'`：只记**挂着筛选按钮的格子**（稀疏，通常只有几列一个）+
+     *   行/列表头 + 筛选条件 —— 「清除筛选按钮」改的正是这三样
+     *   （cell.filter 标记、条件注册表、被筛选隐藏的行），格子影响面稀疏
+     *   且无法用矩形表达，故单独设档。
+     *
+     * 前后都要判断阈值：装载第二个大文件时「操作前」就已经是大表，
      * 只判「操作后」仍会在捕获 before 时白拷一份整表。
      * @param {string} label - 操作标签（用于调试与撤销展示）
      * @param {() => void} action - 实际的变更操作
+     * @param {'auto' | 'selection' | 'headers' | 'paste' | 'shiftLeft' | 'shiftUp' | 'filters'} [scope='auto'] - 大表下的记账策略（小表恒为整表快照）
+     * @param {{ startCol: number; endCol: number; startRow: number; endRow: number }} [rect] - 选区矩形（`'shiftLeft'`/`'shiftUp'` 档必填，其余档忽略）
      * @example
      * data.runWithFullStateUndo('删除行', () => data.deleteRows(2, 3));
+     * @example
+     * // 大表下也要能撤销「清除内容」：影响面就是选区
+     * data.runWithFullStateUndo('清除内容', () => data.clearContents(...), 'selection');
      */
-    public runWithFullStateUndo(label: string, action: () => void): void {
+    public runWithFullStateUndo(
+        label: string,
+        action: () => void,
+        scope: 'auto' | 'selection' | 'headers' | 'paste' | 'shiftLeft' | 'shiftUp' | 'filters' = 'auto',
+        rect?: { startCol: number; endCol: number; startRow: number; endRow: number }
+    ): void {
         const isOutermost = this._fullStateUndoDepth === 0;
+        const anchorBefore = isOutermost ? this._captureAnchor() : null;
+        // 大表下按 scope 决定「怎么记」；小表恒为整表快照
+        const sparse
+            = (isOutermost && !this._undoTrackingEnabled())
+                ? (scope === 'selection' ? this._selectionRectForPatch()
+                    : scope === 'paste' ? this._pasteRectForPatch()
+                        : scope === 'shiftLeft' ? this._shiftLeftRectForPatch(rect)
+                            : scope === 'shiftUp' ? this._shiftUpRectForPatch(rect)
+                                : null)
+                : null;
         // 仅最外层需要「变化前」快照；嵌套层复用外层的捕获结果
         const before = (isOutermost && this._undoTrackingEnabled()) ? this._captureFullState() : null;
+        // 'filters' 档：影响面是稀疏的筛选按钮格子（非矩形），单独捕获
+        const sparseCells = (isOutermost && !this._undoTrackingEnabled() && scope === 'filters')
+            ? this._captureFilterCellsPatch()
+            : undefined;
+        const sparseBefore = (isOutermost && !this._undoTrackingEnabled()
+            && (scope === 'selection' || scope === 'headers' || scope === 'paste'
+                || scope === 'shiftLeft' || scope === 'shiftUp' || scope === 'filters'))
+            ? this._captureStatePatch(sparse, scope === 'headers', sparseCells)
+            : null;
         const prevSuppress = this._suppressValuesUndo;
         this._suppressValuesUndo = true;
         this._fullStateUndoDepth++;
@@ -2051,14 +2248,277 @@ export class DataCollection extends EventEmitter {
             // 结构操作（insertRows/insertCols 等重命名）自己调了 invalidateCellIndex。
             // _pruneEmptyCells 删空格时也会调 invalidateCellIndex（改变了名集合）。
             this.markContentChanged();
-            // 仅最外层推入撤销记录；撤销/重做回写期间（_isApplyingUndo）不得入栈；
-            // 「变化后」超过阈值时同样跳过（如把空表装载成几十万格）
-            if (before !== null && this._undoTrackingEnabled() && !this._isApplyingUndo) {
-                const after = this._captureFullState();
-                if (!this._fullStateSnapshotsEqual(before, after)) {
-                    this.undoManager.push({ type: 'fullState', data: { before, after }, timestamp: Date.now(), label });
+            if (!this._isApplyingUndo) {
+                if (before !== null && this._undoTrackingEnabled()) {
+                    // 仅最外层推入撤销记录；撤销/重做回写期间（_isApplyingUndo）不得入栈；
+                    // 「变化后」超过阈值时同样跳过（如把空表装载成几十万格）
+                    const after = this._captureFullState();
+                    if (!this._fullStateSnapshotsEqual(before, after)) {
+                        this.undoManager.push({
+                            type: 'fullState', data: { before, after }, timestamp: Date.now(), label,
+                            anchorBefore: anchorBefore || undefined, anchorAfter: this._captureAnchor()
+                        });
+                    }
+                } else if (sparseBefore !== null) {
+                    const after = this._captureStatePatch(sparse, scope === 'headers');
+                    if (!this._statePatchSnapshotsEqual(sparseBefore, after)) {
+                        this.undoManager.push({
+                            type: 'statePatch', data: { before: sparseBefore, after }, timestamp: Date.now(), label,
+                            anchorBefore: anchorBefore || undefined, anchorAfter: this._captureAnchor()
+                        });
+                    }
                 }
             }
+        }
+    }
+
+    /**
+     * 求「按影响面记账」的捕获矩形（大表专用）
+     *
+     * 影响面取**当前选区**：右键菜单 / 工具栏的选区类操作改的正是这块。
+     * 选区无法解析（无选区）或面积超过 {@link LARGE_TABLE_PATCH_CELLS} 时返回 null，
+     * 调用方据此放弃记账 —— 宁可这一次不可撤销，也不能为它做一次整表深拷贝。
+     * @returns 捕获矩形；null = 放弃记账
+     * @private
+     */
+    private _selectionRectForPatch(): { startCol: number; endCol: number; startRow: number; endRow: number } | null {
+        return this._capPatchRect(this._selection ? this._parseRect(this._selection) : null);
+    }
+
+    /**
+     * 求「粘贴」的捕获矩形（大表专用）
+     *
+     * 取 {@link getPasteTargetRect} 的结果并套 {@link LARGE_TABLE_PATCH_CELLS} 上限。
+     * 剪贴板整块超限（复制了几十万格再粘贴）时放弃记账，退化为文档级操作。
+     * @returns 捕获矩形；null = 放弃记账
+     * @private
+     */
+    private _pasteRectForPatch(): { startCol: number; endCol: number; startRow: number; endRow: number } | null {
+        return this._capPatchRect(this.getPasteTargetRect());
+    }
+
+    /** 给影响面矩形套 {@link LARGE_TABLE_PATCH_CELLS} 上限；超限返回 null */
+    private _capPatchRect(
+        rect: { startCol: number; endCol: number; startRow: number; endRow: number } | null
+    ): { startCol: number; endCol: number; startRow: number; endRow: number } | null {
+        if (!rect) return null;
+        const area = (rect.endCol - rect.startCol + 1) * (rect.endRow - rect.startRow + 1);
+        if (area > DataCollection.LARGE_TABLE_PATCH_CELLS) return null;
+        return rect;
+    }
+
+    /**
+     * 求「水平平移」（删除并左移 / 插入并右移）的捕获矩形（大表专用）
+     *
+     * 这类操作把选区**右侧**的可见内容整体向左/向右搬动（溢出最右可见列的丢弃），
+     * 影响面 = 选区各行 × 从选区起始列到内容右边界。内容右边界取 O(1) 的
+     * {@link getContentBounds().maxCol} 与选区末列的较大者 —— 可能比逐行真边界宽
+     * （其它行内容更靠右时），多记的格子前后相等，回写时是无害的空转；
+     * 超 {@link LARGE_TABLE_PATCH_CELLS} 时放弃记账。
+     * @param sel - 选区矩形；缺失（无选区）时放弃记账
+     * @returns 捕获矩形；null = 放弃记账
+     * @private
+     */
+    private _shiftLeftRectForPatch(
+        sel?: { startCol: number; endCol: number; startRow: number; endRow: number }
+    ): { startCol: number; endCol: number; startRow: number; endRow: number } | null {
+        if (!sel) return null;
+        const maxCol = Math.max(sel.endCol, this.getContentBounds().maxCol);
+        return this._capPatchRect({
+            startCol: sel.startCol, endCol: maxCol, startRow: sel.startRow, endRow: sel.endRow
+        });
+    }
+
+    /**
+     * 求「垂直平移」（删除并上移 / 插入并下移）的捕获矩形（大表专用）
+     *
+     * 与 {@link _shiftLeftRectForPatch} 对称：操作把选区**下方**的可见内容整体
+     * 上/下搬动，影响面 = 选区各列 × 从选区起始行到内容下边界。
+     * @param sel - 选区矩形；缺失（无选区）时放弃记账
+     * @returns 捕获矩形；null = 放弃记账
+     * @private
+     */
+    private _shiftUpRectForPatch(
+        sel?: { startCol: number; endCol: number; startRow: number; endRow: number }
+    ): { startCol: number; endCol: number; startRow: number; endRow: number } | null {
+        if (!sel) return null;
+        const maxRow = Math.max(sel.endRow, this.getContentBounds().maxRow);
+        return this._capPatchRect({
+            startCol: sel.startCol, endCol: sel.endCol, startRow: sel.startRow, endRow: maxRow
+        });
+    }
+
+    /**
+     * 捕获「挂着筛选按钮」的格子补丁（'filters' 档，大表专用）
+     *
+     * 筛选按钮标记（`cell.filter`）散落在各列表头格上，无法用矩形表达；
+     * 数量 = 已设筛选的列数（通常个位数到几十个），逐个克隆的代价可忽略。
+     * 遍历整表 values 是 O(已用格数) —— 与「清除筛选按钮」操作自身的
+     * 遍历同量级，不构成额外瓶颈。
+     * @returns {CellPatchEntry[]} 筛选按钮格子的克隆补丁（可能为空数组）
+     * @private
+     */
+    private _captureFilterCellsPatch(): CellPatchEntry[] {
+        const out: CellPatchEntry[] = [];
+        for (const cell of this._values) {
+            if (cell.filter !== undefined) out.push({ cell: cell.cell, data: cell.clone() });
+        }
+        return out;
+    }
+
+    /**
+     * 求粘贴落点矩形（从活动单元格起、按剪贴板的可见行列数铺开）
+     *
+     * 与 {@link pasteSelection} 的落点算法同源（同样跳过隐藏行列、同样在表尾截断），
+     * 否则影响面算错就会出现「撤销只还原一半」。
+     * @returns 粘贴落点矩形；无剪贴板或活动格非法时为 null
+     */
+    public getPasteTargetRect(): { startCol: number; endCol: number; startRow: number; endRow: number } | null {
+        const clipboard = this.clipboardManager.getClipboard();
+        if (!clipboard) return null;
+        const { col: activedCol, row: activedRow } = this.getCellColAndRow(this.activedCell);
+        if (!isFinite(activedCol) || !isFinite(activedRow) || activedCol < 1 || activedRow < 1) return null;
+        // 纯文本剪贴板：只写活动格
+        if (clipboard.type !== 'cell' || !clipboard.cells || !clipboard.sourceRange) {
+            return { startCol: activedCol, endCol: activedCol, startRow: activedRow, endRow: activedRow };
+        }
+        const [start, end] = clipboard.sourceRange.split(':');
+        const { col: startCol, row: startRow } = this.getCellColAndRow(start);
+        const { col: endCol, row: endRow } = this.getCellColAndRow(end);
+        if (!isFinite(startCol) || !isFinite(endCol) || !isFinite(startRow) || !isFinite(endRow)) return null;
+        const colOffsets = clipboard.visibleColOffsets
+            ?? Array.from({ length: endCol - startCol + 1 }, (_, i) => i);
+        const rowOffsets = clipboard.visibleRowOffsets
+            ?? Array.from({ length: endRow - startRow + 1 }, (_, i) => i);
+        const targetColOffsets = this._collectVisibleOffsets(activedCol, Infinity, colOffsets.length, true);
+        const targetRowOffsets = this._collectVisibleOffsets(activedRow, Infinity, rowOffsets.length, false);
+        if (targetColOffsets.length === 0 || targetRowOffsets.length === 0) return null;
+        return {
+            startCol: activedCol,
+            endCol: activedCol + targetColOffsets[targetColOffsets.length - 1],
+            startRow: activedRow,
+            endRow: activedRow + targetRowOffsets[targetRowOffsets.length - 1],
+        };
+    }
+
+    /**
+     * 捕获稀疏状态快照（大表专用）
+     *
+     * 只遍历一次 `_values`（只读、不克隆不在影响面内的格子），
+     * 命中矩形者才 `clone()` —— 成本与**影响面格数**成正比，与整表大小几乎无关。
+     * 行/列表头、网格线、图片、筛选条件全量浅拷贝：一万多行表头也就几毫秒，
+     * 而它们是「隐藏行列 / 行高列宽」这类操作**唯一**会变的东西。
+     * @param rect - 影响面矩形；null 表示放弃格子记账（超上限）
+     * @param headersOnly - true = 连格子都不记（'headers' 档）
+     * @param presetCells - 预先捕获好的稀疏格子补丁（'filters' 档）；提供时优先于 rect 使用
+     * @returns {StatePatchSnapshot | null} 快照；rect 为 null 且非 headersOnly 且无 presetCells 时为 null
+     * @private
+     */
+    private _captureStatePatch(
+        rect: { startCol: number; endCol: number; startRow: number; endRow: number } | null,
+        headersOnly: boolean,
+        presetCells?: CellPatchEntry[]
+    ): StatePatchSnapshot | null {
+        if (!headersOnly && rect === null && presetCells === undefined) return null;
+        // 直接复用矩形版补丁捕获：它按**名字**逐格取，而不是遍历 _values 挑命中的 ——
+        // 后者拿不到「操作后被删掉的格子」（清除内容会先清空再被剪掉），
+        // 于是 after 侧会少一条记录，重做时无从删除，表现为「重做没反应」。
+        // 按名取则把「此刻不存在」记成 null，补丁能表达「存在 ↔ 不存在」两个方向。
+        const cells: CellPatchEntry[] = (presetCells !== undefined)
+            ? presetCells
+            : (!headersOnly && rect !== null)
+                ? this._captureCellPatch(rect.startCol, rect.endCol, rect.startRow, rect.endRow)
+                : [];
+        return {
+            cells,
+            rowHeaders: this.rowHeaders.rowHeaders.map(rh => ({ ...rh })),
+            colHeaders: this.colHeaders.colHeaders.map(ch => ({ ...ch })),
+            showGridLines: this._showGridLines,
+            images: this._images.slice(),
+            filters: this._serializeFilterConditions(),
+        };
+    }
+
+    /**
+     * 比较两份稀疏状态快照是否等价
+     * @private
+     */
+    private _statePatchSnapshotsEqual(a: StatePatchSnapshot, b: StatePatchSnapshot): boolean {
+        if (a === b) return true;
+        if (!this._cellPatchesEqual(a.cells, b.cells)) return false;
+        if (a.showGridLines !== b.showGridLines) return false;
+        if (!DataCollection._imagesEqual(a.images, b.images)) return false;
+        if (!DataCollection._headersEqual(a.rowHeaders, b.rowHeaders)) return false;
+        if (!DataCollection._headersEqual(a.colHeaders, b.colHeaders)) return false;
+        if (!DataCollection._filtersEqual(a.filters, b.filters)) return false;
+        return true;
+    }
+
+    /** 表头数组逐项浅比较（top/left/height/width/isHidden 等标量） */
+    private static _headersEqual(a: any[], b: any[]): boolean {
+        if (a === b) return true;
+        if (!a || !b || a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            const x = a[i];
+            const y = b[i];
+            if (x === y) continue;
+            const kx = Object.keys(x);
+            if (kx.length !== Object.keys(y).length) return false;
+            for (let k = 0; k < kx.length; k++) {
+                if (x[kx[k]] !== y[kx[k]]) return false;
+            }
+        }
+        return true;
+    }
+
+    /** 筛选条件列表比较 */
+    private static _filtersEqual(
+        a: Array<{ col: number; anchorRow: number; keep: string[] }> | undefined,
+        b: Array<{ col: number; anchorRow: number; keep: string[] }> | undefined
+    ): boolean {
+        if (a === b) return true;
+        const left = a ?? [];
+        const right = b ?? [];
+        if (left.length !== right.length) return false;
+        for (let i = 0; i < left.length; i++) {
+            if (left[i].col !== right[i].col || left[i].anchorRow !== right[i].anchorRow) return false;
+            if (left[i].keep.length !== right[i].keep.length) return false;
+            for (let k = 0; k < left[i].keep.length; k++) {
+                if (left[i].keep[k] !== right[i].keep[k]) return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 回写稀疏状态快照（撤销/重做恢复）
+     *
+     * 顺序刻意**先表头后格子**：行/列表头决定几何（top/left/隐藏），
+     * 格子补丁只按名字替换内容，二者互不依赖，但表头先就位可以让随后的
+     * 滚动定位与重绘拿到正确的坐标。
+     * @param {StatePatchSnapshot} snapshot - 待恢复的快照
+     * @private
+     */
+    private _applyStatePatchSnapshot(snapshot: StatePatchSnapshot): void {
+        this._isApplyingUndo = true;
+        try {
+            this.rowHeaders.rowHeaders = snapshot.rowHeaders.map(rh => ({ ...rh }));
+            this.rowHeaders.recalcAllRowHeight();
+            this.colHeaders.colHeaders = snapshot.colHeaders.map(ch => ({ ...ch }));
+            this.colHeaders.recalcAllColWidth();
+            this.showGridLines = snapshot.showGridLines;
+            this._restoreFilterConditions(snapshot.filters);
+            if (Array.isArray(snapshot.images)) {
+                this._images = snapshot.images.slice();
+                this._imagesDirty = true;
+            }
+            if (snapshot.cells.length > 0) {
+                this._applyCellPatch(snapshot.cells);
+            }
+            this._refreshBaseline();
+            this.emit(DataEvents.VALUES_CHANGED, this._values);
+        } finally {
+            this._isApplyingUndo = false;
         }
     }
 
@@ -2132,6 +2592,7 @@ export class DataCollection extends EventEmitter {
         action: () => void
     ): void {
         const { minCol, maxCol, minRow, maxRow } = rect;
+        const anchorBefore = this._captureAnchor();
         const before = this._captureCellPatch(minCol, maxCol, minRow, maxRow);
         const prevSuppress = this._suppressValuesUndo;
         this._suppressValuesUndo = true;
@@ -2146,13 +2607,82 @@ export class DataCollection extends EventEmitter {
             if (!this._isApplyingUndo) {
                 const after = this._captureCellPatch(minCol, maxCol, minRow, maxRow);
                 if (!this._cellPatchesEqual(before, after)) {
-                    this.undoManager.push({ type: 'cellPatch', data: { before, after }, timestamp: Date.now(), label });
+                    this.undoManager.push({
+                        type: 'cellPatch', data: { before, after }, timestamp: Date.now(), label,
+                        anchorBefore, anchorAfter: this._captureAnchor()
+                    });
                 }
             }
             // 包裹期间跳过了基准刷新，这里补一次，避免后续 commitValues 拿过期基准
             this._refreshBaseline();
             this.emit(DataEvents.VALUES_CHANGED, this._values);
         }
+    }
+
+    /**
+     * 以「一批指定单元格」为补丁单位执行一次可撤销操作
+     *
+     * 与 {@link runWithCellPatchUndo} 的关系：两者都是「局部补丁」，代价都与影响面
+     * 成正比、都不受 {@link LARGE_TABLE_UNDO_CELLS} 限制。区别在**影响面怎么表达**：
+     * - 矩形版按 `minCol..maxCol × minRow..maxRow` 逐格遍历，适合「影响面就是一块矩形」
+     *   的结构性操作（合并 / 取消合并），并且会把区域内**不存在**的格子也记成 `null`，
+     *   撤销时据此把操作中新增的格子删掉；
+     * - 本方法按给定数组逐个捕获，适合**稀疏**的影响面。查找替换正是如此：整表范围内
+     *   可能只有 3 处命中，矩形版却会为 10 万行 × 100 列每一格都克隆一份快照
+     *   （既是几百毫秒的卡顿，也是成百 MB 的撤销栈内存）。
+     * 替换只改写既有格子的 `chars`、不会新增格子，故不需要 `null` 项。
+     * @param {string} label - 操作标签
+     * @param {Cell[]} cells - 会被改动的单元格（`values` 里的活引用）
+     * @param {() => void} action - 实际的变更操作
+     */
+    public runWithCellsUndo(label: string, cells: Cell[], action: () => void): void {
+        const anchorBefore = this._captureAnchor();
+        const before = this._captureCellsPatch(cells);
+        const prevSuppress = this._suppressValuesUndo;
+        this._suppressValuesUndo = true;
+        this._cellPatchUndoDepth++;
+        try {
+            action();
+        } finally {
+            this._cellPatchUndoDepth--;
+            this._suppressValuesUndo = prevSuppress;
+            this._pruneEmptyCells();
+            this.markContentChanged();
+            if (!this._isApplyingUndo) {
+                const after = this._captureCellsPatch(cells);
+                if (!this._cellPatchesEqual(before, after)) {
+                    this.undoManager.push({
+                        type: 'cellPatch', data: { before, after }, timestamp: Date.now(), label,
+                        anchorBefore, anchorAfter: this._captureAnchor()
+                    });
+                }
+            }
+            // 与矩形版同理：包裹期间跳过了基准刷新，这里补一次
+            this._refreshBaseline();
+            this.emit(DataEvents.VALUES_CHANGED, this._values);
+        }
+    }
+
+    /**
+     * 按给定格子逐个捕获补丁（{@link runWithCellsUndo} 的「一半」）
+     *
+     * 顺序 = 入参数组顺序，因此 before / after 两次捕获必然同序（引用同一份数组），
+     * 满足 {@link _cellPatchesEqual} 的逐项比对前提。
+     * 刻意**不按矩形遍历**：命中是稀疏的，矩形遍历会为区域内每一格都克隆一份快照。
+     *
+     * `_pruneEmptyCells()` 可能把「被替换成空」的格子从 `values` 里摘掉，但本数组
+     * 持有的是对象引用，两次捕获读到的仍是同一个对象（内容为空）—— 于是 before/after
+     * 不等、记录入栈，撤销时由 `_applyCellPatch` 把这个不存在的格子补回 `values`。
+     * @param {Cell[]} cells - 待捕获的格子
+     * @returns {CellPatchEntry[]} 补丁
+     * @private
+     */
+    private _captureCellsPatch(cells: Cell[]): CellPatchEntry[] {
+        const out: CellPatchEntry[] = [];
+        for (let i = 0; i < cells.length; i++) {
+            out.push({ cell: cells[i].cell, data: cells[i].clone() });
+        }
+        return out;
     }
 
     /**
@@ -2210,35 +2740,274 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
-     * 开始一次跨事件的连续操作撤销捕获（如拖拽调整行高/列宽）
-     * 立即捕获全量状态快照作为「变化前」基准，并抑制 values setter 的自动快照记录，
-     * 直到调用 {@link endContinuousUndo} 提交。两次调用必须成对出现。
-     * 大表下返回 null（不捕获基准、不入栈），但仍保持抑制标记，
-     * 由 {@link endContinuousUndo} 在 finally 中恢复。
-     * @returns {FullStateSnapshot | null} 操作前全量状态快照；大表时为 null
+     * 以「结构命令」为单位执行一次可撤销操作（插入/删除整行整列，大表专用）
+     *
+     * 与 {@link runWithFullStateUndo} 的区别：插入/删除整行整列会把下方/右侧
+     * **所有**格子重命名，前后快照等价于两份整表深拷贝 —— 大表下这条路被
+     * {@link LARGE_TABLE_UNDO_CELLS} 阈值整体关掉，历史表现是「大表里插入/删除
+     * 行列后 Ctrl+Z 静默失效」。本方法改用**命令模式**（见 {@link StructuralSnapshot}）：
+     * 只记「操作参数 + 被删带数据」，代价与被删带内的格子数成正比、与整表无关。
+     *
+     * 正确性依赖撤销栈的严格 LIFO：撤销某条记录时，其后的操作都已被先撤销，
+     * 表格必然处于「该操作刚做完」的状态，逆操作因此是安全的。
+     *
+     * 记账上限：删除带内的格子克隆数超过 {@link LARGE_TABLE_PATCH_CELLS} 时
+     * 放弃记账（宁可这一次不可撤销，也不能为它扛一份巨型快照）；
+     * 操作实际未生效（行列数未变化）时同样不记。
+     * @param {string} label - 操作标签
+     * @param {'insertRows' | 'deleteRows' | 'insertCols' | 'deleteCols'} op - 操作类别
+     * @param {number} at - 插入位置 / 删除带起始行（列）号（1-based）
+     * @param {number} count - 插入 / 删除的数量（delete 时为**请求**数量，实际数量按表尾收敛后入账）
+     * @param {() => void} action - 实际的变更操作（内部调用 insertRows/deleteRows/...）
+     * @example
+     * data.runWithStructuralUndo('删除行', 'deleteRows', 5, 2, () => data.deleteRows(5, 6));
      */
-    public beginContinuousUndo(): FullStateSnapshot | null {
+    public runWithStructuralUndo(
+        label: string,
+        op: StructuralSnapshot['op'],
+        at: number,
+        count: number,
+        action: () => void
+    ): void {
+        const anchorBefore = this._captureAnchor();
+        // delete 类操作先捕获被删带数据（撤销时的逆操作需要它还原）；insert 无需捕获
+        const isDelete = op === 'deleteRows' || op === 'deleteCols';
+        const before = isDelete ? this._captureStructuralBefore(op, at, count) : null;
+        // 超上限放弃记账：快照仍要捕获表头/格子的情形只有 delete，insert 恒可记账
+        const record = (before === null) || (before.removedCells.length <= DataCollection.LARGE_TABLE_PATCH_CELLS);
+        const rowsLenBefore = this.rowHeaders.length;
+        const colsLenBefore = this.colHeaders.length;
+        const prevSuppress = this._suppressValuesUndo;
         this._suppressValuesUndo = true;
-        return this._undoTrackingEnabled() ? this._captureFullState() : null;
+        try {
+            action();
+        } finally {
+            this._suppressValuesUndo = prevSuppress;
+            this._pruneEmptyCells();
+            this.markContentChanged();
+            // 包裹期间跳过了基准刷新，这里补一次，避免后续 commitValues 拿过期基准
+            this._refreshBaseline();
+            if (!this._isApplyingUndo && record) {
+                // 操作未生效（行列数都没变）不记账，避免撤销时执行一次凭空的逆操作
+                const changed = this.rowHeaders.length !== rowsLenBefore || this.colHeaders.length !== colsLenBefore;
+                if (changed) {
+                    const snapshot: StructuralSnapshot = (before !== null)
+                        ? before
+                        : { op, at, count, removedCells: [], removedHeaders: [], shrunkMerges: [] };
+                    // 实际数量按表尾收敛（deleteRows/deleteCols 内部同款钳制），
+                    // 逆操作 deleteRows(at, at+count-1) 才能删准同一段
+                    if (op === 'deleteRows') snapshot.count = Math.max(0, Math.min(at + count - 1, rowsLenBefore) - at + 1);
+                    if (op === 'deleteCols') snapshot.count = Math.max(0, Math.min(at + count - 1, colsLenBefore) - at + 1);
+                    this.undoManager.push({
+                        type: 'structural', data: snapshot, timestamp: Date.now(), label,
+                        anchorBefore, anchorAfter: this._captureAnchor()
+                    });
+                }
+            }
+        }
+    }
+
+    /**
+     * 捕获「删除整行/整列」的逆操作所需数据（{@link runWithStructuralUndo} 的记账一半）
+     *
+     * 遍历一次 values（O(已用格数)，与 deleteRows 自身的遍历同量级）：
+     * - 落在删除带内的格子 → 克隆入 removedCells（名字为删除前的名字）；
+     * - 锚点在删除带上方/左侧、跨距末端伸进删除带的合并 → 原始跨距入 shrunkMerges
+     *   （删除会按重叠数收缩它们，重叠数可能小于 count，撤销时的结构插回
+     *   只能按 count 还原「整段跨越」的合并，端点落在带内的必须靠这份记录）。
+     * 表头按删除带切片（含自定义行高列宽与隐藏标记）。
+     * @param op - 'deleteRows' | 'deleteCols'
+     * @param at - 删除带起始行/列号（1-based）
+     * @param count - 请求删除的数量
+     * @returns {StructuralSnapshot} 快照（count 已按表尾收敛；带为空时 removed* 为空数组）
+     * @private
+     */
+    private _captureStructuralBefore(op: 'deleteRows' | 'deleteCols', at: number, count: number): StructuralSnapshot {
+        const snapshot: StructuralSnapshot = { op, at, count, removedCells: [], removedHeaders: [], shrunkMerges: [] };
+        const removedCells: CellPatchEntry[] = [];
+        const shrunkMerges: Array<{ cell: string; rowspan?: number; colspan?: number }> = [];
+        if (op === 'deleteRows') {
+            const clampedEnd = Math.min(at + count - 1, this.rowHeaders.length);
+            snapshot.count = Math.max(0, clampedEnd - at + 1);
+            for (const cell of this._values) {
+                const { col, row } = this.getCellColAndRow(cell.cell);
+                if (row >= at && row <= clampedEnd) {
+                    removedCells.push({ cell: cell.cell, data: cell.clone() });
+                } else if (cell.rowspan && cell.rowspan > 1 && row < at && row + cell.rowspan - 1 >= at) {
+                    shrunkMerges.push({ cell: cell.cell, rowspan: cell.rowspan });
+                }
+            }
+            snapshot.removedHeaders = this.rowHeaders.rowHeaders.slice(at - 1, clampedEnd);
+        } else {
+            const clampedEnd = Math.min(at + count - 1, this.colHeaders.length);
+            snapshot.count = Math.max(0, clampedEnd - at + 1);
+            for (const cell of this._values) {
+                const { col, row } = this.getCellColAndRow(cell.cell);
+                if (col >= at && col <= clampedEnd) {
+                    removedCells.push({ cell: cell.cell, data: cell.clone() });
+                } else if (cell.colspan && cell.colspan > 1 && col < at && col + cell.colspan - 1 >= at) {
+                    shrunkMerges.push({ cell: cell.cell, colspan: cell.colspan });
+                }
+            }
+            snapshot.removedHeaders = this.colHeaders.colHeaders.slice(at - 1, clampedEnd);
+        }
+        snapshot.removedCells = removedCells;
+        snapshot.shrunkMerges = shrunkMerges;
+        return snapshot;
+    }
+
+    /**
+     * 回写结构性操作（撤销/重做恢复）
+     *
+     * 撤销 = 逆操作：insert → 删掉刚插入的那段；delete → 结构上插回 + 还原被删数据。
+     * 重做 = 原操作重放：参数即可，无需任何快照数据。
+     * @param {StructuralSnapshot} snap - 结构快照
+     * @param {boolean} isUndo - true = 撤销（执行逆操作）；false = 重做（重放原操作）
+     * @private
+     */
+    private _applyStructuralOp(snap: StructuralSnapshot, isUndo: boolean): void {
+        this._isApplyingUndo = true;
+        try {
+            if (snap.op === 'insertRows') {
+                if (isUndo) this.deleteRows(snap.at, snap.at + snap.count - 1);
+                else this.insertRows(snap.at, snap.count);
+            } else if (snap.op === 'deleteRows') {
+                if (isUndo) this._restoreDeletedRows(snap);
+                else this.deleteRows(snap.at, snap.at + snap.count - 1);
+            } else if (snap.op === 'insertCols') {
+                if (isUndo) this.deleteCols(snap.at, snap.at + snap.count - 1);
+                else this.insertCols(snap.at, snap.count);
+            } else {
+                if (isUndo) this._restoreDeletedCols(snap);
+                else this.deleteCols(snap.at, snap.at + snap.count - 1);
+            }
+            this._refreshBaseline();
+        } finally {
+            this._isApplyingUndo = false;
+        }
+    }
+
+    /**
+     * 还原被删除的行（deleteRows 的逆操作）
+     *
+     * 顺序刻意为「先结构、再表头、再格子、最后合并跨距」：
+     * 1. {@link insertRows} 把下方格子整体移回原位、按 count 扩展整段跨越的合并
+     *    （端点落在删除带内部的合并由第 4 步兜底）；
+     * 2. 被删行的表头（自定义行高/隐藏标记） splice 回原位 —— insertRows 塞的是
+     *    默认表头，直接整体替换掉这 count 个；
+     * 3. 被删格子按删除前的名字克隆回填 —— 此时那些位置已被第 1 步清空，无名字冲突；
+     * 4. shrunkMerges 里记录的合并锚点按**原始跨距**赋回（赋值语义，天然幂等，
+     *    与第 1 步对「整段跨越」合并的扩展不冲突）。
+     * @param {StructuralSnapshot} snap - 结构快照（op 必为 'deleteRows'）
+     * @private
+     */
+    private _restoreDeletedRows(snap: StructuralSnapshot): void {
+        // 1) 结构插回：下方格子下移归位 + 整段跨越的合并扩展 rowspan
+        this.insertRows(snap.at, snap.count);
+        // 2) 表头还原：整体替换 insertRows 塞入的默认表头（克隆入栈，快照保持只读）
+        if (snap.removedHeaders.length > 0) {
+            this.rowHeaders.rowHeaders.splice(
+                snap.at - 1, snap.count, ...snap.removedHeaders.map(rh => ({ ...rh })));
+            this.rowHeaders.recalcRowPositions();
+        }
+        // 3) 格子还原：按删除前的名字回填（此刻位置为空，push 即插入）
+        if (snap.removedCells.length > 0) {
+            for (const e of snap.removedCells) {
+                if (e.data) this._values.push((e.data as Cell).clone());
+            }
+            this.invalidateCellIndex();
+        }
+        // 4) 跨距还原：端点落在删除带内的合并无法由第 1 步还原，按原始值赋回
+        for (const m of snap.shrunkMerges) {
+            const anchor = this.getCellByName(m.cell);
+            if (!anchor) continue;
+            if (m.rowspan !== undefined) anchor.rowspan = m.rowspan;
+            if (m.colspan !== undefined) anchor.colspan = m.colspan;
+        }
+    }
+
+    /**
+     * 还原被删除的列（deleteCols 的逆操作）
+     *
+     * 与 {@link _restoreDeletedRows} 完全对称，仅轴向不同。
+     * @param {StructuralSnapshot} snap - 结构快照（op 必为 'deleteCols'）
+     * @private
+     */
+    private _restoreDeletedCols(snap: StructuralSnapshot): void {
+        this.insertCols(snap.at, snap.count);
+        if (snap.removedHeaders.length > 0) {
+            this.colHeaders.colHeaders.splice(
+                snap.at - 1, snap.count, ...snap.removedHeaders.map(ch => ({ ...ch })));
+            this.colHeaders.recalcColPositions();
+        }
+        if (snap.removedCells.length > 0) {
+            for (const e of snap.removedCells) {
+                if (e.data) this._values.push((e.data as Cell).clone());
+            }
+            this.invalidateCellIndex();
+        }
+        for (const m of snap.shrunkMerges) {
+            const anchor = this.getCellByName(m.cell);
+            if (!anchor) continue;
+            if (m.rowspan !== undefined) anchor.rowspan = m.rowspan;
+            if (m.colspan !== undefined) anchor.colspan = m.colspan;
+        }
+    }
+
+    /**
+     * 开始一次跨事件的连续操作撤销捕获（如拖拽调整行高/列宽）
+     * 立即捕获「变化前」基准，并抑制 values setter 的自动快照记录，
+     * 直到调用 {@link endContinuousUndo} 提交。两次调用必须成对出现。
+     *
+     * 基准按表规模分档：
+     * - 小表：整表全量快照（{@link FullStateSnapshot}）；
+     * - 大表：'headers' 档稀疏快照（{@link StatePatchSnapshot}）—— 只浅拷贝
+     *   行/列表头与标量状态、不克隆任何格子。拖拽行高列宽只改表头，
+     *   一万多行表头的浅拷贝仅几毫秒，使大表下拖拽调宽高同样可以撤销。
+     * @returns {ContinuousUndoSnapshot} 操作前基准快照（含档位标记）
+     */
+    public beginContinuousUndo(): ContinuousUndoSnapshot {
+        this._suppressValuesUndo = true;
+        if (this._undoTrackingEnabled()) {
+            return { kind: 'full', snapshot: this._captureFullState() };
+        }
+        return { kind: 'patch', snapshot: this._captureStatePatch(null, true) as StatePatchSnapshot };
     }
 
     /**
      * 结束连续操作并提交撤销记录
-     * 捕获当前全量状态为「变化后」快照，与 before 不同时推入 undoManager（type: 'fullState'），
+     * 按 {@link beginContinuousUndo} 捕获时的同档基准捕获「变化后」快照，
+     * 前后不同时推入 undoManager（小表 'fullState' / 大表 'statePatch'），
      * 并恢复 values setter 的自动记录。整个拖拽手势折叠为一条撤销记录。
      *
-     * `before` 为 null（大表 / 调用方未持有基准）时也必须走完 finally 恢复抑制标记：
-     * 早期实现在 try 之外提前 return，会让 `_suppressValuesUndo` 永久停在 true，
-     * 此后所有变更都不再记账 —— 故此处刻意把早退放进 try 内。
-     * @param {FullStateSnapshot | null} before - {@link beginContinuousUndo} 返回的快照；为 null 时仅恢复抑制标记
+     * 抑制标记必须在 finally 中无条件恢复：早期实现在 try 之外提前 return，
+     * 会让 `_suppressValuesUndo` 永久停在 true，此后所有变更都不再记账。
+     * @param {ContinuousUndoSnapshot} before - {@link beginContinuousUndo} 返回的基准快照
      * @param {string} label - 操作标签
      */
-    public endContinuousUndo(before: FullStateSnapshot | null, label: string): void {
+    public endContinuousUndo(before: ContinuousUndoSnapshot, label: string): void {
         try {
-            if (!before || !this._undoTrackingEnabled()) return;
-            const after = this._captureFullState();
-            if (!this._fullStateSnapshotsEqual(before, after)) {
-                this.undoManager.push({ type: 'fullState', data: { before, after }, timestamp: Date.now(), label });
+            if (before.kind === 'full') {
+                // 防御：拖拽期间表规模不应变化；若已切到大表则放弃，避免整表深拷贝
+                if (!this._undoTrackingEnabled()) return;
+                const after = this._captureFullState();
+                if (!this._fullStateSnapshotsEqual(before.snapshot, after)) {
+                    const anchor = this._captureAnchor();
+                    this.undoManager.push({
+                        type: 'fullState', data: { before: before.snapshot, after }, timestamp: Date.now(), label,
+                        anchorBefore: anchor, anchorAfter: anchor
+                    });
+                }
+            } else {
+                if (this._undoTrackingEnabled()) return;
+                const after = this._captureStatePatch(null, true) as StatePatchSnapshot;
+                if (!this._statePatchSnapshotsEqual(before.snapshot, after)) {
+                    const anchor = this._captureAnchor();
+                    this.undoManager.push({
+                        type: 'statePatch', data: { before: before.snapshot, after }, timestamp: Date.now(), label,
+                        anchorBefore: anchor, anchorAfter: anchor
+                    });
+                }
             }
         } finally {
             this._suppressValuesUndo = false;
@@ -2303,9 +3072,29 @@ export class DataCollection extends EventEmitter {
                 ? (action.data as { before: CellPatchEntry[]; after: CellPatchEntry[] }).before
                 : (action.data as { before: CellPatchEntry[]; after: CellPatchEntry[] }).after;
             this._applyCellPatchAndBroadcast(patch);
+        } else if (action.type === 'statePatch' && action.data) {
+            const snapshot = isUndo
+                ? (action.data as { before: StatePatchSnapshot; after: StatePatchSnapshot }).before
+                : (action.data as { before: StatePatchSnapshot; after: StatePatchSnapshot }).after;
+            this._applyStatePatchSnapshot(snapshot);
+        } else if (action.type === 'structural' && action.data) {
+            // 结构撤销（插入/删除整行整列）：data 是单份命令快照（非 before/after 对），
+            // 撤销 = 逆操作，重做 = 再执行一遍原操作
+            this._applyStructuralOp(action.data as StructuralSnapshot, isUndo);
+        } else if (action.type === 'sortPermutation' && action.data) {
+            // 排序撤销：data 是排列命令（非状态快照），撤销 = 逆置换，重做 = 原置换
+            this._applySortPermutation(action.data as SortPermutationSnapshot, isUndo);
         } else {
             return;
         }
+        // 撤销/重做后把视口带回操作发生的区域：
+        // 只还原数据不动选区的话，百万行表里撤销第 8000 行的修改后画面仍停在第 1 行，
+        // 用户看到的是「什么都没发生」。这里统一恢复锚点并卷进可视区，
+        // 随后补一次 VALUES_CHANGED —— 滚动偏移是在数据回写**之后**才变的，
+        // 光靠回写时那次广播画不到新位置。
+        const anchor = isUndo ? action.anchorBefore : action.anchorAfter;
+        this._revealAnchor(anchor);
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
         // 回写完成后广播快照恢复事件：activedCell/selection 与当前值相同时
         // updateProperty 不会发出差量事件（ACTIVED_CELL_CHANGED 等），
         // 依赖差量事件刷新外观的工具栏分区需监听本事件同步按钮状态
@@ -2511,9 +3300,19 @@ export class DataCollection extends EventEmitter {
      * 返回第一个可见列/行。
      * @param {number} _x - 鼠标X坐标（从0开始）
      * @param {number} _y - 鼠标Y坐标（从0开始）
+     * @param {Object} [options] - 命中选项
+     * @param {boolean} [options.rawGeometry=false] - 为 true 时返回**纯几何**命中结果：
+     * 跳过锚点覆盖（IN_ANCHOR）与合并单元格锚点吸附。行/列头拖选进行中使用
+     * （起点 startLocation 为 IN_ROW_HEADER / IN_COL_HEADER）：从行头向下拖入
+     * 内容区时，首列的纵向合并（如 A1:A3）会把经过行的行号吸附到合并锚点，
+     * 导致整行选区端点被错误锚定；列头横向拖选同理。行/列头选区恒为
+     * expandMerges=false（见 setSelection / setSelectedRange 的说明），
+     * 命中端也必须使用未经合并归一化的原始行列号，两端语义才一致。
+     * 无合并单元格时该选项为幂等 no-op，不改变普通点击/拖选行为。
      * @returns {{ location: MouseLocation, col: number, row: number }} 包含鼠标位置、列号和行号的对象
      */
-    public getSheetCell(_x: number, _y: number): {location: MouseLocation, col: number, row: number} {
+    public getSheetCell(_x: number, _y: number, options?: { rawGeometry?: boolean }): {location: MouseLocation, col: number, row: number} {
+        const rawGeometry = options?.rawGeometry === true;
         let location = MouseLocation.IN_CELL;
         let col = 1;
         let row = 1;
@@ -2580,27 +3379,32 @@ export class DataCollection extends EventEmitter {
             row = firstVisibleRow;
         }
             
-        // 锚点覆盖：若锚点自身隐藏则跳过
-        const anchor = this.getAnchorRect();
-        if (x >= anchor.left && x <= (anchor.left + anchor.width) 
-            && y >= anchor.top && y <= (anchor.top + anchor.height)) {
-            const anchorColHidden = this.isColHidden(anchor.col - 1);
-            const anchorRowHidden = this.isRowHidden(anchor.row - 1);
-            if (!anchorColHidden && !anchorRowHidden) {
-                location = MouseLocation.IN_ANCHOR;
-                col = anchor.col;
-                row = anchor.row;
+        // 锚点覆盖：若锚点自身隐藏则跳过（行/列头拖选进行中要求纯几何命中，一并跳过）
+        if (!rawGeometry) {
+            const anchor = this.getAnchorRect();
+            if (x >= anchor.left && x <= (anchor.left + anchor.width) 
+                && y >= anchor.top && y <= (anchor.top + anchor.height)) {
+                const anchorColHidden = this.isColHidden(anchor.col - 1);
+                const anchorRowHidden = this.isRowHidden(anchor.row - 1);
+                if (!anchorColHidden && !anchorRowHidden) {
+                    location = MouseLocation.IN_ANCHOR;
+                    col = anchor.col;
+                    row = anchor.row;
+                }
             }
         }
 
-        // 合并单元格覆盖：若合并后的目标单元格隐藏则跳过
-        const { col: mergedCol, row: mergedRow } = this.getMergeColAndRow(this.getCellName(col, row));
-        if (mergedCol !== col || mergedRow !== row) {
-            const mergedColHidden = this.isColHidden(mergedCol - 1);
-            const mergedRowHidden = this.isRowHidden(mergedRow - 1);
-            if (!mergedColHidden && !mergedRowHidden) {
-                col = mergedCol;
-                row = mergedRow;
+        // 合并单元格覆盖：若合并后的目标单元格隐藏则跳过（rawGeometry 下行/列头拖选
+        // 不允许吸附到合并锚点，否则整行/整列选区端点会被合并块拖偏）
+        if (!rawGeometry) {
+            const { col: mergedCol, row: mergedRow } = this.getMergeColAndRow(this.getCellName(col, row));
+            if (mergedCol !== col || mergedRow !== row) {
+                const mergedColHidden = this.isColHidden(mergedCol - 1);
+                const mergedRowHidden = this.isRowHidden(mergedRow - 1);
+                if (!mergedColHidden && !mergedRowHidden) {
+                    col = mergedCol;
+                    row = mergedRow;
+                }
             }
         }
         
@@ -3051,9 +3855,10 @@ export class DataCollection extends EventEmitter {
             return true;
         }
         if (startCell === endCell) {
-            if (mergedCells.find(v => v.includes(startCell))) {
-                return true;
-            }
+            // 几何判定（勿用字符串 includes，见 getMergedRangeAt 的说明）：
+            // 该格被某个合并区域覆盖（不管它是锚点还是内部的被覆盖格）即算合并
+            const { col, row } = this.getCellColAndRow(startCell);
+            if (this.findMergeRect(col, row) !== null) return true;
             const cell = this.getCellByName(startCell);
             if (cell) {
                 return cell.colspan > 1 || cell.rowspan > 1;
@@ -3183,7 +3988,6 @@ export class DataCollection extends EventEmitter {
      */
     public unmergeCells(): void {
         if (!this.selection) return;
-        const mergedCells = this.getMergedCells();
         const [startCell] = this.selection.split(':');
         const cell = this.getCellByName(startCell);
         
@@ -3192,15 +3996,14 @@ export class DataCollection extends EventEmitter {
         let topLeftRow = this.getCellColAndRow(startCell).row;
         
         if (cell?.colspan === 0 && cell?.rowspan === 0) {
-            for (const mergedGroup of mergedCells) {
-                if (mergedGroup.includes(startCell)) {
-                    const topLeftCellName = mergedGroup.split(':')[0];
-                    const topLeftPos = this.getCellColAndRow(topLeftCellName);
-                    topLeftCol = topLeftPos.col;
-                    topLeftRow = topLeftPos.row;
-                    topLeftCell = this.getCellByName(topLeftCellName) || null;
-                    break;
-                }
+            // 锚点被合并吞掉（colspan/rowspan 归零）时，原点位置已无合并信息，
+            // 只能回查合并表；同样必须按**行列号数值矩形**判定（见 getMergedRangeAt）
+            const { col, row } = this.getCellColAndRow(startCell);
+            const rect = this.findMergeRect(col, row);
+            if (rect !== null) {
+                topLeftCol = rect.startCol;
+                topLeftRow = rect.startRow;
+                topLeftCell = this.getCellByName(rect.anchor) || null;
             }
         } else if (cell && (cell.colspan > 1 || cell.rowspan > 1)) {
             topLeftCell = cell;
@@ -3495,6 +4298,62 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 取覆盖指定位置的合并区域**选区串**（如 `'B22:D24'`）；不在任何合并区域内时 `null`
+     *
+     * 【勿写成 `mergedCells.find(v => v.includes(name))`】—— 那是**字符串包含**而非几何判定：
+     * `('B22:D24').includes('B2') === true`（`B22` 里就含 `B2`）、
+     * `('B22:D24').includes('D2') === true`（`D24` 里就含 `D2`）。
+     * 于是点第 2 行的 B2 / D2 会命中二十行开外毫不相关的合并块，选中框当场跑到
+     * B22；反过来点合并块内部的 B23 却因为 `'B22:D24'.includes('B23') === false`
+     * 而选不中。必须按行列号做**数值矩形**判定（走 {@link findMergeRect} 倒排索引）。
+     * @param {number} col - 列号（1-based）
+     * @param {number} row - 行号（1-based）
+     * @returns {string | null} 覆盖该位置的合并区域选区串；不在任何合并区域内时 null
+     */
+    public getMergedRangeAt(col: number, row: number): string | null {
+        const rect = this.findMergeRect(col, row);
+        if (rect === null) return null;
+        return `${rect.anchor}:${this.getColName(rect.endCol)}${rect.endRow}`;
+    }
+
+    /**
+     * 求行/列头点击后**活动格**应落的位置（**跳过合并单元格**）
+     *
+     * 行头点击恒取第 1 列、列头点击恒取第 1 行，而第 1 行 / 第 1 列恰恰最常被整行整列合并
+     * （表头横幅 `A1:D1`、首列纵向分组 `A5:A8`）。活动格一旦落进合并区会同时坏两件事：
+     * - `getActivedRect()` 走**合并锚点语义**（`calculateCellRect`），在选中框上挖的透明洞
+     *   会变成整个合并块那么大 —— 整行/整列的高亮被挖掉一大片，就是「选择框出问题」；
+     * - 若活动格是被合并**覆盖**的格子（colspan/rowspan 归零），编辑光标、填充柄都无处安放。
+     *
+     * 故沿所点的那一行（那一列）**向后**找第一个「既不在任何合并区内、又未被隐藏」的位置。
+     * 跳过隐藏行列是同一道理：活动格落在隐藏行列上时用户根本看不见它。
+     * 整行/整列都被合并或隐藏时退回原位置 —— 活动格总得有个落点，
+     * 且选区本身不受影响（选区仍按 `expandMerges=false` 精确地等于所点的整行/整列）。
+     * @param {number} col - 点击处的列号（1-based；行头点击时恒为 1）
+     * @param {number} row - 点击处的行号（1-based；列头点击时恒为 1）
+     * @param {'row' | 'col'} axis - 'row' = 点了行头（沿该行横向找）；'col' = 点了列头（沿该列纵向找）
+     * @returns {string} 活动格名称
+     */
+    public resolveHeaderActiveCell(col: number, row: number, axis: 'row' | 'col'): string {
+        if (axis === 'row') {
+            const last = this.colHeaders.length;
+            for (let c = col; c <= last; c++) {
+                if (this.isColHidden(c - 1)) continue;
+                if (this.findMergeRect(c, row) !== null) continue;
+                return this.getCellName(c, row);
+            }
+        } else {
+            const last = this.rowHeaders.length;
+            for (let r = row; r <= last; r++) {
+                if (this.isRowHidden(r - 1)) continue;
+                if (this.findMergeRect(col, r) !== null) continue;
+                return this.getCellName(col, r);
+            }
+        }
+        return this.getCellName(col, row);
+    }
+
+    /**
      * 取出与给定视口矩形相交的合并区域（供按视口绘制合并背景使用）
      *
      * 走列倒排索引：只遍历**可见列**上挂着的合并块，复杂度
@@ -3667,26 +4526,41 @@ export class DataCollection extends EventEmitter {
 
     /**
      * 设置选中的单元格范围
+     *
+     * ## 合并归一化（`expandMerges`）
+     * 默认会把选区**向外扩张到完整包含**所有与之相交的合并区域，维持
+     * 「选区永不半覆盖合并区域」这一不变式 —— 单元格点击与单元格拖选需要它
+     * （否则选区端点落在合并区内部时，用户看到的高亮与「实际作用范围」是两回事）。
+     *
+     * 行头 / 列头点击是刻意的例外：用户点第 5 行的行头，要的就是「第 5 行这一整行」，
+     * 这一行中间有没有纵向合并（如 A5:A8）与他的意图无关。若照旧扩张，选中的会变成
+     * 第 5~8 行 —— 「查找范围」「复制的内容」「删除行」会全部跟着错一整块。
+     * 故这两个入口显式传 `expandMerges = false`。
+     * （高亮的正确性不依赖归一化：{@link getSelectedRect} 只用网格矩形取端点，
+     * 不按合并锚点展开，见那里的说明。）
      * @param {number} startCol - 起始列索引
      * @param {number} startRow - 起始行索引
      * @param {number} endCol - 结束列索引
      * @param {number} endRow - 结束行索引
+     * @param {boolean} [expandMerges=true] - 是否把选区扩张到完整包含相交的合并区域
      */
-    public setSelectedRange(startCol: number, startRow: number, endCol: number, endRow: number) {
+    public setSelectedRange(startCol: number, startRow: number, endCol: number, endRow: number, expandMerges: boolean = true) {
         let maxCol = Math.max(startCol, endCol);
         let minCol = Math.min(startCol, endCol);
         let maxRow = Math.max(startRow, endRow);
         let minRow = Math.min(startRow, endRow);
-        const mergeRects = this.getMergeRects();
-        for (let i = 0; i < mergeRects.length; i++) {
-            const rect = mergeRects[i];
-            // 矩形相交即说明合并区域落在选区内（数值比较，不再逐格试探）
-            if (rect.endCol < minCol || rect.startCol > maxCol) continue;
-            if (rect.endRow < minRow || rect.startRow > maxRow) continue;
-            if (rect.startCol < minCol) minCol = rect.startCol;
-            if (rect.startRow < minRow) minRow = rect.startRow;
-            if (rect.endCol > maxCol) maxCol = rect.endCol;
-            if (rect.endRow > maxRow) maxRow = rect.endRow;
+        if (expandMerges) {
+            const mergeRects = this.getMergeRects();
+            for (let i = 0; i < mergeRects.length; i++) {
+                const rect = mergeRects[i];
+                // 矩形相交即说明合并区域落在选区内（数值比较，不再逐格试探）
+                if (rect.endCol < minCol || rect.startCol > maxCol) continue;
+                if (rect.endRow < minRow || rect.startRow > maxRow) continue;
+                if (rect.startCol < minCol) minCol = rect.startCol;
+                if (rect.startRow < minRow) minRow = rect.startRow;
+                if (rect.endCol > maxCol) maxCol = rect.endCol;
+                if (rect.endRow > maxRow) maxRow = rect.endRow;
+            }
         }
         if (this.startLocation !== MouseLocation.IN_ANCHOR) {
             this.selection = `${this.getColName(minCol)}${minRow}:${this.getColName(maxCol)}${maxRow}`;
@@ -3696,33 +4570,41 @@ export class DataCollection extends EventEmitter {
 
     /**
      * 设置选中的单元格
+     *
+     * 起点在行头 / 列头上时（点击或拖选），产出的是**整行 / 整列选区**，与
+     * {@link setSelectedRange} 的 `expandMerges` 说明一致：按行列号本身取，
+     * 不按合并区域向外扩张（`false`）—— 用户点第 5 行头要的是第 5 行整行，
+     * 不会被该行中间的合并块拖成第 5~8 行。
      * @param {string} location - 选中的单元格名称
      * @param {number} col - 单元格的列索引
      * @param {number} row - 单元格的行索引
      */
     public setSelection(location: string, col: number, row: number) {
         const { col: startCol, row: startRow } = this.getCellColAndRow(this.activedCell);
+        // 起点在行头 / 列头 → 本次拖选产出整行 / 整列选区：不按合并区域扩张
+        const inColHeader = this.startLocation === MouseLocation.IN_COL_HEADER;
+        const inRowHeader = this.startLocation === MouseLocation.IN_ROW_HEADER;
         if (location.includes('inCol')) {
-            if (this.startLocation === MouseLocation.IN_COL_HEADER) {
-                this.setSelectedRange(startCol, 1, col, this.rowHeaders.length);
-            } else if (this.startLocation === MouseLocation.IN_ROW_HEADER) {
-                this.setSelectedRange(1, startRow, this.colHeaders.length, 1);
+            if (inColHeader) {
+                this.setSelectedRange(startCol, 1, col, this.rowHeaders.length, false);
+            } else if (inRowHeader) {
+                this.setSelectedRange(1, startRow, this.colHeaders.length, 1, false);
             } else {
                 this.setSelectedRange(startCol, startRow, col, 1);
             }
         } else if (location.includes('inRow')) {
-            if (this.startLocation === MouseLocation.IN_COL_HEADER) {
-                this.setSelectedRange(startCol, 1, 1, this.rowHeaders.length);
-            } else if (this.startLocation === MouseLocation.IN_ROW_HEADER) {
-                this.setSelectedRange(1, startRow, this.colHeaders.length, row);
+            if (inColHeader) {
+                this.setSelectedRange(startCol, 1, 1, this.rowHeaders.length, false);
+            } else if (inRowHeader) {
+                this.setSelectedRange(1, startRow, this.colHeaders.length, row, false);
             } else {
                 this.setSelectedRange(startCol, startRow, 1, row);
             }
         } else {
-            if (this.startLocation === MouseLocation.IN_COL_HEADER) {
-                this.setSelectedRange(startCol, 1, col, this.rowHeaders.length);
-            } else if (this.startLocation === MouseLocation.IN_ROW_HEADER) {
-                this.setSelectedRange(1, startRow, this.colHeaders.length, row);
+            if (inColHeader) {
+                this.setSelectedRange(startCol, 1, col, this.rowHeaders.length, false);
+            } else if (inRowHeader) {
+                this.setSelectedRange(1, startRow, this.colHeaders.length, row, false);
             } else {
                 this.setSelectedRange(startCol, startRow, col, row);
             }
@@ -4346,48 +5228,65 @@ export class DataCollection extends EventEmitter {
     
     /**
      * 设置选中单元格的字体
+     *
+     * 撤销/重做：非编辑态下整体经 {@link runWithFullStateUndo}（'selection' 档）包裹 ——
+     * 工具栏（字体/字号/粗斜体/下划线/删除线/颜色/对齐/换行/底色）在小表走整表快照、
+     * 大表只按当前选区捕获稀疏格子补丁（影响面超 {@link LARGE_TABLE_PATCH_CELLS}
+     * 时自动放弃记账），与右键菜单的选区类操作记账口径完全一致。
+     * 编辑态（仅可能由活动格 cell.isEdit 分支进入）**裸执行**：字符级/单格撤销走
+     * 独立的编辑内撤销栈，绝不能被全量/补丁记账包裹，否则会污染编辑栈
+     * （工具栏在编辑态本就改调 {@link setSelectedCharsFont}，这里仅为防御）。
      * @param fontStyle 字体样式
      */
     public setSelectedCellsFont(fontStyle: FontStyle): void {
-        const selectedCells = this.getSelectedCells();
-        selectedCells.forEach(_cell => {
-            const cell = this.getCellByName(_cell);
-            if (cell) {
-                if(cell.isEdit) {
-                    if (fontStyle.fontFamily !== cell.fontFamily && fontStyle.fontFamily !== undefined) cell.fontFamily = fontStyle.fontFamily;
-                    if (fontStyle.fontSize !== cell.fontSize && fontStyle.fontSize !== undefined) cell.fontSize = fontStyle.fontSize;
-                    if (fontStyle.fontWeight !== cell.fontWeight && fontStyle.fontWeight !== undefined) cell.fontWeight = fontStyle.fontWeight;
-                    if (fontStyle.fontStyle !== cell.fontStyle && fontStyle.fontStyle !== undefined) cell.fontStyle = fontStyle.fontStyle;
-                    if (fontStyle.fontColor !== cell.fontColor && fontStyle.fontColor !== undefined) cell.fontColor = fontStyle.fontColor;
-                    if (fontStyle.underline !== cell.underline && fontStyle.underline !== undefined) cell.underline = fontStyle.underline;
-                    if (fontStyle.strikethrough !== cell.strikethrough && fontStyle.strikethrough !== undefined) cell.strikethrough = fontStyle.strikethrough;
-                    if (fontStyle.textAlign !== cell.textAlign && fontStyle.textAlign !== undefined) cell.textAlign = fontStyle.textAlign as TextAlign;
-                    if (fontStyle.alignItems !== cell.alignItems && fontStyle.alignItems !== undefined) cell.alignItems = fontStyle.alignItems as VerticalAlign;
-                    if (fontStyle.backgroundColor !== cell.backgroundColor && fontStyle.backgroundColor !== undefined) cell.backgroundColor = fontStyle.backgroundColor;
-                    if (fontStyle.letterSpacing !== cell.letterSpacing && fontStyle.letterSpacing !== undefined) cell.letterSpacing = fontStyle.letterSpacing;
-                    if (fontStyle.lineSpacing !== cell.lineSpacing && fontStyle.lineSpacing !== undefined) cell.lineSpacing = fontStyle.lineSpacing;
-                    if (fontStyle.wrap !== cell.wrap && fontStyle.wrap !== undefined) cell.wrap = fontStyle.wrap;
+        const apply = (): void => {
+            const selectedCells = this.getSelectedCells();
+            selectedCells.forEach(_cell => {
+                const cell = this.getCellByName(_cell);
+                if (cell) {
+                    if(cell.isEdit) {
+                        if (fontStyle.fontFamily !== cell.fontFamily && fontStyle.fontFamily !== undefined) cell.fontFamily = fontStyle.fontFamily;
+                        if (fontStyle.fontSize !== cell.fontSize && fontStyle.fontSize !== undefined) cell.fontSize = fontStyle.fontSize;
+                        if (fontStyle.fontWeight !== cell.fontWeight && fontStyle.fontWeight !== undefined) cell.fontWeight = fontStyle.fontWeight;
+                        if (fontStyle.fontStyle !== cell.fontStyle && fontStyle.fontStyle !== undefined) cell.fontStyle = fontStyle.fontStyle;
+                        if (fontStyle.fontColor !== cell.fontColor && fontStyle.fontColor !== undefined) cell.fontColor = fontStyle.fontColor;
+                        if (fontStyle.underline !== cell.underline && fontStyle.underline !== undefined) cell.underline = fontStyle.underline;
+                        if (fontStyle.strikethrough !== cell.strikethrough && fontStyle.strikethrough !== undefined) cell.strikethrough = fontStyle.strikethrough;
+                        if (fontStyle.textAlign !== cell.textAlign && fontStyle.textAlign !== undefined) cell.textAlign = fontStyle.textAlign as TextAlign;
+                        if (fontStyle.alignItems !== cell.alignItems && fontStyle.alignItems !== undefined) cell.alignItems = fontStyle.alignItems as VerticalAlign;
+                        if (fontStyle.backgroundColor !== cell.backgroundColor && fontStyle.backgroundColor !== undefined) cell.backgroundColor = fontStyle.backgroundColor;
+                        if (fontStyle.letterSpacing !== cell.letterSpacing && fontStyle.letterSpacing !== undefined) cell.letterSpacing = fontStyle.letterSpacing;
+                        if (fontStyle.lineSpacing !== cell.lineSpacing && fontStyle.lineSpacing !== undefined) cell.lineSpacing = fontStyle.lineSpacing;
+                        if (fontStyle.wrap !== cell.wrap && fontStyle.wrap !== undefined) cell.wrap = fontStyle.wrap;
+                    }
+                } else {
+                    const newCell = new Cell();
+                    newCell.cell = _cell;
+                    newCell.fontFamily = fontStyle.fontFamily;
+                    newCell.fontSize = fontStyle.fontSize;
+                    newCell.fontWeight = fontStyle.fontWeight;
+                    newCell.fontStyle = fontStyle.fontStyle;
+                    newCell.fontColor = fontStyle.fontColor;
+                    newCell.underline = fontStyle.underline;
+                    newCell.strikethrough = fontStyle.strikethrough;
+                    newCell.textAlign = fontStyle.textAlign as TextAlign;
+                    newCell.alignItems = fontStyle.alignItems as VerticalAlign;
+                    newCell.backgroundColor = fontStyle.backgroundColor;
+                    newCell.letterSpacing = fontStyle.letterSpacing;
+                    newCell.lineSpacing = fontStyle.lineSpacing;
+                    newCell.wrap = fontStyle.wrap;
+                    this.values.push(newCell);
                 }
-            } else {
-                const newCell = new Cell();
-                newCell.cell = _cell;
-                newCell.fontFamily = fontStyle.fontFamily;
-                newCell.fontSize = fontStyle.fontSize;
-                newCell.fontWeight = fontStyle.fontWeight;
-                newCell.fontStyle = fontStyle.fontStyle;
-                newCell.fontColor = fontStyle.fontColor;
-                newCell.underline = fontStyle.underline;
-                newCell.strikethrough = fontStyle.strikethrough;
-                newCell.textAlign = fontStyle.textAlign as TextAlign;
-                newCell.alignItems = fontStyle.alignItems as VerticalAlign;
-                newCell.backgroundColor = fontStyle.backgroundColor;
-                newCell.letterSpacing = fontStyle.letterSpacing;
-                newCell.lineSpacing = fontStyle.lineSpacing;
-                newCell.wrap = fontStyle.wrap;
-                this.values.push(newCell);
-            }
-        });
-        this.commitValues();
+            });
+            this.commitValues();
+        };
+        if (this.isEditting) {
+            apply();
+            return;
+        }
+        this.runWithFullStateUndo('设置字体格式', apply, 'selection');
+        // 包裹期间 commitValues 的自动广播被抑制，这里补一次驱动重绘（app.ts 按 rAF 排程，重复发射会自动合并）
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
     }
 
     /**
@@ -4587,67 +5486,81 @@ export class DataCollection extends EventEmitter {
 
     /**
      * 设置选中单元格的边框样式
+     *
+     * 撤销/重做：非编辑态经 {@link runWithFullStateUndo}（'selection' 档）包裹，
+     * 小表整表快照、大表选区稀疏补丁（超 {@link LARGE_TABLE_PATCH_CELLS} 放弃记账）。
+     * 「设置单元格格式」对话框已在外层包裹时本方法作为嵌套层自动折叠，
+     * 只保留最外层一条撤销记录（嵌套深度机制保证不重复入栈）。
      * @param cellBorderStyle 边框样式
      */
     public setSelectedCellsBorder(cellBorderStyle: CellBorderStyle): void {
-        const selectedCells = this.getSelectedCells();
-        const { col: startCol, row: startRow } = this.getCellColAndRow(selectedCells.at(0));
-        const { col: endCol, row: endRow } = this.getCellColAndRow(selectedCells.at(-1));
-        selectedCells.forEach(_cell => {
-            const {col, row} = this.getCellColAndRow(_cell);
-            // 用 boolean 标记本格四条边哪些需要本次设置；未标记的保留原值，避免误清空。
-            // 旧实现把未赋值的 borderTopWidth 等当作 undefined 赋给 cell，会清掉选区内部
-            // 已有宽度为 1 的边框，导致 BorderOuter/WideOuter/Bottom/Top/Left/Right
-            // 这六种"只设外部/单边"的操作意外改写了内部单元格的边框样式。
-            let setTop = false, setBottom = false, setLeft = false, setRight = false;
-            let borderTopWidth: number | undefined, borderBottomWidth: number | undefined,
-                borderLeftWidth: number | undefined, borderRightWidth: number | undefined;
-            if (cellBorderStyle === CellBorderStyle.BorderNone) {
-                setTop = setBottom = setLeft = setRight = true;
-                // 四条边都清空（undefined）
-            } else if (cellBorderStyle === CellBorderStyle.BorderAll) {
-                setTop = setBottom = setLeft = setRight = true;
-                borderTopWidth = borderBottomWidth = borderLeftWidth = borderRightWidth = 1;
-            } else if (cellBorderStyle === CellBorderStyle.BorderOuter) {
-                if (startRow === row) { setTop = true; borderTopWidth = 1; }
-                if (endRow === row) { setBottom = true; borderBottomWidth = 1; }
-                if (startCol === col) { setLeft = true; borderLeftWidth = 1; }
-                if (endCol === col) { setRight = true; borderRightWidth = 1; }
-            } else if (cellBorderStyle === CellBorderStyle.BorderWideOuter) {
-                if (startRow === row) { setTop = true; borderTopWidth = 2; }
-                if (endRow === row) { setBottom = true; borderBottomWidth = 2; }
-                if (startCol === col) { setLeft = true; borderLeftWidth = 2; }
-                if (endCol === col) { setRight = true; borderRightWidth = 2; }
-            } else if (cellBorderStyle === CellBorderStyle.BorderBottom) {
-                if (endRow === row) { setBottom = true; borderBottomWidth = 1; }
-            } else if (cellBorderStyle === CellBorderStyle.BorderTop) {
-                if (startRow === row) { setTop = true; borderTopWidth = 1; }
-            } else if (cellBorderStyle === CellBorderStyle.BorderLeft) {
-                if (startCol === col) { setLeft = true; borderLeftWidth = 1; }
-            } else if (cellBorderStyle === CellBorderStyle.BorderRight) {
-                if (endCol === col) { setRight = true; borderRightWidth = 1; }
-            }
+        const apply = (): void => {
+            const selectedCells = this.getSelectedCells();
+            const { col: startCol, row: startRow } = this.getCellColAndRow(selectedCells.at(0));
+            const { col: endCol, row: endRow } = this.getCellColAndRow(selectedCells.at(-1));
+            selectedCells.forEach(_cell => {
+                const {col, row} = this.getCellColAndRow(_cell);
+                // 用 boolean 标记本格四条边哪些需要本次设置；未标记的保留原值，避免误清空。
+                // 旧实现把未赋值的 borderTopWidth 等当作 undefined 赋给 cell，会清掉选区内部
+                // 已有宽度为 1 的边框，导致 BorderOuter/WideOuter/Bottom/Top/Left/Right
+                // 这六种"只设外部/单边"的操作意外改写了内部单元格的边框样式。
+                let setTop = false, setBottom = false, setLeft = false, setRight = false;
+                let borderTopWidth: number | undefined, borderBottomWidth: number | undefined,
+                    borderLeftWidth: number | undefined, borderRightWidth: number | undefined;
+                if (cellBorderStyle === CellBorderStyle.BorderNone) {
+                    setTop = setBottom = setLeft = setRight = true;
+                    // 四条边都清空（undefined）
+                } else if (cellBorderStyle === CellBorderStyle.BorderAll) {
+                    setTop = setBottom = setLeft = setRight = true;
+                    borderTopWidth = borderBottomWidth = borderLeftWidth = borderRightWidth = 1;
+                } else if (cellBorderStyle === CellBorderStyle.BorderOuter) {
+                    if (startRow === row) { setTop = true; borderTopWidth = 1; }
+                    if (endRow === row) { setBottom = true; borderBottomWidth = 1; }
+                    if (startCol === col) { setLeft = true; borderLeftWidth = 1; }
+                    if (endCol === col) { setRight = true; borderRightWidth = 1; }
+                } else if (cellBorderStyle === CellBorderStyle.BorderWideOuter) {
+                    if (startRow === row) { setTop = true; borderTopWidth = 2; }
+                    if (endRow === row) { setBottom = true; borderBottomWidth = 2; }
+                    if (startCol === col) { setLeft = true; borderLeftWidth = 2; }
+                    if (endCol === col) { setRight = true; borderRightWidth = 2; }
+                } else if (cellBorderStyle === CellBorderStyle.BorderBottom) {
+                    if (endRow === row) { setBottom = true; borderBottomWidth = 1; }
+                } else if (cellBorderStyle === CellBorderStyle.BorderTop) {
+                    if (startRow === row) { setTop = true; borderTopWidth = 1; }
+                } else if (cellBorderStyle === CellBorderStyle.BorderLeft) {
+                    if (startCol === col) { setLeft = true; borderLeftWidth = 1; }
+                } else if (cellBorderStyle === CellBorderStyle.BorderRight) {
+                    if (endCol === col) { setRight = true; borderRightWidth = 1; }
+                }
 
-            // 局部边框模式：本格四条边都不需要改时跳过，避免触碰选区内部格子的原有边框
-            if (!setTop && !setBottom && !setLeft && !setRight) return;
+                // 局部边框模式：本格四条边都不需要改时跳过，避免触碰选区内部格子的原有边框
+                if (!setTop && !setBottom && !setLeft && !setRight) return;
 
-            const cell = this.getCellByName(_cell);
-            if (cell) {
-                if (setTop) cell.borderTopWidth = borderTopWidth;
-                if (setBottom) cell.borderBottomWidth = borderBottomWidth;
-                if (setLeft) cell.borderLeftWidth = borderLeftWidth;
-                if (setRight) cell.borderRightWidth = borderRightWidth;
-            } else {
-                const newCell = new Cell();
-                newCell.cell = _cell;
-                if (setTop) newCell.borderTopWidth = borderTopWidth;
-                if (setBottom) newCell.borderBottomWidth = borderBottomWidth;
-                if (setLeft) newCell.borderLeftWidth = borderLeftWidth;
-                if (setRight) newCell.borderRightWidth = borderRightWidth;
-                this.values.push(newCell);
-            }
-        })
-        this.commitValues();
+                const cell = this.getCellByName(_cell);
+                if (cell) {
+                    if (setTop) cell.borderTopWidth = borderTopWidth;
+                    if (setBottom) cell.borderBottomWidth = borderBottomWidth;
+                    if (setLeft) cell.borderLeftWidth = borderLeftWidth;
+                    if (setRight) cell.borderRightWidth = borderRightWidth;
+                } else {
+                    const newCell = new Cell();
+                    newCell.cell = _cell;
+                    if (setTop) newCell.borderTopWidth = borderTopWidth;
+                    if (setBottom) newCell.borderBottomWidth = borderBottomWidth;
+                    if (setLeft) newCell.borderLeftWidth = borderLeftWidth;
+                    if (setRight) newCell.borderRightWidth = borderRightWidth;
+                    this.values.push(newCell);
+                }
+            })
+            this.commitValues();
+        };
+        if (this.isEditting) {
+            apply();
+            return;
+        }
+        this.runWithFullStateUndo('设置边框', apply, 'selection');
+        // 包裹期间 commitValues 的自动广播被抑制，补一次驱动重绘（嵌套在外层记账内时仅多排程一帧，无副作用）
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
     }
 
     /**
@@ -4669,9 +5582,12 @@ export class DataCollection extends EventEmitter {
      * 根据选区判断是列排序（选区在同一列）还是行排序（选区在同一行），
      * 调用 MatrixSorter.sort() 统一接口，支持全量/连续/不连续三种模式。
      *
-     * 撤销/重做：排序前深拷贝当前 values 作为 before 快照，
-     * 抑制 setter 自动记录（因 remapMatrixCellNames 会就地修改 Cell 名称，
-     * setter 的 oldValue 不再是真正的排序前状态），排序后手动推送快照。
+     * 撤销/重做（命令式排列，大表友好）：排序只是选定范围内的一次置换，
+     * 不创建/销毁任何格子，因此不再像旧实现那样 cloneValues 两份整表
+     * （含全部 chars 的深拷贝，百万格下单次数秒、上百 MB）。改为从
+     * MatrixSorter 取出实际执行的排列（positions/origins 两条索引数组，
+     * 排序被筛选锚点/合并一致性中止时为 null，则什么都不做），
+     * 推一条 'sortPermutation' 记录；撤销/重做见 {@link _applySortPermutation}。
      *
      * @param {boolean} ascending - true=升序，false=降序
      * @private
@@ -4713,29 +5629,104 @@ export class DataCollection extends EventEmitter {
             return;
         }
 
-        // 排序前深拷贝，作为撤销快照的 before（必须在 remap 之前捕获）
-        const beforeSnapshot = this.cloneValues(this.values);
         const matrix = this.matrixValues();
-        const _matrix = this.matrixSorter.init(matrix).sort(sortConfig).getData();
+        const sorter = this.matrixSorter.init(matrix);
+        sorter.sort(sortConfig);
+        // 中止（筛选锚点行/列、合并一致性失败、keyIndex 越界等）：矩阵未被改动，
+        // 旧实现仍会 remap + 重赋 values（一次可观的无效遍历），这里直接收尾
+        const permutation = sorter.lastPermutation;
+        if (!permutation) return;
+        const _matrix = sorter.getData();
         this.remapMatrixCellNames(_matrix);
         const sortedValues = _matrix.flat().filter((c): c is Cell => c !== undefined);
 
-        // 抑制 setter 自动记录（oldValue 中的 Cell 名称已被 remap 修改，不再可靠）
+        // 抑制 setter 自动记录：撤销依据是排列命令，而非前后快照
+        const prevSuppress = this._suppressValuesUndo;
         this._suppressValuesUndo = true;
         try {
             this.values = sortedValues;
         } finally {
-            this._suppressValuesUndo = false;
+            this._suppressValuesUndo = prevSuppress;
         }
 
-        // 手动推送排序的撤销快照
-        this.undoManager.pushValuesSnapshot(
-            beforeSnapshot,
-            this.cloneValues(this.values),
-            ascending ? '升序排序' : '降序排序'
-        );
+        // 命令式撤销记录：只存两条索引数组，成本与参与排序的行/列数成正比，
+        // 与整表格子数无关（数组拷一份入栈，sorter 实例上的引用后续会被复用）
+        const anchor = this._captureAnchor();
+        this.undoManager.push({
+            type: 'sortPermutation',
+            data: {
+                axis: permutation.axis,
+                positions: permutation.positions.slice(),
+                origins: permutation.origins.slice()
+            },
+            timestamp: Date.now(),
+            label: ascending ? '升序排序' : '降序排序',
+            anchorBefore: anchor,
+            anchorAfter: anchor
+        });
         this._refreshBaseline();
+        this.markContentChanged();
         this.emit(DataEvents.VALUES_CHANGED, this._values);
+    }
+
+    /**
+     * 执行一次排序排列的撤销/重做回写
+     *
+     * 正向（重做）：positions[i] 放置当前 origins[i] 行/列；
+     * 逆向（撤销）：交换两数组角色 —— origins[i] 放置当前 positions[i] 行/列。
+     * 排列为同一集合上的双射，交换角色恰为逆置换。
+     * @param {SortPermutationSnapshot} snap - 排序排列记录
+     * @param {boolean} isUndo - true=撤销，false=重做
+     * @private
+     */
+    private _applySortPermutation(snap: SortPermutationSnapshot, isUndo: boolean): void {
+        this._isApplyingUndo = true;
+        try {
+            this._applyAxisPermutation(
+                snap.axis,
+                isUndo ? snap.origins : snap.positions,
+                isUndo ? snap.positions : snap.origins
+            );
+            this._refreshBaseline();
+            this.emit(DataEvents.VALUES_CHANGED, this._values);
+        } finally {
+            this._isApplyingUndo = false;
+        }
+    }
+
+    /**
+     * 沿指定轴对单元格做一次置换（排序撤销/重做的原语）
+     *
+     * 排列后 `destinations[i]`（0-based 绝对行/列号）位置上放着当前位于
+     * `sources[i]` 的整行/整列格子 —— 实现只改格子名称里的行号或列号
+     * （与排序主路径 remapMatrixCellNames 的改名语义完全一致），
+     * 不移动对象、不增删格子。范围外的格子不动。
+     * @param {'column' | 'row'} axis - 'column'=置换行（按列排序），'row'=置换列
+     * @param {number[]} destinations - 目标位置序列（0-based）
+     * @param {number[]} sources - 来源位置序列（0-based，与 destinations 等长）
+     * @private
+     */
+    private _applyAxisPermutation(axis: 'column' | 'row', destinations: number[], sources: number[]): void {
+        // 来源 → 目标 的改名映射；恒等项（位置不变的行/列）无需入表
+        const move = new Map<number, number>();
+        for (let i = 0; i < destinations.length; i++) {
+            if (destinations[i] !== sources[i]) move.set(sources[i], destinations[i]);
+        }
+        if (move.size === 0) return;
+        // 单遍扫描全部格子改名：O(实际格子数)，与排序自身的 matrix/remap 同阶
+        for (const cell of this._values) {
+            const { col, row } = this.getCellColAndRow(cell.cell);
+            if (axis === 'column') {
+                const to = move.get(row - 1);
+                if (to !== undefined) cell.cell = this.getCellName(col, to + 1);
+            } else {
+                const to = move.get(col - 1);
+                if (to !== undefined) cell.cell = this.getCellName(to + 1, row);
+            }
+        }
+        // 名称大面积变化，单元格索引必须重建
+        this.invalidateCellIndex();
+        this.markContentChanged();
     }
 
     /**
@@ -4823,7 +5814,7 @@ export class DataCollection extends EventEmitter {
                 // **只恢复「因筛选而隐藏」的行**：手动隐藏的行不在 filterHidden 中，保持隐藏。
                 this.restoreRowsHiddenByFilter(filterHidden);
                 this.emit(DataEvents.VALUES_CHANGED, this._values);
-            });
+            }, 'filters');
             return;
         }
 
@@ -4859,7 +5850,8 @@ export class DataCollection extends EventEmitter {
                 }
                 this.invalidateFilterCells();
                 this.emit(DataEvents.VALUES_CHANGED, this._values);
-            });
+                // 'selection' 档：只写选中行上那几个筛选按钮格，影响面 ⊆ 选区
+            }, 'selection');
         } else {
             this.messageBox.confirm(
                 `执行过滤操作时，请选择同一行的单元格范围。`,
@@ -6289,6 +7281,556 @@ export class DataCollection extends EventEmitter {
         return cell;
     }
     
+    /* ==================== 查询与替换 ====================
+     *
+     * 「工具栏 → 查询 / 替换」的数据层实现。**全部限定在给定矩形范围内**，
+     * UI 层（toolbar/start/searchDialog.ts）只负责取值与展示：
+     * - 范围是显式参数，不读也不改当前选区（`gotoSearchHit` 除外），
+     *   因此「跳转命中项（会改写选区）」之后继续「查找下一个」不会把范围缩小成一个格子；
+     * - **扫描只遍历 `values`（真实存在的单元格）**，不遍历 行 × 列 网格 ——
+     *   见 `_collectSearchCells`。整表范围是常态（单格选区会被解释成整表，
+     *   见 `expandSingleCellRect`），而 10 万行 × 100 列的表按网格遍历是**亿级**空转；
+     * - 替换的撤销补丁按**命中的格子**逐个捕获（`runWithCellsUndo`），不是按矩形逐格捕获：
+     *   命中天然稀疏，矩形版在整表范围下会为每一格都克隆一份快照；
+     * - 行/列的隐藏状态按 copySelection 的口径：**隐藏行列不参与查找**，
+     *   否则筛选状态下会命中用户看不见的格子。
+     * ==================== */
+
+    /**
+     * 解析一段区域串（`'B3'` 或 `'A1:C9'`，大小写不敏感）
+     *
+     * 只认这两种形态；任何一处不合法返回 null，由调用方决定如何提示
+     * （不要让本方法抛错：范围串直接来自对话框输入框，用户可能手打）。
+     * @param {string} range - 区域串
+     * @returns {SheetRect | null} 规范化后的矩形（1-based 闭区间，端点已按大小端排序）
+     */
+    private _parseRect(range: string): SheetRect | null {
+        const parts = range.split(':');
+        if (parts.length > 2) return null;
+        const a = this._parseCellRef(parts[0]);
+        if (!a) return null;
+        if (parts.length === 1) {
+            return { startCol: a.col, startRow: a.row, endCol: a.col, endRow: a.row };
+        }
+        const b = this._parseCellRef(parts[1]);
+        if (!b) return null;
+        return {
+            startCol: Math.min(a.col, b.col),
+            startRow: Math.min(a.row, b.row),
+            endCol: Math.max(a.col, b.col),
+            endRow: Math.max(a.row, b.row)
+        };
+    }
+
+    /**
+     * 解析单个单元格引用（`'AB12'` → `{ col: 28, row: 12 }`）
+     *
+     * 手写这里而不是复用 {@link getCellColAndRow}：后者对 `'A0'`、`''`、`'1A'`
+     * 这类输入会返回 `row: 0` / `col: 0` / `NaN` 而不报错，作为范围来源会让
+     * 「查询第 0 行」这种不存在的结果悄悄进入扫描循环。
+     * @param {string} ref - 单元格引用
+     * @returns {{ col: number, row: number } | null} 行列号（1-based）；非法返回 null
+     */
+    private _parseCellRef(ref: string): { col: number; row: number } | null {
+        const trimmed = ref.trim();
+        const m = /^([A-Za-z]{1,3})([1-9][0-9]{0,6})$/.exec(trimmed);
+        if (!m) return null;
+        const col = this.getColNumber(m[1].toUpperCase());
+        const row = parseInt(m[2], 10);
+        if (!isFinite(col) || col < 1 || !isFinite(row) || row < 1) return null;
+        return { col, row };
+    }
+
+    /**
+     * 决定本次查询 / 替换的作用范围
+     *
+     * 三级回退：
+     * ① 显式区域串（对话框「范围」输入框的值优先，让用户在 dialog 里点选或手填的范围说了算）；
+     * ② 当前选区（工具栏入口的默认语义 = **只在当前选中区域内查找**）；
+     * ③ 无选区时回退到**有内容的区域**（{@link getContentBounds}），而不是行列表头的
+     *    逻辑上限（1048575 × 16384）——后者会让一次查询扫过整张虚拟表。
+     * @param {string} [range] - 显式区域串
+     * @returns {SheetRect | null} 查询范围；连空表都没有时返回 null
+     */
+    public resolveSearchRect(range?: string): SheetRect | null {
+        if (range && range.trim()) {
+            const rect = this._parseRect(range);
+            if (rect) return rect;
+        }
+        if (this.selection) {
+            const rect = this._parseRect(this.selection);
+            if (rect) return rect;
+        }
+        const { maxRow, maxCol } = this.getContentBounds();
+        if (!maxRow || !maxCol) return null;
+        return { startCol: 1, startRow: 1, endCol: maxCol, endRow: maxRow };
+    }
+
+    /**
+     * 把范围矩形格式化成 `'A1:C9'`（单格时为 `'A1:A1'`，与 selection 的既有口径一致）
+     * @param {SheetRect} rect - 范围矩形
+     * @returns {string} 区域串
+     */
+    public formatRect(rect: SheetRect): string {
+        const start = this.getCellName(rect.startCol, rect.startRow);
+        const end = this.getCellName(rect.endCol, rect.endRow);
+        return `${start}:${end}`;
+    }
+
+    /**
+     * 把「单格范围」解释为「整表范围 + 起点锚」
+     *
+     * 选中单个单元格之后查找，要找的显然不是这一格本身（它的内容就摆在眼前），
+     * 而是**整张表**里还有哪些地方出现同样的内容；「查找下一个」从这一格往下走、
+     * 到头回绕 —— 与 Excel「选中一格 → Ctrl+F → 查找全部/下一个」的语义一致。
+     *
+     * 返回 `null` 表示**保持原样**：范围不是单格，或者表里根本没有内容
+     * （`getContentBounds()` 为 0，此时连一个候选格都没有，扩不扩张结果都一样）。
+     *
+     * 注意这是 `DataCollection` 的语义、不是「范围串恰好写成单格」的判定：
+     * 由主表格选出的单格走本方法（范围会被**显示**成展开后的整表范围，用户看得见
+     * 将要搜多大一片）；用户手工在范围框里敲 `'B2:B2'` 时按字面处理，就是只查那一格。
+     * @param {SheetRect} rect - 待检查的范围（1-based 闭区间）
+     * @returns {{ rect: SheetRect; anchor: { col: number; row: number } } | null} 整表范围 + 起点锚；不适用时 null
+     */
+    public expandSingleCellRect(rect: SheetRect): { rect: SheetRect; anchor: { col: number; row: number } } | null {
+        if (rect.startCol !== rect.endCol || rect.startRow !== rect.endRow) return null;
+        const { maxRow, maxCol } = this.getContentBounds();
+        if (!maxRow || !maxCol) return null;
+        return {
+            rect: { startCol: 1, startRow: 1, endCol: maxCol, endRow: maxRow },
+            anchor: { col: rect.startCol, row: rect.startRow }
+        };
+    }
+
+    /**
+     * 构造查询用正则
+     *
+     * - `useWildcard`：`?` → 单个字符、`*` → 任意长度（含换行，故用 `[\s\S]` 而非 `.`），
+     *   其余字符按正则元字符转义；
+     * - `matchEntire`：首尾锚定（「单元格内容完全匹配」而非包含即可）；
+     * - `matchCase`：不加 `i` 标志。
+     * 统一返回**带 g 标志**的正则：命中判定与「把所有匹配位置替换掉」共用同一个 「lastIndex 游标」语义。
+     * @param {string} keyword - 关键字
+     * @param {SearchMatchOptions} [options] - 匹配选项
+     * @returns {RegExp | null} 正则；关键字为空返回 null（空关键字不构成查询）
+     */
+    private _buildSearchPattern(keyword: string, options?: SearchMatchOptions): RegExp | null {
+        if (!keyword) return null;
+        const escape = DataCollection._escapeRegExp;
+        let source = '';
+        if (options?.useWildcard === true) {
+            for (let i = 0; i < keyword.length; i++) {
+                const ch = keyword[i];
+                source += ch === '?' ? '[\\s\\S]'
+                    : ch === '*' ? '[\\s\\S]*'
+                        : escape(ch);
+            }
+        } else {
+            source = escape(keyword);
+        }
+        if (options?.matchEntire === true) source = `^(?:${source})$`;
+        try {
+            return new RegExp(source, options?.matchCase === true ? 'g' : 'gi');
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /**
+     * 转义正则元字符（`'a?b'` → `'a\\?b'`）
+     *
+     * **刻意不用 `text.replace(/[...]/g, '\\$&')` 这种字符类写法**：
+     * 字符类里要同时含 `]` 与 `\`，写错一个（例如少写 `]`，或把 `]` 放在 `\` 之后）
+     * 就会静默改变语义 —— 而这里一旦漏转义 `?`，通配符模式下的 `'a?b'` 会退化成
+     * 字面量 "a?b"（`?` 只对前一个字符生效，于是永远查不到东西），
+     * 表面上「查询没结果」，排查起来极费时间。
+     * 下面用显式字符集 + `includes` 分派：没有字符类、没有一层转义，读一眼就知道对不对。
+     * @param {string} text - 原文本
+     * @returns {string} 转义后文本
+     */
+    private static _escapeRegExp(text: string): string {
+        const SPECIAL = '.?*+^$()[]{}|\\';
+        let out = '';
+        for (let i = 0; i < text.length; i++) {
+            const ch = text[i];
+            out += SPECIAL.indexOf(ch) >= 0 ? '\\' + ch : ch;
+        }
+        return out;
+    }
+
+    /**
+     * 取出单元格**逐字符对齐**的文本
+     *
+     * 与 {@link Cell.getText} 的唯一差别：这里对每个字符都产出一个位（哪怕 `char` 为
+     * null/undefined 也记一个下标），保证「文本下标 ↔ chars 下标」一一对应 ——
+     * 替换时要按匹配的下标去切 `chars`，两者错位会把样式/字符切错乱。
+     * @param {Cell} cell - 单元格
+     * @returns {string} 对齐文本（与 getText 的结果一致）
+     */
+    private _alignedCellText(cell: Cell): string {
+        const chars = cell.chars;
+        if (!chars || chars.length === 0) return '';
+        let text = '';
+        for (let i = 0; i < chars.length; i++) {
+            const ch = chars[i];
+            if (ch && ch.char !== null && ch.char !== undefined) text += ch.char;
+        }
+        return text;
+    }
+
+    /**
+     * 稀疏收集矩形内的候选格（**行优先序**）
+     *
+     * ## 性能约定（勿回退为「按行列号逐格 getCellName + getCellByName」）
+     * 历史实现是 `for row { for col { getCellName(...) → getCellByName(...) } }`：
+     * 每次迭代都要拼一个字符串、再查一次 Map，**空网格也要一格一格走过**。
+     * 整表范围（单格选区展开后的常态）下这是 行数 × 列数 次迭代 ——
+     * 10 万行 × 100 列 = 一千万次，而其中 99% 的格子在 `values` 里根本不存在。
+     *
+     * 这里只遍历 `values`（O(存在的格子数)），顺序由行列号算出；`values` 恰好已是
+     * 行优先时（装载 / 顺序编辑的主流情形）**不排序**，否则按行优先键排一次 ——
+     * 命中列表必须按「行优先」呈现（查找下一个要自上而下、自左向右走）。
+     * 「是否已有序」在扫描过程中顺手判定，不需要额外的探测遍历。
+     *
+     * 过滤顺序刻意从便宜到贵：非空文本 → 解析行列号 → 范围 → 隐藏 → 拼文本。
+     * @param {SheetRect} rect - 范围矩形（1-based 闭区间）
+     * @returns {ScanCandidate[]} 候选格（行优先；已排除隐藏行列与无文本的格子）
+     * @private
+     */
+    private _collectSearchCells(rect: SheetRect): ScanCandidate[] {
+        const values = this._values;
+        const out: ScanCandidate[] = [];
+        const { startCol, startRow, endCol, endRow } = rect;
+        const width = endCol - startCol + 1;
+        let ordered = true;
+        let lastKey = -1;
+        for (let i = 0; i < values.length; i++) {
+            const cell = values[i];
+            // 最便宜的判定先行：只有样式 / 空 Cell 的格子直接跳过，连名字都不用解析
+            if (!DataCollection.hasAnyText(cell)) continue;
+            const { col, row } = this.getCellColAndRow(cell.cell);
+            if (col < startCol || col > endCol || row < startRow || row > endRow) continue;
+            if (this.isRowHidden(row - 1) || this.isColHidden(col - 1)) continue;
+            const key = (row - startRow) * width + (col - startCol);
+            if (key < lastKey) ordered = false;
+            lastKey = key;
+            out.push({
+                ref: cell,
+                cell: cell.cell,
+                col,
+                row,
+                text: this._alignedCellText(cell),
+                key
+            });
+        }
+        if (!ordered) out.sort((a, b) => a.key - b.key);
+        return out;
+    }
+
+    /**
+     * 在指定范围内找出**所有**命中项（行优先：先逐列扫完一行，再进下一行）
+     *
+     * 每个单元格最多产出一条命中（即便格内有多处匹配）—— 与 Excel 的命中列表口径一致；
+     * 「一处 Cell 内多处匹配」只在替换时展开处理（见 {@link replaceInRect}）。
+     * @param {SheetRect} rect - 查询范围
+     * @param {string} keyword - 关键字
+     * @param {SearchMatchOptions} [options] - 匹配选项
+     * @param {number} [limit=Infinity] - 最多返回多少条（用于 UI 上限保护）
+     * @returns {SearchHit[]} 命中列表（行优先升序）
+     */
+    public findAllInRect(
+        rect: SheetRect,
+        keyword: string,
+        options?: SearchMatchOptions,
+        limit: number = Infinity
+    ): SearchHit[] {
+        const pattern = this._buildSearchPattern(keyword, options);
+        const hits: SearchHit[] = [];
+        if (!pattern) return hits;
+        const candidates = this._collectSearchCells(rect);
+        for (let i = 0; i < candidates.length; i++) {
+            const candidate = candidates[i];
+            if (!this._matchesPattern(pattern, candidate.text)) continue;
+            hits.push({ cell: candidate.cell, col: candidate.col, row: candidate.row, text: candidate.text });
+            if (hits.length >= limit) break;
+        }
+        return hits;
+    }
+
+    /**
+     * 用正则做一次「是否命中」判定（带 g 标志，必须先归零 lastIndex）
+     * @param {RegExp} pattern - {@link _buildSearchPattern} 产出的正则
+     * @param {string} text - 待判定文本
+     * @returns {boolean} 是否命中
+     */
+    private _matchesPattern(pattern: RegExp, text: string): boolean {
+        pattern.lastIndex = 0;
+        return pattern.test(text);
+    }
+
+    /**
+     * 在范围内找出 `after` 之后的**第一条**命中（找不到则回绕到首条）
+     *
+     * 与 {@link findAllInRect} 同源（同一次稀疏扫描），只是不建整张命中列表 ——
+     * 调用方只想要「下一个」时没必要为整个范围分配数组。
+     * 候选格自身已按行优先有序，因此「首个序号大于起点」的命中就是要找的那条。
+     * @param {SheetRect} rect - 查询范围
+     * @param {string} keyword - 关键字
+     * @param {SearchMatchOptions} [options] - 匹配选项
+     * @param {{ col: number; row: number }} [after] - 起点（不含）；缺省从头找，即返回首条命中
+     * @returns {SearchHit | null} 命中项；无命中返回 null
+     */
+    public findNextInRect(
+        rect: SheetRect,
+        keyword: string,
+        options?: SearchMatchOptions,
+        after?: { col: number; row: number } | null
+    ): SearchHit | null {
+        const pattern = this._buildSearchPattern(keyword, options);
+        if (!pattern) return null;
+        const width = rect.endCol - rect.startCol + 1;
+        const afterKey = after
+            ? (after.row - rect.startRow) * width + (after.col - rect.startCol)
+            : -1;
+        const candidates = this._collectSearchCells(rect);
+        let wrapTarget: SearchHit | null = null;
+        for (let i = 0; i < candidates.length; i++) {
+            const candidate = candidates[i];
+            if (!this._matchesPattern(pattern, candidate.text)) continue;
+            const hit = {
+                cell: candidate.cell,
+                col: candidate.col,
+                row: candidate.row,
+                text: candidate.text
+            };
+            // 回绕目标 = 首条命中（行优先序，故第一次赋值即最终值）
+            if (wrapTarget === null) wrapTarget = hit;
+            if (candidate.key > afterKey) return hit;
+        }
+        return wrapTarget;
+    }
+
+    /**
+     * 判定某格**当前**是否命中，命中则返回它的命中项
+     *
+     * 供「替换」之后局部刷新命中列表用：替换只改动**一个**格子，重扫整个范围
+     * 在整表尺度上是几百毫秒的代价，而「替换」恰恰是连点操作。
+     * 本方法是单格的 O(1) 检查（就表规模而言）。
+     * @param {string} name - 单元格名称（如 `'B3'`）
+     * @param {string} keyword - 关键字
+     * @param {SearchMatchOptions} [options] - 匹配选项
+     * @returns {SearchHit | null} 命中项；不命中 / 格子不存在 / 落在隐藏行列上时返回 null
+     */
+    public cellMatches(name: string, keyword: string, options?: SearchMatchOptions): SearchHit | null {
+        const pattern = this._buildSearchPattern(keyword, options);
+        if (!pattern) return null;
+        const { col, row } = this.getCellColAndRow(name);
+        if (!isFinite(col) || !isFinite(row) || col < 1 || row < 1) return null;
+        if (this.isRowHidden(row - 1) || this.isColHidden(col - 1)) return null;
+        const cell = this.getCellByName(name);
+        if (!cell) return null;
+        const text = this._alignedCellText(cell);
+        if (text === '' || !this._matchesPattern(pattern, text)) return null;
+        return { cell: name, col, row, text };
+    }
+
+    /**
+     * 在范围内把关键字替换为目标串（一步可撤销）
+     *
+     * 整体包在 {@link runWithCellsUndo} 内：撤销补丁按**命中的格子**逐个捕获，
+     * 代价与命中处数成正比、与范围面积无关 —— 整表范围（单格选区展开后的常态）
+     * 里只有 3 处命中时，也只克隆这 3 个格子，因此百万格的大表照样能 Ctrl+Z / Ctrl+Y
+     * （全量快照超过 {@link LARGE_TABLE_UNDO_CELLS} 会被关闭）。
+     *
+     * 分两阶段：**先只读扫描收集待改格子**，再在补丁作用域内统一改写。
+     * 边扫边改会让补丁捕获到的「变化前」已经是被改过的内容（撤销失效）；
+     * 而把扫描塞进 `action` 里则无从预知哪些格子会变，只能退化成整矩形捕获。
+     *
+     * 合并区域内部的格子通常已被 merge 删除，天然不会被重复替换；若保留着
+     * （带边框/底色的内部格子，见合并铁律）则按普通格子处理。
+     * @param {SheetRect} rect - 替换范围
+     * @param {string} keyword - 关键字
+     * @param {string} replacement - 替换内容（空串 = 删除匹配文本）
+     * @param {SearchMatchOptions} [options] - 匹配选项（与查询共用，保证「查得到才替换得掉」）
+     * @param {SearchHit[] | null} [targets] - 仅替换这些单元格（「替换」按钮）；缺省替换范围内全部命中（「全部替换」）
+     * @param {string} [label='替换'] - 撤销操作标签
+     * @returns {number} 实际替换的**匹配处数**（一个格内多处匹配计多处）
+     */
+    public replaceInRect(
+        rect: SheetRect,
+        keyword: string,
+        replacement: string,
+        options?: SearchMatchOptions,
+        targets?: SearchHit[] | null,
+        label: string = '替换'
+    ): number {
+        const pattern = this._buildSearchPattern(keyword, options);
+        if (!pattern) return 0;
+        let nameFilter: Set<string> | null = null;
+        if (targets) {
+            nameFilter = new Set<string>();
+            for (let i = 0; i < targets.length; i++) nameFilter.add(targets[i].cell);
+        }
+        // 阶段一（只读）：确定「哪些格子会被改动」—— 一次稀疏扫描
+        const candidates = this._collectSearchCells(rect);
+        const affected: Cell[] = [];
+        for (let i = 0; i < candidates.length; i++) {
+            const candidate = candidates[i];
+            if (nameFilter && !nameFilter.has(candidate.cell)) continue;
+            if (!this._matchesPattern(pattern, candidate.text)) continue;
+            affected.push(candidate.ref);
+        }
+        if (affected.length === 0) return 0;
+        // 阶段二：补丁作用域内改写。两个阶段之间没有让出，文本快照仍然有效。
+        let count = 0;
+        this.runWithCellsUndo(label, affected, () => {
+            for (let i = 0; i < affected.length; i++) {
+                count += this._replaceCharsInCell(affected[i], pattern, replacement);
+            }
+        });
+        return count;
+    }
+
+    /**
+     * 把单个单元格里**所有**匹配片段替换掉
+     *
+     * 字符级样式保护：被替换片段原位插入到 a+b+c 的位置；原片段若被替换为空串则该片段直接删除。
+     * @param {Cell} cell - 目标单元格（values 里的活引用）
+     * @param {RegExp} pattern - 带 g 标志的正则
+     * @param {string} replacement - 替换内容
+     * @returns {number} 替换的片段数
+     */
+    private _replaceCharsInCell(cell: Cell, pattern: RegExp, replacement: string): number {
+        const chars = cell.chars;
+        if (!chars || chars.length === 0) return 0;
+        const text = this._alignedCellText(cell);
+        if (text === '') return 0;
+        // 先收集所有片段位置（不重叠，由正则自身的 g 语义保证），再一次性重建 chars：
+        // 边替换边改 chars 会让后续片段的下标全部失效。
+        //
+        // 【性能约定，勿回退为「先收集位置、再统一重建 chars」的两趟写法】
+        // 常见的替换（范围内每格都是 `old → new` 这类单片段、且首字符就命中）走下面这条
+        // 快路径：原地改字符、样式留空（保留各处样式差异）。只有**多处片段**才退到
+        // 重建路径 —— 「全部替换」动辄上万格，重建会为每格都新分配一个 chars 数组，
+        // 而这些格子往往一个字符都不需要换。
+        const replacementChars = Array.from(replacement);
+        pattern.lastIndex = 0;
+        const first = pattern.exec(text);
+        if (first === null) return 0;
+        if (first.index === 0 && first[0].length === text.length) {
+            for (let i = 0; i < chars.length; i++) {
+                chars[i].char = i < replacementChars.length ? replacementChars[i] : '';
+            }
+            // 短替换：多出来的字符（char = ''）参与 isEmpty 判定时会一并释放（'' 不算文字信息）
+            // 长替换：样式留空，由渲染层按单元格/默认字体兜底
+            return 1;
+        }
+        const starts: number[] = [first.index];
+        const ends: number[] = [first.index + first[0].length];
+        if (first[0].length === 0) pattern.lastIndex++;
+        let m: RegExpExecArray | null;
+        while ((m = pattern.exec(text)) !== null) {
+            starts.push(m.index);
+            ends.push(m.index + m[0].length);
+            if (m[0].length === 0) pattern.lastIndex++; // 零宽匹配：手动前进，否则死循环
+        }
+        if (starts.length === 1 && ends[0] - starts[0] === text.length) {
+            // 全格被替换但首字符不命中（如完全匹配时首字符被通配符吃掉）：同样走原位路径
+            for (let i = 0; i < chars.length; i++) {
+                chars[i].char = i < replacementChars.length ? replacementChars[i] : '';
+            }
+            return 1;
+        }
+        const out: Char[] = [];
+        let cursor = 0;
+        for (let i = 0; i < starts.length; i++) {
+            const start = starts[i];
+            const end = ends[i];
+            if (start > cursor) {
+                for (let k = cursor; k < start; k++) out.push(chars[k]);
+            }
+            if (replacementChars.length > 0) {
+                // 继承被替换片段**首字符**的样式，替换进去的字保留原格式（字号/字色/加粗…）
+                const styleSource = chars[start] || chars[cursor] || new Char();
+                for (let k = 0; k < replacementChars.length; k++) {
+                    const char = styleSource.clone();
+                    char.char = replacementChars[k];
+                    out.push(char);
+                }
+            }
+            cursor = end;
+        }
+        for (let k = cursor; k < chars.length; k++) out.push(chars[k]);
+        cell.chars = out;
+        return starts.length;
+    }
+
+    /**
+     * 滚动表格使目标单元格完全可见（按需调整行列头滚动偏移）
+     *
+     * 与 `Canvas.scrollCellIntoView` 同算法，但坐标取**网格矩形**
+     * （{@link getCellGridRect}，不做合并展开）：命中的格子若落在合并区内，
+     * 按合并锚点算出的矩形会连带把旁边的行列卷进视野。
+     * @param {number} col - 列号（1-based）
+     * @param {number} row - 行号（1-based）
+     * @returns {boolean} 是否发生了滚动
+     */
+    public scrollCellIntoView(col: number, row: number): boolean {
+        const { left, top, width, height } = this.getCellGridRect(col, row);
+        if (width === 0 && height === 0) return false;
+        const { sheetWidth, sheetHeight } = this.visibleView;
+        const visibleWidth = sheetWidth / this.zoom;
+        const visibleHeight = sheetHeight / this.zoom;
+        const totalWidth = this.colHeaders.allColWidth;
+        const totalHeight = this.rowHeaders.allRowHeight;
+        let offsetX = this.colHeaders.offsetWidth;
+        let offsetY = this.rowHeaders.offsetHeight;
+        let needScroll = false;
+
+        const absoluteLeft = left + offsetX;
+        const absoluteTop = top + offsetY;
+        if (left < 0) {
+            // 列号 2 起才允许向左滚动到露出它：第 1 列本来就该贴住视口左边，
+            // 滚到 1px 只会把首列切掉一条边（像素级位移下最容易发生）
+            offsetX = Math.max(0, col > 1 ? absoluteLeft : 0);
+            needScroll = offsetX !== this.colHeaders.offsetWidth;
+        } else if (left + width > visibleWidth) {
+            const required = absoluteLeft + width - visibleWidth;
+            offsetX = Math.min(Math.max(0, required), Math.max(0, totalWidth - visibleWidth));
+            needScroll = true;
+        }
+        // 行号 2 起再往下滚：第 1 行恒在视口顶端，滚到 1px 只是让首行被裁掉一条边。
+        // 同理第 1 列不接受「左上角露在外面」这种滑移（拖到像素级滚动时最容易发生）。
+        if (top < 0) {
+            offsetY = Math.max(0, row > 1 ? absoluteTop : 0);
+            needScroll = offsetY !== this.rowHeaders.offsetHeight;
+        } else if (top + height > visibleHeight) {
+            const required = absoluteTop + height - visibleHeight;
+            offsetY = Math.min(Math.max(0, required), Math.max(0, totalHeight - visibleHeight));
+            needScroll = true;
+        }
+        if (needScroll) {
+            this.colHeaders.offsetWidth = offsetX;
+            this.rowHeaders.offsetHeight = offsetY;
+        }
+        return needScroll;
+    }
+
+    /**
+     * 跳转到指定单元格（活动单元格 + 单格选区 + 滚动入可视区）
+     *
+     * 供「查找下一个 / 上一个」跳转命中项。注意它**会改写选区**，所以调用方必须
+     * 事先把查询范围记住（searchDialog 用一个输入控件持有范围串），
+     * 否则下一次查找的范围就会被这次跳转缩小成一个格子。
+     * @param {SearchHit} hit - 命中项
+     */
+    public gotoSearchHit(hit: SearchHit): void {
+        this.activedCell = hit.cell;
+        this.selection = `${hit.cell}:${hit.cell}`;
+        this.scrollCellIntoView(hit.col, hit.row);
+    }
+
     /**
      * 通知工具栏状态更新
      */

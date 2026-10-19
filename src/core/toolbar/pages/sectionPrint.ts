@@ -14,6 +14,7 @@ import { DataCollection } from "../../dataArchitecture/dataCollection";
 import { Menu } from "../../common/menu";
 import { BtnBase } from "../../common/button";
 import { Printer, getSharedPrinter, MarginPreset, PaperOrientation, PaperSize, ScaleMode } from "../../../utils/printer";
+import { hideFindReplace } from "../start/searchDialog";
 
 /**
  * sectionPrintOptions 接口
@@ -84,7 +85,12 @@ export class SectionPrint {
             ishow: true,
             tshow: true,
             layout: 'vertical',
-            onClick: () => this.printer.printPreview(),
+            onClick: () => {
+                // 打印预览是自绘的整屏遮罩（不走 Dialog 的互斥登记表），
+                // 这里显式收起查找/替换对话框，保持「一次只显示一个对话框」
+                hideFindReplace();
+                this.printer.printPreview();
+            },
         });
 
         /*------------------ 页边距：常规 / 宽（默认）/ 窄 ------------------*/

@@ -1014,34 +1014,37 @@ export class Canvas extends EventEmitter {
                 data.copySelection();
                 break;
             case 'cut':
-                data.runWithFullStateUndo('剪切', () => data.cutSelection());
+                data.runWithFullStateUndo('剪切', () => data.cutSelection(), 'selection');
                 break;
             case 'paste':
-                data.runWithFullStateUndo('粘贴', () => data.pasteSelection());
+                data.runWithFullStateUndo('粘贴', () => data.pasteSelection(), 'paste');
                 break;
             case 'pasteText':
-                data.runWithFullStateUndo('只粘贴文本', () => data.pasteTextOnly());
+                data.runWithFullStateUndo('只粘贴文本', () => data.pasteTextOnly(), 'paste');
                 break;
             case 'pasteFormat':
-                data.runWithFullStateUndo('只粘贴格式', () => data.pasteFormatOnly());
+                data.runWithFullStateUndo('只粘贴格式', () => data.pasteFormatOnly(), 'paste');
                 break;
             case 'deleteShiftLeft': {
                 // 清除选区内容 + 右侧可见单元格向左紧凑补位（单元格级，非整列）
+                // 'shiftLeft' 档：影响面 = 选区起点 → 内容右边界（右侧整带都会左移补位）
                 data.runWithFullStateUndo('删除并左移', () => {
                     data.shiftCellsLeft(startCol, endCol, startRow, endRow);
-                });
+                }, 'shiftLeft', { startCol, endCol, startRow, endRow });
                 break;
             }
             case 'deleteShiftUp': {
                 // 清除选区内容 + 下方可见单元格向上紧凑补位（单元格级，非整行）
+                // 'shiftUp' 档：影响面 = 选区起点 → 内容下边界（下方整带都会上移补位）
                 data.runWithFullStateUndo('删除并上移', () => {
                     data.shiftCellsUp(startCol, endCol, startRow, endRow);
-                });
+                }, 'shiftUp', { startCol, endCol, startRow, endRow });
                 break;
             }
             case 'delete': {
                 if (this._contextTarget === 'row') {
-                    data.runWithFullStateUndo('删除行', () => {
+                    // 结构撤销（命令模式）：大表下不再做整表快照，代价只与被删带成正比
+                    data.runWithStructuralUndo('删除行', 'deleteRows', startRow, endRow - startRow + 1, () => {
                         data.deleteRows(startRow, endRow);
                         // 删除后选区保持原位置（下方行上移补位），越界部分收缩到有效范围
                         const newEndRow = Math.min(endRow, data.rowHeaders.length);
@@ -1049,7 +1052,7 @@ export class Canvas extends EventEmitter {
                         data.selection = `A${newStartRow}:${data.getColName(data.colHeaders.length)}${newEndRow}`;
                     });
                 } else if (this._contextTarget === 'col') {
-                    data.runWithFullStateUndo('删除列', () => {
+                    data.runWithStructuralUndo('删除列', 'deleteCols', startCol, endCol - startCol + 1, () => {
                         data.deleteCols(startCol, endCol);
                         // 删除后选区保持原位置（右侧列左移补位），越界部分收缩到有效范围
                         const newEndCol = Math.min(endCol, data.colHeaders.length);
@@ -1060,13 +1063,13 @@ export class Canvas extends EventEmitter {
                     // 单元格清除内容：选区保持原位置不动
                     data.runWithFullStateUndo('删除内容', () => {
                         data.clearContents(startCol, endCol, startRow, endRow);
-                    });
+                    }, 'selection');
                 }
                 break;
             }
             case 'deleteRow': {
                 // 二级菜单「删除整行」：不依赖右键目标（行头/单元格均可），删除选区覆盖的整行
-                data.runWithFullStateUndo('删除行', () => {
+                data.runWithStructuralUndo('删除行', 'deleteRows', startRow, endRow - startRow + 1, () => {
                     data.deleteRows(startRow, endRow);
                     // 删除后选区保持原位置（下方行上移补位），越界部分收缩到有效范围
                     const newEndRow = Math.min(endRow, data.rowHeaders.length);
@@ -1077,7 +1080,7 @@ export class Canvas extends EventEmitter {
             }
             case 'deleteCol': {
                 // 二级菜单「删除整列」：不依赖右键目标（列头/单元格均可），删除选区覆盖的整列
-                data.runWithFullStateUndo('删除列', () => {
+                data.runWithStructuralUndo('删除列', 'deleteCols', startCol, endCol - startCol + 1, () => {
                     data.deleteCols(startCol, endCol);
                     // 删除后选区保持原位置（右侧列左移补位），越界部分收缩到有效范围
                     const newEndCol = Math.min(endCol, data.colHeaders.length);
@@ -1088,23 +1091,25 @@ export class Canvas extends EventEmitter {
             }
             case 'insertShiftRight': {
                 // 选区位置插入空白单元格 + 右侧可见单元格右移让位（单元格级）
+                // 'shiftLeft' 档（同一影响面形状）：起点 → 内容右边界整带右移让位
                 data.runWithFullStateUndo('插入并右移', () => {
                     data.insertCellsRight(startCol, endCol, startRow, endRow);
-                });
+                }, 'shiftLeft', { startCol, endCol, startRow, endRow });
                 break;
             }
             case 'insertShiftDown': {
                 // 选区位置插入空白单元格 + 下方可见单元格下移让位（单元格级）
+                // 'shiftUp' 档（同一影响面形状）：起点 → 内容下边界整带下移让位
                 data.runWithFullStateUndo('插入并下移', () => {
                     data.insertCellsDown(startCol, endCol, startRow, endRow);
-                });
+                }, 'shiftUp', { startCol, endCol, startRow, endRow });
                 break;
             }
             case 'hide':
                 if (this._contextTarget === 'row') {
-                    data.runWithFullStateUndo('隐藏行', () => data.setRowsHidden(startRow, endRow, true));
+                    data.runWithFullStateUndo('隐藏行', () => data.setRowsHidden(startRow, endRow, true), 'headers');
                 } else if (this._contextTarget === 'col') {
-                    data.runWithFullStateUndo('隐藏列', () => data.setColsHidden(startCol, endCol, true));
+                    data.runWithFullStateUndo('隐藏列', () => data.setColsHidden(startCol, endCol, true), 'headers');
                 } else {
                     return; // 单元格上无隐藏语义
                 }
@@ -1113,9 +1118,9 @@ export class Canvas extends EventEmitter {
                 // 只取消当前选区行/列范围内的隐藏行/列（而非全表）：
                 // 选区范围由 selection 字符串直接解析，包含其中被隐藏的行/列
                 if (this._contextTarget === 'row') {
-                    data.runWithFullStateUndo('取消隐藏行', () => data.setRowsHidden(startRow, endRow, false));
+                    data.runWithFullStateUndo('取消隐藏行', () => data.setRowsHidden(startRow, endRow, false), 'headers');
                 } else if (this._contextTarget === 'col') {
-                    data.runWithFullStateUndo('取消隐藏列', () => data.setColsHidden(startCol, endCol, false));
+                    data.runWithFullStateUndo('取消隐藏列', () => data.setColsHidden(startCol, endCol, false), 'headers');
                 } else {
                     return;
                 }
@@ -1131,12 +1136,12 @@ export class Canvas extends EventEmitter {
             case 'gridLines':
                 data.runWithFullStateUndo('切换分割线', () => {
                     data.showGridLines = !data.showGridLines;
-                });
+                }, 'headers');
                 break;
             case 'clearContent':
                 data.runWithFullStateUndo('清除内容', () => {
                     data.clearContents(startCol, endCol, startRow, endRow);
-                });
+                }, 'selection');
                 break;
             case 'format': {
                 // 弹出 Excel 风格的「设置单元格格式」对话框（数字 / 边框两个 Tab）
@@ -1162,25 +1167,26 @@ export class Canvas extends EventEmitter {
         const safeCount = Math.max(1, Math.floor(count));
         switch (todo) {
             case 'insertRowsAbove':
-                data.runWithFullStateUndo('上方插入行', () => {
+                // 结构撤销（命令模式）：记录插入参数即可撤销/重做，代价与整表大小无关
+                data.runWithStructuralUndo('上方插入行', 'insertRows', startRow, safeCount, () => {
                     data.insertRows(startRow, safeCount);
                     data.selection = `A${startRow}:${data.getColName(data.colHeaders.length)}${startRow + safeCount - 1}`;
                 });
                 break;
             case 'insertRowsBelow':
-                data.runWithFullStateUndo('下方插入行', () => {
+                data.runWithStructuralUndo('下方插入行', 'insertRows', endRow + 1, safeCount, () => {
                     data.insertRows(endRow + 1, safeCount);
                     data.selection = `A${endRow + 1}:${data.getColName(data.colHeaders.length)}${endRow + safeCount}`;
                 });
                 break;
             case 'insertColsLeft':
-                data.runWithFullStateUndo('左侧插入列', () => {
+                data.runWithStructuralUndo('左侧插入列', 'insertCols', startCol, safeCount, () => {
                     data.insertCols(startCol, safeCount);
                     data.selection = `${data.getColName(startCol)}1:${data.getColName(startCol + safeCount - 1)}${data.rowHeaders.length}`;
                 });
                 break;
             case 'insertColsRight':
-                data.runWithFullStateUndo('右侧插入列', () => {
+                data.runWithStructuralUndo('右侧插入列', 'insertCols', endCol + 1, safeCount, () => {
                     data.insertCols(endCol + 1, safeCount);
                     data.selection = `${data.getColName(endCol + 1)}1:${data.getColName(endCol + safeCount)}${data.rowHeaders.length}`;
                 });
@@ -1458,7 +1464,7 @@ export class Canvas extends EventEmitter {
                     for (let r = startRow; r <= endRow; r++) {
                         data.adjustRowHeight(r, height);
                     }
-                });
+                }, 'headers');
                 this.refreshAfterContextMenu();
             }
         });
@@ -1483,7 +1489,7 @@ export class Canvas extends EventEmitter {
                     for (let c = startCol; c <= endCol; c++) {
                         data.adjustColumnWidth(c, width);
                     }
-                });
+                }, 'headers');
                 this.refreshAfterContextMenu();
             }
         });
@@ -2262,7 +2268,7 @@ export class Canvas extends EventEmitter {
                         data.setCellsBorderColor(startCol, endCol, startRow, endRow, borderColor);
                     }
                 }
-            });
+            }, 'selection');
             this.refreshAfterContextMenu();
         };
 
@@ -2298,6 +2304,14 @@ export class Canvas extends EventEmitter {
 
     /**
      * 滚动到指定单元格，确保单元格完全可见
+     *
+     * 【转调数据层实现，勿在这里自己算一遍】
+     * 历史实现取 `calculateCellRect` —— 那是**合并锚点展开**语义（锚到合并区左上角、
+     * 按 colspan/rowspan 累加宽高）。而列头点击恒传 `row = 1`、行头点击恒传 `col = 1`，
+     * 行 1 / 列 1 恰恰最常被整行整列合并：test_sample.xlsx 的 A1 colspan = 127 →
+     * 算出的矩形宽 127 × 80 = 10160px → 已滚动时被拉回最左端、未滚动时又被钳到最右端，
+     * 所点的列反而不在屏内。数据层那份早已改用网格矩形 `getCellGridRect`，
+     * 「在哪儿滚动」只应有一份实现。
      * @param {number} col - 单元格列索引
      * @param {number} row - 单元格行索引
      */
@@ -2305,47 +2319,7 @@ export class Canvas extends EventEmitter {
         if (col < 0 || row < 0) {
             return;
         }
-
-        const { left, top, width, height } = this.data.calculateCellRect(col, row);
-        const { sheetWidth, sheetHeight } = this.data.visibleView;
-
-        let needScroll = false;
-        let newOffsetX = this.data.colHeaders.offsetWidth;
-        let newOffsetY = this.data.rowHeaders.offsetHeight;
-
-        const totalWidth = this.data.colHeaders.allColWidth;
-        const totalHeight = this.data.rowHeaders.allRowHeight;
-
-        const visibleWidth = Math.round(sheetWidth / this.data.zoom);
-        const visibleHeight = Math.round(sheetHeight / this.data.zoom);
-
-        const originalLeft = left + this.data.colHeaders.offsetWidth;
-        const originalTop = top + this.data.rowHeaders.offsetHeight;
-
-        if (left < 0) {
-            newOffsetX = Math.max(0, originalLeft);
-            needScroll = true;
-        } else if (left + width > visibleWidth) {
-            const requiredOffset = originalLeft + width - visibleWidth;
-            newOffsetX = Math.min(totalWidth - visibleWidth, requiredOffset);
-            newOffsetX = Math.max(0, newOffsetX);
-            needScroll = true;
-        }
-
-        if (top < 0) {
-            newOffsetY = Math.max(0, originalTop);
-            needScroll = true;
-        } else if (top + height > visibleHeight) {
-            const requiredOffset = originalTop + height - visibleHeight;
-            newOffsetY = Math.min(totalHeight - visibleHeight, requiredOffset);
-            newOffsetY = Math.max(0, newOffsetY);
-            needScroll = true;
-        }
-
-        if (needScroll) {
-            this.data.colHeaders.offsetWidth = newOffsetX;
-            this.data.rowHeaders.offsetHeight = newOffsetY;
-        }
+        this.data.scrollCellIntoView(col, row);
     }
 
     /**

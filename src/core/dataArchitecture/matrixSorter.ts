@@ -171,31 +171,34 @@ function compareMixedText(a: string, b: string): number {
 class MatrixSorter {
     /** 数据集合 */
     private data: DataCollection;
-    /** 原始数据 */
-    private originalValues: (Cell | null)[][] = [];
-    /** 排序后的数据 */
+    /** 排序后的数据（init 时对入参矩阵做一次行级浅拷贝，排序就地改写本副本） */
     private values: (Cell | null)[][] = [];
+    /**
+     * 最近一次 {@link sort} **实际执行**的排列（中止时为 null）
+     *
+     * positions[i]（0-based 绝对行/列号）位置上，排序后放着原来位于
+     * origins[i] 的那一行/列。DataCollection 据此做命令式撤销/重做，
+     * 无需为排序保存两份整表深拷贝。
+     */
+    public lastPermutation: { axis: 'column' | 'row'; positions: number[]; origins: number[] } | null = null;
     constructor(data: DataCollection) {
         this.data = data;
     }
 
     /**
      * 初始化数据
+     *
+     * 只做**一次**行级浅拷贝：排序会就地交换行向量 / 改写格子位置，
+     * 不能直接作用于入参矩阵；而格子对象本身不需要复制（仅行向量重排，
+     * 单元格内容不变，名称由调用方在排序后统一 remap）。
+     * 旧实现额外保留一份 originalValues 供 reset() 使用，但 reset 无调用方，
+     * 大表下那份 maxRow×maxCol 矩阵纯属浪费内存，已移除。
      * @param {(Cell | null)[][]} values - 二维数组
      * @returns {MatrixSorter} 返回 this，支持链式调用
      */
     public init(values: (Cell | null)[][]): MatrixSorter {
-        this.originalValues = values.map(row => [...row]);
         this.values = values.map(row => [...row]);
-        return this;
-    }
-
-    /**
-     * 重置数据到原始状态
-     * @returns {MatrixSorter} 返回 this
-     */
-    public reset(): MatrixSorter {
-        this.values = this.originalValues.map(row => [...row]);
+        this.lastPermutation = null;
         return this;
     }
 
@@ -205,14 +208,6 @@ class MatrixSorter {
      */
     public getData(): (Cell | null)[][] {
         return this.values;
-    }
-
-    /**
-     * 获取数据副本
-     * @returns {(Cell | null)[][]} 数据的深拷贝
-     */
-    public getDataCopy(): (Cell | null)[][] {
-        return this.values.map(row => [...row]);
     }
 
     // ==================== 统一排序方法 ====================
@@ -243,6 +238,8 @@ class MatrixSorter {
      */
     public sort(config: SortConfig): MatrixSorter {
         const { axis, keyIndex, ascending, startIndex, endIndex, indices } = config;
+        // 每次排序前清空上一次排列：中止路径（下方各 return this）必须让外部读到 null
+        this.lastPermutation = null;
 
         // 解析目标索引：不连续 > 连续范围 > 全量
         let targetIndices: number[];
@@ -284,9 +281,11 @@ class MatrixSorter {
 
         // 排序
         if (axis === 'column') {
-            this._sortByColumn(keyIndex, ascending, sortIndices);
+            const origins = this._sortByColumn(keyIndex, ascending, sortIndices);
+            this.lastPermutation = { axis, positions: sortIndices.slice(), origins };
         } else {
-            this._sortByRow(keyIndex, ascending, sortIndices);
+            const origins = this._sortByRow(keyIndex, ascending, sortIndices);
+            this.lastPermutation = { axis, positions: sortIndices.slice(), origins };
         }
 
         return this;
@@ -297,40 +296,45 @@ class MatrixSorter {
     /**
      * 列排序：按指定列的值对 targetIndices 对应的行进行排序。
      *
-     * 提取目标行 → 按列值排序 → 回填到原位。
+     * 提取目标行（携带其原始行号）→ 按键列稳定排序 → 回填到原位。
      * @param {number} colIndex - 排序依据的列索引
      * @param {boolean} ascending - 升序/降序
-     * @param {number[]} rowIndices - 要排序的行索引
+     * @param {number[]} rowIndices - 要排序的行索引（即目标位置序列，升序）
+     * @returns {number[]} 排序后落在各目标位置上的**原始行号**序列（排列的 origins）
      * @private
      */
-    private _sortByColumn(colIndex: number, ascending: boolean, rowIndices: number[]): void {
-        // 提取要排序的行
-        const rowsToSort = rowIndices.map(i => this.values[i]);
+    private _sortByColumn(colIndex: number, ascending: boolean, rowIndices: number[]): number[] {
+        // 行向量与原始行号配对排序：排序结果除新排布外，还需导出「来源行号」
+        // 供命令式撤销/重做使用（不能只排序行向量，否则排序后无法知道每行来自哪里）。
+        const paired = rowIndices.map(i => ({ row: this.values[i], origin: i }));
 
-        // 按列值排序
-        rowsToSort.sort((a, b) => {
-            return this._compareCells(a[colIndex], b[colIndex], ascending);
+        // 稳定排序（JS 引擎自 ES2019 起保证稳定；与历史实现依赖的语义一致）
+        paired.sort((a, b) => {
+            return this._compareCells(a.row[colIndex], b.row[colIndex], ascending);
         });
 
         // 回填到原位
         rowIndices.forEach((rowIdx, i) => {
-            this.values[rowIdx] = rowsToSort[i];
+            this.values[rowIdx] = paired[i].row;
         });
+        return paired.map(p => p.origin);
     }
 
     /**
      * 行排序：按指定行的值对 targetIndices 对应的列进行排序。
      *
-     * 提取关键行的列值 → 排序列索引 → 将相同的列排列方式应用到所有行。
+     * 提取关键行的列值 → 稳定排序原始列索引得到排列 → 将相同的列排列方式
+     * 应用到所有行。
      * @param {number} rowIndex - 排序依据的行索引
      * @param {boolean} ascending - 升序/降序
-     * @param {number[]} colIndices - 要排序的列索引
+     * @param {number[]} colIndices - 要排序的列索引（即目标位置序列，升序）
+     * @returns {number[]} 排序后落在各目标位置上的**原始列号**序列（排列的 origins）
      * @private
      */
-    private _sortByRow(rowIndex: number, ascending: boolean, colIndices: number[]): void {
+    private _sortByRow(rowIndex: number, ascending: boolean, colIndices: number[]): number[] {
         const keyRow = this.values[rowIndex];
 
-        // 按关键行的值排序列索引，得到排列后的列顺序
+        // 按关键行的值排序列索引，得到排列后的原始列顺序（origins）
         const sortedColIndices = [...colIndices].sort((a, b) => {
             return this._compareCells(keyRow[a], keyRow[b], ascending);
         });
@@ -350,6 +354,7 @@ class MatrixSorter {
                 this.values[r][origCol] = reordered[j];
             });
         }
+        return sortedColIndices.slice();
     }
 
     // ==================== 辅助方法 ====================

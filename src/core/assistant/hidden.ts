@@ -115,13 +115,14 @@ export class Hidden {
         this.hiddenContainer.addEventListener('click', () => {
             if (!this.hiddenRange) return;
             const range = this.hiddenRange;
+            // 'headers' 档：只改行/列隐藏标记，不动 values
             this.data.runWithFullStateUndo(this.axis === 'row' ? '取消隐藏行' : '取消隐藏列', () => {
                 if (this.axis === 'row') {
                     this.data.setRowsHidden(range.start, range.end, false);
                 } else {
                     this.data.setColsHidden(range.start, range.end, false);
                 }
-            });
+            }, 'headers');
             this.hide();
         });
         this.hiddenContainer.addEventListener('mouseleave', () => this.hide());

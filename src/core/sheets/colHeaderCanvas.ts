@@ -5,7 +5,7 @@ import { CELL_PADDING, DEFAULT_ANCHOR_SELECTED_BORDER_COLOR, DEFAULT_CELL_BG_COL
     DEFAULT_CELL_WIDTH,
     MouseLocation} from "../constant";
 import { Canvas, CanvasOptions } from "./canvas";
-import { FullStateSnapshot } from "../../utils/undoManager";
+import { ContinuousUndoSnapshot } from "../../utils/undoManager";
 import { Hidden } from "../assistant/hidden";
 
 
@@ -16,8 +16,8 @@ export class ColHeaderCanvas extends Canvas {
     private _resizeRafId: number | null = null;
     /** 拖拽列宽：最近一次实际应用的宽度（用于跳过未跨像素的重复更新） */
     private _lastAppliedWidth: number | null = null;
-    /** 拖拽列宽：手势开始时的全量状态快照（mouseup 时提交撤销） */
-    private _resizeUndoBefore: FullStateSnapshot | null = null;
+    /** 拖拽列宽：手势开始时的基准快照（小表全量/大表 headers 补丁档，mouseup 时提交撤销） */
+    private _resizeUndoBefore: ContinuousUndoSnapshot | null = null;
     /** 隐藏列悬停指示按钮（左右双三角）：鼠标悬停到「分割线且右侧紧邻隐藏列」时显示 */
     private hiddenIndicator: Hidden;
 
@@ -235,15 +235,21 @@ export class ColHeaderCanvas extends Canvas {
             this._resizeUndoBefore = this.data.beginContinuousUndo();
             this._lastAppliedWidth = this.data.startWidth;
         }
-        this.data.activedCell = `${this.data.getColName(col)}${row}`;
-        // 【勿回退为直接写 `selection = {col}1:{col}{末行}`】
-        // 列头点击 = 整列选区，但必须与「单元格点击 / 拖选」同源，经 setSelectedRange 归一化：
-        // 该列内若有横向合并（如 A1:C1），选区与之部分相交，会被扩到合并区域完整范围
-        // （列 A~C），从而维持「选区永不半覆盖合并区域」这一不变式。
-        // 若直接写死单列选区，getSelectedRect 会按合并锚点取端点矩形 —— 左边界左移到列 A、
-        // 宽度按 colspan 累加，高亮多覆盖一列，与列头高亮的列号、乃至实际点中的列都对不上。
-        this.data.setSelectedRange(col, 1, col, this.data.rowHeaders.length);
-        this.scrollCellIntoView(col, row);
+        // 活动格**跳过合并单元格**：列头点击恒取第 1 行，而首行最常被横向合并
+        // （如表头横幅 A1:D1）；活动格落进合并区后，选中框上挖的透明洞会变成整个
+        // 合并块那么大（getActivedRect 走合并锚点语义），整列高亮被挖掉一大片。
+        this.data.activedCell = this.data.resolveHeaderActiveCell(col, row, 'col');
+        // 列头点击 = **精确的**整列选区（`expandMerges = false`）
+        // 【语义】点第 C 列头要的就是「C 列这一整列」，该列中间有没有横向合并
+        // （如 C1:E1）与用户意图无关；若按合并区域归一化，选中的会变成 C~E 列，
+        // 于是「查找范围」「复制内容」「删除列」全都跟着错一整块。
+        // 高亮的正确性不依赖归一化：getSelectedRect 只用网格矩形取端点
+        // （见那里的说明），因此单列选区照样精确地贴在所点的那一列上。
+        this.data.setSelectedRange(col, 1, col, this.data.rowHeaders.length, false);
+        // 滚到**活动格**（而非点击处的第 1 行）：活动格可能已被挪到别的行，
+        // 保证它连同选中框一起落在屏幕里。
+        const active = this.data.getCellColAndRow(this.data.activedCell);
+        this.scrollCellIntoView(active.col, active.row);
     }
 
     /**

@@ -80,6 +80,16 @@ export interface DialogOptions {
 }
 
 export class Dialog extends EventEmitter {
+    /**
+     * 当前处于「打开」状态的对话框集合
+     *
+     * {@link show} 时会隐藏其中的**其它**实例 —— 即「同一时刻只显示一个对话框」：
+     * 打开别的对话框时，先前那个（例如查找/替换）自动隐去。
+     * 之所以放在 Dialog 内部而不是让调用方逐个协调：对话框的创建点分散在
+     * fileTree / canvas / 查找替换等多处，逐个去改既容易漏、又会随新增调用点失守。
+     */
+    private static readonly openDialogs: Set<Dialog> = new Set();
+
     private options: DialogOptions;
     /** 遮罩层根元素（整层绝对定位铺满视口） */
     private dialogElement: HTMLElement;
@@ -304,6 +314,13 @@ export class Dialog extends EventEmitter {
             .gs-modal.gs-show .gs-modal-dialog { transform: none; }
             /* 拖拽中关闭位移过渡，使标题栏拖动实时跟手 */
             .gs-modal-dialog.gs-dragging { transition: none; }
+            /* 「点击穿透」模式（gs-modal-pick）：
+               遮罩层整层 pointer-events:none —— 点击/拖拽直接落到主页面，
+               于是「对话框不关闭也能在表格上拖选单元格」，只有对话框本体仍可交互。
+               注意 CSS 的 pointer-events 是可被子元素覆盖的继承性属性，
+               故 gs-modal-content 必须显式设回 auto，否则连按钮都点不动。 */
+            .gs-modal.gs-modal-pick { pointer-events: none; }
+            .gs-modal.gs-modal-pick .gs-modal-content { pointer-events: auto; }
             /* 尺寸：对应 Bootstrap modal-sm / 默认 / modal-lg / modal-xl */
             .gs-modal-dialog.gs-modal-sm { max-width: 300px; }
             .gs-modal-dialog.gs-modal-lg { max-width: 800px; }
@@ -386,6 +403,9 @@ export class Dialog extends EventEmitter {
                     border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
             }
             .gs-btn:focus { outline: 0; box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25); }
+            /* 用 hidden 控显隐时必须补这条：.gs-btn 自身有作者样式 display:inline-block，
+               会压过 UA 的 [hidden]{display:none}，否则「设为 hidden」看上去毫无效果 */
+            .gs-modal-footer .gs-btn[hidden] { display: none; }
             .gs-btn-primary { color: #fff; background-color: #0d6efd; border-color: #0d6efd; }
             .gs-btn-primary:hover { color: #fff; background-color: #0b5ed7; border-color: #0a58ca; }
             .gs-btn-primary:focus { box-shadow: 0 0 0 0.25rem rgba(49, 132, 253, 0.5); }
@@ -432,11 +452,14 @@ export class Dialog extends EventEmitter {
             clearTimeout(this.hideTimer);
             this.hideTimer = null;
         }
+        // 同一时刻只显示一个对话框：打开本实例时隐去其它已打开的
+        Dialog.hideOtherDialogs(this);
         const parent = this.options.parentElement ?? document.body;
         if (!this.dialogElement.parentElement) {
             parent.appendChild(this.dialogElement);
         }
         this.isOpen = true;
+        Dialog.openDialogs.add(this);
         this.dialogElement.style.display = 'flex';
         // 强制回流，使 display 变化先生效，随后添加 gs-show 才能触发过渡动画
         this.dialogElement.getBoundingClientRect();
@@ -458,6 +481,7 @@ export class Dialog extends EventEmitter {
     public hide(): void {
         if (!this.isOpen) return;
         this.isOpen = false;
+        Dialog.openDialogs.delete(this);
         document.removeEventListener('keydown', this.handleEscKeyDown);
         this.dialogElement.classList.remove('gs-show');
         this.hideTimer = setTimeout(() => {
@@ -477,6 +501,74 @@ export class Dialog extends EventEmitter {
     }
 
     /**
+     * 切换「点击穿透」模式
+     *
+     * 该模式下遮罩层不再拦截指针事件（CSS：`.gs-modal.gs-modal-pick`），
+     * 点击与拖拽直接落到身后页面 —— 这就是「对话框不关闭、仍能在主页面拖选单元格区域」
+     * 的实现方式。对话框本体的 pointer-events 仍是 auto，按钮/输入框照常可点。
+     *
+     * 查找/替换对话框把它**常驻开启**（不再提供「选取范围」按钮）：对话框一打开
+     * 就能直接在主表格上拖选，选区变化由调用方监听 `SELECTION_CHANGED` 回填。
+     *
+     * 对比「先关闭对话框 → 选完再重开」的方案：那样范围、关键字、选项、命中位置
+     * 全部要在两次 open 之间搬运（甚至扛不住用户中途改主意），而现在它们都活在
+     * 同一个对话框实例的闭包里。
+     * @param {boolean} on - true 开启点击穿透；false 恢复模态（遮罩拦截指针）
+     */
+    public setRangePickMode(on: boolean): void {
+        this.dialogElement.classList.toggle('gs-modal-pick', on === true);
+    }
+
+    /**
+     * 是否处于点击穿透模式
+     * @returns {boolean} 开启返回 true
+     * @public
+     */
+    public isRangePickMode(): boolean {
+        return this.dialogElement.classList.contains('gs-modal-pick');
+    }
+
+    /**
+     * 隐藏除 `except` 之外所有处于打开状态的对话框
+     *
+     * 遍历前先取快照：`hide()` 内部会把自己从 {@link openDialogs} 中摘除，
+     * 直接遍历集合会在迭代中修改它。
+     * @param {Dialog} except - 保持显示的对话框
+     * @private
+     */
+    private static hideOtherDialogs(except: Dialog): void {
+        for (const dialog of Array.from(Dialog.openDialogs)) {
+            if (dialog !== except && dialog.isOpen) {
+                dialog.hide();
+            }
+        }
+    }
+
+    /**
+     * 把对话框复位到初始的居中位置（清除标题栏拖拽产生的位移）
+     *
+     * 复用同一实例反复打开时（如查找/替换对话框），若不复位就会一直停在上次
+     * 拖放的位置，与「默认打开在主页面居中」的预期不符。
+     * @public
+     */
+    public resetPosition(): void {
+        this.dialogOffset = { x: 0, y: 0 };
+        this.dialogBoxElement.style.transform = '';
+    }
+
+    /**
+     * 获取底部按钮元素（按声明顺序）
+     *
+     * 供调用方按状态显隐某些按钮（例如查找/替换对话框按当前页签决定
+     * 是否显示「替换」「全部替换」）。未提供 buttons 时返回空数组。
+     * @returns {HTMLButtonElement[]} 底部按钮元素列表
+     * @public
+     */
+    public getFooterButtons(): HTMLButtonElement[] {
+        return this.footerButtons;
+    }
+
+    /**
      * 对话框是否处于打开状态
      * @returns {boolean} 打开返回 true
      * @public
@@ -490,6 +582,7 @@ export class Dialog extends EventEmitter {
      * @public
      */
     public destroy(): void {
+        Dialog.openDialogs.delete(this);
         document.removeEventListener('keydown', this.handleEscKeyDown);
         if (this.hideTimer !== null) {
             clearTimeout(this.hideTimer);

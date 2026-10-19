@@ -136,8 +136,10 @@ export class SectionBrush {
                     const caretIndex = this.data.cutChars();
                     this.data.cursorAbsolutePosition = caretIndex;
                 } else {
-                    // 单元格级剪切
-                    this.data.cutSelection();
+                    // 单元格级剪切：与右键菜单同口径包裹，大表按选区稀疏补丁记账可撤销/重做
+                    this.data.runWithFullStateUndo('剪切', () => this.data.cutSelection(), 'selection');
+                    // 包裹抑制了 commitValues 的自动广播，这里补一次驱动重绘（draw 按 rAF 合帧）
+                    this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
                 }
             }
         });
@@ -200,15 +202,29 @@ export class SectionBrush {
                         this.data.cursorAbsolutePosition = caretIndex;
                     }
                 } else {
-                    // 非编辑状态下进行单元格级粘贴
-                    this.data.pasteSelection();
+                    // 非编辑态单元格级粘贴：与右键菜单同口径包裹，'paste' 档按粘贴目标矩形
+                    // 捕获稀疏补丁，大表同样可撤销/重做（超大块粘贴超上限时放弃记账）
+                    this.data.runWithFullStateUndo('粘贴', () => this.data.pasteSelection(), 'paste');
+                    this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
                 }
                 break;
             case 'paste-value':
-                this.data.pastePlainText();
+                // 编辑态下不纳入全量/补丁记账（字符级编辑有独立编辑内栈），保持裸调用
+                if (this.data.isEditting) {
+                    this.data.pastePlainText();
+                } else {
+                    this.data.runWithFullStateUndo('只粘贴文本', () => this.data.pastePlainText(), 'paste');
+                    this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
+                }
                 break;
             case 'paste-style':
-                this.data.pasteFormatOnly();
+                // 同上：编辑态裸调用，避免污染编辑内撤销栈
+                if (this.data.isEditting) {
+                    this.data.pasteFormatOnly();
+                } else {
+                    this.data.runWithFullStateUndo('只粘贴格式', () => this.data.pasteFormatOnly(), 'paste');
+                    this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
+                }
                 break;
         }
     }

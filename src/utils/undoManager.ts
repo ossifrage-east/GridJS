@@ -80,6 +80,20 @@ export interface FullStateSnapshot {
 }
 
 /**
+ * 跨事件连续操作（如鼠标拖拽调整行高/列宽）的「变化前」基准快照
+ *
+ * 整个拖拽手势折叠为一条撤销记录：手势开始时捕获一次 before，
+ * 手势结束（mouseup）时捕获 after 并入栈。
+ * - 小表：{@link FullStateSnapshot}（整表前后快照）；
+ * - 大表：{@link StatePatchSnapshot}（'headers' 档，只含行/列表头浅拷贝 +
+ *   网格线/图片/筛选，不克隆任何格子 —— 拖拽行高列宽只改表头，
+ *   一万多行表头的浅拷贝也仅几毫秒，代价与整表大小无关）。
+ */
+export type ContinuousUndoSnapshot =
+    | { kind: 'full'; snapshot: FullStateSnapshot }
+    | { kind: 'patch'; snapshot: StatePatchSnapshot };
+
+/**
  * 局部单元格补丁的一项
  *
  * `data` 为 **null 表示该格子在该时刻不存在**：合并会把区域内除左上角外的
@@ -112,6 +126,119 @@ export interface CellPatchSnapshot {
 }
 
 /**
+ * 撤销/重做后应恢复的「视图锚点」
+ *
+ * 选区与活动单元格**不属于**任何一种数据快照，但必须随快照一起存取：
+ * 撤销「在第 5000 行做的格式修改」时，若视口仍停在第 1 行，用户根本看不见
+ * 刚被还原的内容，会误判成「撤销没生效」。因此每种快照类型都在 action 上
+ * 额外挂一对锚点（before / after），由 DataCollection 统一捕获与回写。
+ */
+export interface UndoAnchor {
+    /** 活动单元格名称（如 `B7`） */
+    activedCell: string;
+    /** 选区字符串（如 `A1:C3`）；null = 无选区 */
+    selection: string | null;
+}
+
+/**
+ * 稀疏状态快照接口（大表专用）
+ *
+ * 与 {@link FullStateSnapshot} 的差别只有一处：`values` 从「整表深拷贝」换成
+ * **影响面内的格子补丁**（{@link CellPatchEntry} 列表）。行/列表头、网格线、
+ * 图片、筛选条件仍然全量捕获 —— 它们要么条数远小于单元格（1.9M 格的表
+ * 也就一万多行表头），要么本来就是标量，深/浅拷贝的代价可以忽略。
+ *
+ * 之所以需要它：百万格的表做一次整表深拷贝要 1.7 秒（实测），整表快照这条路
+ * 在大表上被 {@link DataCollection} 按阈值整体关掉，于是「大表里清除一片区域
+ * 再 Ctrl+Z」会静默失效。补丁把成本压到「影响面格数」，于是大表也能正常撤销。
+ *
+ * **前提**：`cells` 必须完整覆盖本次操作的影响面。影响面会溢出选区的操作
+ * （插入/删除整行整列会把下方/右侧所有格子重映射）不能用本类型记账，
+ * 否则撤销后只还原了选区那一块、其余格子停在改后状态 —— 数据自相矛盾。
+ */
+export interface StatePatchSnapshot {
+    /**
+     * 影响面内格子在**该时刻**的状态（行优先，两条快照同序）
+     *
+     * 单侧设计：before 快照与 after 快照各自只装自己那一半，
+     * 由外层 `UndoAction` 的 before/after 字段配对，不再在内部再分一次前后
+     * （多一层嵌套只会让「取错侧」这类错误更难一眼看出）。
+     * `'headers'` 档（操作不动 values）恒为空数组。
+     */
+    cells: CellPatchEntry[];
+    /** 行表头数组浅拷贝（每项 {...rh}） */
+    rowHeaders: any[];
+    /** 列表头数组浅拷贝（每项 {...ch}） */
+    colHeaders: any[];
+    /** 是否显示网格线 */
+    showGridLines: boolean;
+    /** 内嵌图片数组（浅拷贝，与 FullStateSnapshot 同口径） */
+    images?: any[];
+    /** 筛选条件列表（可选） */
+    filters?: Array<{ col: number; anchorRow: number; keep: string[] }>;
+}
+
+/**
+ * 结构性操作快照接口（插入/删除整行整列，大表专用）
+ *
+ * 采用**命令模式**（记录「操作参数 + 被删数据」），而不是前后两份状态快照：
+ * - 插入行/列不销毁任何数据，撤销 = 删掉刚插入的那段；重做 = 再插一次；
+ * - 删除行/列销毁被删带上的格子与表头，撤销时除逆操作（结构上插回去，
+ *   下方/右侧格子自动移回原位）外，还需把这份「被删数据」原样放回。
+ *
+ * 之所以不用前后快照：插入/删除会把下方/右侧**所有**格子重命名，
+ * 前后快照等价于两份整表深拷贝 —— 正是大表下被 {@link DataCollection}
+ * 按阈值整体关掉的那条路；而命令记录的代价只与「被删带内的格子数」
+ * 成正比，与整表大小无关。
+ */
+export interface StructuralSnapshot {
+    /** 操作类别：行/列 × 插入/删除 */
+    op: 'insertRows' | 'deleteRows' | 'insertCols' | 'deleteCols';
+    /** 插入位置（insert）或删除带起始行/列号（delete），1-based */
+    at: number;
+    /** 插入/删除的数量（delete 时 = 实际删除数，已按表尾收敛） */
+    count: number;
+    /** delete 专用：被删带上的格子克隆（名字为删除前的名字）；insert 时为空数组 */
+    removedCells: CellPatchEntry[];
+    /** delete 专用：被删带上的行/列头条目（含自定义行高列宽与隐藏标记）；insert 时为空数组 */
+    removedHeaders: any[];
+    /**
+     * delete 专用：被收缩的「跨越删除带」合并锚点的原始跨距
+     *
+     * 删除会把锚点在删除带**上方/左侧**、但跨距末端伸进删除带的合并收缩
+     * （收缩量 = 与删除带的重叠数，可能小于 count）。撤销时的结构插回只能
+     * 按 count 还原「整段跨越」的合并，端点落在删除带内部的合并无法由它
+     * 还原 —— 用这里记录的原始值按名字直接赋回（赋值语义，天然幂等）。
+     */
+    shrunkMerges: Array<{ cell: string; rowspan?: number; colspan?: number }>;
+}
+
+/**
+ * 排序排列快照接口（大表专用的可撤销排序记录）
+ *
+ * 排序本质上只是选定行/列范围内的一次**置换**，没有任何格子被创建或销毁。
+ * 旧实现无论表多大都克隆两份整表（排序前/后各一份，含全部 chars 深拷贝），
+ * 百万格单次排序仅撤销记账就要数秒与上百 MB 内存。改为只记两条索引数组：
+ * - `positions[i]`（0-based 绝对行/列号）位置上，排序后放着原来位于
+ *   `origins[i]` 的那一行/列；
+ * - 撤销 = 交换两个数组的角色再做一次置换，重做 = 按原数组再置换一次。
+ *
+ * 记账成本 O(参与排序的行/列数)（仅两个数字数组），与整表格子数无关；
+ * 执行一次撤销/重做是 O(实际格子数) 的单遍改名，与排序自身同阶。
+ *
+ * axis 沿用 MatrixSorter 的语义：'column' = 按列排序**行**（置换行），
+ * 'row' = 按行排序**列**（置换列）。
+ */
+export interface SortPermutationSnapshot {
+    /** 排序轴：'column' 时置换行，'row' 时置换列 */
+    axis: 'column' | 'row';
+    /** 目标位置序列（0-based 绝对行/列号，升序且已剔除筛选锚点） */
+    positions: number[];
+    /** 排序后落在 {@link positions} 各位置上的原始行/列号序列 */
+    origins: number[];
+}
+
+/**
  * 撤销操作接口
  * 记录单个操作的所有信息
  */
@@ -126,6 +253,16 @@ export interface UndoAction {
     groupId?: string;
     /** 可读标签，便于调试与撤销菜单展示 */
     label?: string;
+    /**
+     * 撤销后应恢复到的视图锚点（操作发生**前**的选区与活动格）
+     *
+     * 可选：旧快照没有该字段，缺失时 DataCollection 只还原数据、不动选区。
+     */
+    anchorBefore?: UndoAnchor;
+    /**
+     * 重做后应恢复到的视图锚点（操作发生**后**的选区与活动格）
+     */
+    anchorAfter?: UndoAnchor;
 }
 
 /**
