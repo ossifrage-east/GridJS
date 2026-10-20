@@ -151,12 +151,18 @@ export const PY_EDITOR_CLASS_NAMES = {   // 定义 Python 编辑器（「脚本�
     CONTAINER: 'py-editor',
     TOOLBAR: 'py-editor-toolbar',
     TITLE: 'py-editor-title',
+    ACTIONS: 'py-editor-actions',
+    RUN: 'py-editor-run',
+    STOP: 'py-editor-stop',
     STATUS: 'py-editor-status',
     BODY: 'py-editor-body',
     GUTTER: 'py-editor-gutter',
     CODE: 'py-editor-code',
     HIGHLIGHT: 'py-editor-highlight',
     INPUT: 'py-editor-input',
+    OUTPUT: 'py-editor-output',
+    OUTPUT_LINE: 'py-editor-output-line',
+    OUTPUT_ERROR: 'py-editor-output-error',
 }
 
 export const MENU_CLASS_NAMES = {

@@ -9,6 +9,8 @@ import { DataEvents, PY_EDITOR_CLASS_NAMES } from '../constant';
 import { IndexDB } from '../dataArchitecture/indexDB';
 import { DataCollection } from '../dataArchitecture/dataCollection';
 import { createDiv, createElement, createSpan } from '../../utils/dom';
+import { runPython, stopPython } from '../../utils/python/pythonClient';
+import { PY_NAMESPACE_SOURCE, buildSnapshot, applyWrites } from '../../utils/python/sheetNameSpace';
 import '../style/pyEditor.scss';
 
 /** Python 关键字（高亮为「关键字」色） */
@@ -79,6 +81,9 @@ function escapeHtml(text: string): string {
  * - 缩进辅助：Tab 缩进、Shift+Tab 反缩进（选区跨行时按行批量处理）、
  *   回车自动延续缩进（行尾为 `:` 时自动加一级）；
  * - 状态栏：实时显示光标所在行 / 列；
+ * - 运行脚本：工具栏「运行 / 停止」按钮，经 Pyodide Worker 执行当前脚本
+ *   （见 {@link PYEditor.handleRun}），stdout / stderr 实时流式追加到页签下方的
+ *   输出面板，脚本对工作表的写入会套进撤销栈落回表格；
  * - 持久化：内容变化防抖写入 IndexedDB，**按当前工作表名分键存储**，
  *   切换工作表时先落盘旧表脚本、再载入新表脚本，刷新后自动恢复；
  * - 选区保持：存在选区（如 Ctrl+A 全选）时，点击选中的文字保持选区不变，
@@ -102,6 +107,19 @@ export class PYEditor {
     private readonly textarea: HTMLTextAreaElement;
     /** 状态栏（行 / 列指示） */
     private readonly status: HTMLSpanElement;
+    /** 工具栏「运行」按钮 */
+    private readonly runButton: HTMLButtonElement;
+    /** 工具栏「停止」按钮 */
+    private readonly stopButton: HTMLButtonElement;
+    /** 输出面板（stdout / stderr / 运行结果） */
+    private readonly output: HTMLDivElement;
+    /**
+     * 是否正在运行
+     *
+     * 兼作串行保护：Pyodide 的 stdout/stderr 绑定是「按当前请求 id」的，
+     * 两次运行重叠会让输出串到错误的运行上（见 pythonClient 的并发约定）。
+     */
+    private isRunning = false;
     /** 界面状态持久化存储 */
     private readonly db: IndexDB;
     /** 当前行号栏渲染的行数（行数未变时跳过重排） */
@@ -166,6 +184,9 @@ export class PYEditor {
      * 无存档的新文件之间就无法区分。名字取
      * {@link DataCollection.activedSheetName}（它同时是该文件脚本的存储键，
      * 故注释与存档键天然一致）。
+     *
+     * 注释里同时列出读写当前工作表可用的 API：脚本页签里没有别的文档入口，
+     * 把 API 清单放在「新建文件时第一眼看到的地方」是唯一不增加界面的做法。
      * @param sheetName - 文件名（工作表名）；为空（未打开文件）时退化为不带名字的标题
      * @returns 默认脚本文本
      */
@@ -174,14 +195,26 @@ export class PYEditor {
         return [
             `# ${title}`,
             '# 在此编写脚本，内容会自动保存在本机（IndexedDB）',
+            '#',
+            '# 可用 API（读写当前工作表）：',
+            '#   sheet_name / row_count / col_count   当前工作表名、行数、列数',
+            '#   get_cell("A1")                        读取单元格文本（空格子返回空串）',
+            '#   set_cell("A1", "值") / clear_cell("A1")  写入 / 清空单元格，运行后可 Ctrl+Z 撤销',
+            '#   get_range("A1:C3")                    读取区域，返回二维列表',
+            '#   set_range("A1:C3", [["a1","b1"],["a2","b2"]])  写入区域，以 A1 为左上角',
+            '#',
+            '# 也可把单元格名直接当变量名（列字母须大写，x1 / b2 这类小写名仍按普通变量），',
+            '# 模块级与 def 函数体内都成立：',
+            '#   A1 = 1                等价于 set_cell("A1", 1)',
+            '#   C10 = "2026-10-20"    等价于 set_cell("C10", "2026-10-20")',
+            '#   x = A1                等价于 x = get_cell("A1")',
+            '#   def main():',
+            '#       B2 = 42           函数体内同样写入 B2 单元格',
             '',
             '',
-            'def main():',
-            '    print("Hello, SilkSpaces!")',
+            'B2 = "Hello, SilkSpaces!"',
             '',
             '',
-            'if __name__ == "__main__":',
-            '    main()',
         ].join('\n');
     }
 
@@ -191,10 +224,26 @@ export class PYEditor {
         this.container = createDiv({ className: PY_EDITOR_CLASS_NAMES.CONTAINER });
 
         this.status = createSpan({ className: PY_EDITOR_CLASS_NAMES.STATUS });
+        // 按钮只放图标（i.icon-play3 / i.icon-stop2，来自 icon.css），文字提示走 title
+        this.runButton = createElement('button', {
+            className: PY_EDITOR_CLASS_NAMES.RUN,
+            attributes: { type: 'button', title: '运行当前脚本' },
+        }) as HTMLButtonElement;
+        this.runButton.appendChild(createElement('i', { className: 'icon-play3' }));
+        this.stopButton = createElement('button', {
+            className: PY_EDITOR_CLASS_NAMES.STOP,
+            attributes: { type: 'button', disabled: 'disabled', title: '强制终止正在运行的脚本' },
+        }) as HTMLButtonElement;
+        this.stopButton.appendChild(createElement('i', { className: 'icon-stop2' }));
+        const actions = createDiv({
+            className: PY_EDITOR_CLASS_NAMES.ACTIONS,
+            children: [this.runButton, this.stopButton],
+        });
         const toolbar = createDiv({
             className: PY_EDITOR_CLASS_NAMES.TOOLBAR,
             children: [
                 createSpan({ className: PY_EDITOR_CLASS_NAMES.TITLE, textContent: 'Python 脚本' }),
+                actions,
                 this.status,
             ],
         });
@@ -221,7 +270,12 @@ export class PYEditor {
             className: PY_EDITOR_CLASS_NAMES.BODY,
             children: [this.gutter, codeWrap],
         });
-        this.container.append(toolbar, body);
+        // tabindex=-1：容器可获焦点，从而接收键盘事件（Ctrl+C 复制等）
+        this.output = createDiv({
+            className: PY_EDITOR_CLASS_NAMES.OUTPUT,
+            attributes: { tabindex: '-1' },
+        });
+        this.container.append(toolbar, body, this.output);
 
         this.bindEvents();
         this.setValue(PYEditor.defaultScript(this.data.activedSheetName));
@@ -259,10 +313,120 @@ export class PYEditor {
     }
 
     /**
+     * 运行当前脚本（工具栏「运行」）
+     *
+     * 流程：导出当前工作表快照 → 交给 Pyodide Worker 执行（stdout/stderr 实时
+     * 追加到输出面板）→ 把脚本的写回改动套进撤销栈落到表格上。
+     *
+     * 失败一律在输出面板里呈现（而不是弹窗）：
+     * - Worker 基础设施不可用 → {@link PythonWorkerUnavailableError}，文案里带排查提示；
+     * - 脚本自身异常 → Python 的完整 traceback；
+     * - 用户点了「停止」或运行超时 → 由 {@link runPython} 的拒绝文案给出。
+     * @private
+     */
+    private async handleRun(): Promise<void> {
+        if (this.isRunning) return;
+        this.setRunningState(true);
+        this.clearOutput();
+        this.appendOutput('正在运行…（首次运行需先加载 Python 运行环境）', false);
+
+        const snapshot = buildSnapshot(this.data);
+        try {
+            const { writesJson } = await runPython({
+                script: this.getValue(),
+                sheetName: snapshot.sheetName,
+                snapshotJson: snapshot.json,
+                rowCount: snapshot.rowCount,
+                colCount: snapshot.colCount,
+                namespaceSource: PY_NAMESPACE_SOURCE,
+                onStdout: (text: string) => this.appendOutput(text, false),
+                onStderr: (text: string) => this.appendOutput(text, true),
+            });
+            const count = applyWrites(this.data, writesJson, '运行 Python 脚本');
+            this.appendOutput(count > 0 ? `运行完成，已写入 ${count} 个单元格` : '运行完成', false);
+        } catch (err) {
+            this.appendOutput(err instanceof Error ? err.message : String(err), true);
+        } finally {
+            this.setRunningState(false);
+        }
+    }
+
+    /**
+     * 停止正在运行的脚本（工具栏「停止」）
+     *
+     * 死循环里的 Pyodide 没有任何抢占点，唯一可靠的打断方式是丢弃整个 Worker
+     * （见 `pythonClient.stopPython`）。代价是下次运行需要重新加载运行环境，
+     * 这一点由 {@link handleRun} 开头的提示覆盖。
+     * 停止后 {@link runPython} 会以「已停止」被拒绝，提示文案由 handleRun 的
+     * catch 分支统一负责，这里不重复输出。
+     * @private
+     */
+    private handleStop(): void {
+        if (!this.isRunning) return;
+        stopPython();
+    }
+
+    /**
+     * 切换「运行中 / 空闲」的按钮状态
+     * @param running - 是否正在运行
+     * @private
+     */
+    private setRunningState(running: boolean): void {
+        this.isRunning = running;
+        this.runButton.disabled = running;
+        this.stopButton.disabled = !running;
+    }
+
+    /** 清空输出面板（每次运行开始时调用） */
+    private clearOutput(): void {
+        this.output.textContent = '';
+    }
+
+    /**
+     * 向输出面板追加文本（实时流式）
+     *
+     * Pyodide 的 `batched` 回调按批给出文本（内含换行），故按行拆分后逐行建节点：
+     * 一行一个 div，空行也保留（`min-height` 维持行高），空行被折叠会破坏
+     * 脚本输出的可读性。末尾因「文本以换行结尾」多出的空段则丢弃，否则每次
+     * 追加都会凭空多出一行空白。
+     * @param text - 待追加的文本（可能含多行）
+     * @param isError - 是否为错误输出（stderr / traceback），用红色区分
+     * @private
+     */
+    private appendOutput(text: string, isError: boolean): void {
+        if (!text) return;
+        const lines = text.split('\n');
+        if (lines[lines.length - 1] === '') lines.pop();
+        for (const line of lines) {
+            const el = createDiv({
+                className: PY_EDITOR_CLASS_NAMES.OUTPUT_LINE,
+                textContent: line,
+            });
+            if (isError) el.classList.add(PY_EDITOR_CLASS_NAMES.OUTPUT_ERROR);
+            this.output.appendChild(el);
+        }
+        // 流式输出必须跟着滚动到底，否则运行中看不到最新一行
+        this.output.scrollTop = this.output.scrollHeight;
+    }
+
+    /**
      * 绑定输入 / 滚动 / 键盘事件
      * @private
      */
     private bindEvents(): void {
+        this.runButton.addEventListener('click', () => { void this.handleRun(); });
+        this.stopButton.addEventListener('click', () => this.handleStop());
+        // 输出面板的复制 / 剪切 / 全选交还给浏览器：
+        // editCanvas 在 document 级（冒泡阶段）监听 keydown，遇非输入类元素会
+        // preventDefault 并复制表格选区，会把输出面板的 Ctrl+C 抢走。这里在
+        // 容器上截断冒泡（不阻止默认行为，浏览器原生复制照常执行）。
+        this.output.addEventListener('keydown', (e: KeyboardEvent) => {
+            if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+            if (e.key === 'c' || e.key === 'C' || e.key === 'x' || e.key === 'X'
+                || e.key === 'a' || e.key === 'A') {
+                e.stopPropagation();
+            }
+        });
         this.textarea.addEventListener('input', () => {
             this.dirty = true;
             this.refresh();

@@ -1,4 +1,5 @@
 const HtmlWebpackPlugin = require('html-webpack-plugin');
+const CopyWebpackPlugin = require('copy-webpack-plugin');
 const MiniCssExtractPlugin = require('mini-css-extract-plugin');
 const MiniSVGDataURI = require("mini-svg-data-uri");  // SVG 文件转换为 URI 编码后，与 base64 相比，体积会更小
 const fs = require('fs');
@@ -30,6 +31,26 @@ const mainConfig = {
     }),
     new MiniCssExtractPlugin({
       filename: '[name].[contenthash:8].css',
+    }),
+    // Pyodide 运行时资产：非 webpack 模块，由 Worker 在运行时按 indexURL 自行拉取，
+    // 因此必须原样拷贝到 dist 下的**固定路径** dist/pyodide/（不能带 hash）。
+    // 只保留运行时真正会用到的 5 个文件：
+    //   pyodide.mjs（ESM 入口，Worker 用动态 import() 加载；classic 脚本 pyodide.js 不要，
+    //               Pyodide 314 在 classic worker 内会直接拒绝运行）
+    //   pyodide.asm.mjs（Pyodide 自身以动态 import() 拉取）
+    //   pyodide.asm.wasm、python_stdlib.zip、pyodide-lock.json
+    // 其余（类型声明 / sourcemap / 文档 / 包描述 / pyodide.js / console 示例页）都剔除。
+    new CopyWebpackPlugin({
+      patterns: [{
+        from: resolve(__dirname, './node_modules/pyodide'),
+        to: 'pyodide',
+        globOptions: {
+          ignore: [
+            '**/*.d.ts', '**/*.map', '**/README.md', '**/package.json',
+            '**/console*.html', '**/pyodide.js'
+          ],
+        },
+      }],
     })
    ],
   module: {
@@ -179,4 +200,46 @@ const workerConfig = {
   },
 };
 
-module.exports = [mainConfig, workerConfig];
+// —— Pyodide 执行 Worker 配置 ——
+// 与解析 Worker 同构：只打包 python.worker.ts 这一个入口，输出固定文件名
+// python.worker.js（pythonClient 以 `new Worker('python.worker.js', { type: 'module' })`
+// 加载）。Pyodide 运行时（wasm / stdlib）不参与打包，由 Worker 在运行时按
+// indexURL 从 dist/pyodide/ 拉取（见上方 CopyWebpackPlugin）。
+//
+// **必须产出为 ES module**：Pyodide 314 会拒绝在 classic worker 中初始化
+// （见 python.worker.ts 注释），而 classic 与否由 Worker 的构造方式决定，
+// 故这里开 outputModule，让 python.worker.js 是 ESM 文件。
+const pythonWorkerConfig = {
+  name: 'python-worker',
+  mode: "development",
+  target: 'webworker',
+  experiments: {
+    outputModule: true,
+  },
+  entry: resolve(__dirname, './src/utils/python/python.worker.ts'),
+  output: {
+    filename: 'python.worker.js',
+    path: DIST,
+    clean: false, // 与主配置共用 dist，清空已在上方统一完成
+    module: true,
+  },
+  module: {
+    rules: [
+      {
+        test: /\.tsx?$/,
+        use: 'ts-loader',
+        exclude: /node_modules/
+      }
+    ]
+  },
+  resolve: {
+    extensions: ['.ts', '.js'],
+    fallback: {
+      'fs': false,
+      'path': false,
+      'vm': false
+    }
+  },
+};
+
+module.exports = [mainConfig, workerConfig, pythonWorkerConfig];
