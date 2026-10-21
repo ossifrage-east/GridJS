@@ -160,12 +160,9 @@ export class PYEditor {
         '# 在此编写脚本，内容会自动保存在本机（IndexedDB）',
         '',
         '',
-        'def main():',
-        '    print("Hello, SilkSpaces!")',
+        'B2 = "Hello, SilkSpaces!"',
         '',
         '',
-        'if __name__ == "__main__":',
-        '    main()',
     ].join('\n');
 
     /**

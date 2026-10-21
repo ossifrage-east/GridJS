@@ -1045,10 +1045,12 @@ export class SheetCanvas extends Canvas {
         this.data.startRow = 1;
         this.data.startHeight = 0;
         if (this.data.brushMode) {
-            // 格式刷落刷：影响面 = 当前目标选区，'selection' 档按选区捕获稀疏补丁，
+            // 格式刷落刷：影响面 = 目标选区 ∪ 源跨度撑开的块（'brush' 档）。
+            // 不能只用 'selection' —— 源是合并单元格时落点会变成更大的合并块，
+            // 块内被覆盖的格子在选区之外，漏记的话大表下撤销撤不回它们。
             // 大表同样可撤销/重做（exeBrush 单格分支内部调 pasteFormatOnly，
             // 嵌套的记账捕获会自动折叠到本层，只产生一条记录）。
-            this.data.runWithFullStateUndo('格式刷', () => this.data.exeBrush(), 'selection');
+            this.data.runWithFullStateUndo('格式刷', () => this.data.exeBrush(), 'brush');
             // 包裹抑制了 exeBrush 内部 commitValues 的自动广播，补一次驱动重绘
             this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
         }

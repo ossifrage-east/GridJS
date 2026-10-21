@@ -2226,7 +2226,7 @@ export class DataCollection extends EventEmitter {
     public runWithFullStateUndo(
         label: string,
         action: () => void,
-        scope: 'auto' | 'selection' | 'headers' | 'paste' | 'shiftLeft' | 'shiftUp' | 'filters' = 'auto',
+        scope: 'auto' | 'selection' | 'headers' | 'paste' | 'brush' | 'shiftLeft' | 'shiftUp' | 'filters' = 'auto',
         rect?: { startCol: number; endCol: number; startRow: number; endRow: number }
     ): void {
         const isOutermost = this._fullStateUndoDepth === 0;
@@ -2236,9 +2236,10 @@ export class DataCollection extends EventEmitter {
             = (isOutermost && !this._undoTrackingEnabled())
                 ? (scope === 'selection' ? this._selectionRectForPatch()
                     : scope === 'paste' ? this._pasteRectForPatch()
-                        : scope === 'shiftLeft' ? this._shiftLeftRectForPatch(rect)
-                            : scope === 'shiftUp' ? this._shiftUpRectForPatch(rect)
-                                : null)
+                        : scope === 'brush' ? this._brushRectForPatch()
+                            : scope === 'shiftLeft' ? this._shiftLeftRectForPatch(rect)
+                                : scope === 'shiftUp' ? this._shiftUpRectForPatch(rect)
+                                    : null)
                 : null;
         // 仅最外层需要「变化前」快照；嵌套层复用外层的捕获结果
         const before = (isOutermost && this._undoTrackingEnabled()) ? this._captureFullState() : null;
@@ -2247,7 +2248,7 @@ export class DataCollection extends EventEmitter {
             ? this._captureFilterCellsPatch()
             : undefined;
         const sparseBefore = (isOutermost && !this._undoTrackingEnabled()
-            && (scope === 'selection' || scope === 'headers' || scope === 'paste'
+            && (scope === 'selection' || scope === 'headers' || scope === 'paste' || scope === 'brush'
                 || scope === 'shiftLeft' || scope === 'shiftUp' || scope === 'filters'))
             ? this._captureStatePatch(sparse, scope === 'headers', sparseCells)
             : null;
@@ -2314,6 +2315,20 @@ export class DataCollection extends EventEmitter {
      */
     private _pasteRectForPatch(): { startCol: number; endCol: number; startRow: number; endRow: number } | null {
         return this._capPatchRect(this.getPasteTargetRect());
+    }
+
+    /**
+     * 求「格式刷」的捕获矩形（大表专用）
+     *
+     * 影响面 = **目标选区 ∪ 由源跨度撑开的块**。必须撑开：源是合并单元格（3×3）而
+     * 目标只选了 1 格时，落点会变成一个 3×3 合并块，块内被覆盖的格子要被删除 ——
+     * 那些格子在选区**之外**，只用 'selection' 档记账的话大表下撤销/重做撤不回它们
+     * （表现为「撤一次只撤掉一半」）。
+     * @returns 捕获矩形；null = 放弃记账
+     * @private
+     */
+    private _brushRectForPatch(): { startCol: number; endCol: number; startRow: number; endRow: number } | null {
+        return this._capPatchRect(this.getBrushTargetRect());
     }
 
     /** 给影响面矩形套 {@link LARGE_TABLE_PATCH_CELLS} 上限；超限返回 null */
@@ -2417,6 +2432,35 @@ export class DataCollection extends EventEmitter {
             endCol: activedCol + targetColOffsets[targetColOffsets.length - 1],
             startRow: activedRow,
             endRow: activedRow + targetRowOffsets[targetRowOffsets.length - 1],
+        };
+    }
+
+    /**
+     * 求「格式刷落刷」的影响面矩形：目标选区按源的最大跨度向右下撑开
+     *
+     * 撑开量取剪贴板里**最大**的 colspan/rowspan，而不是逐格精确计算 ——
+     * 精确值要为每个目标位置重算一遍源对应关系（回绕 + 隐藏行列），而偏大的
+     * 影响面只是多克隆几个前后完全相同的空格子（无害空转），代价远低于漏记
+     * （漏记 = 撤销后数据自相矛盾）。源里没有任何跨度时原样返回选区矩形。
+     * @returns 影响面矩形；无选区时返回 null
+     */
+    public getBrushTargetRect(): { startCol: number; endCol: number; startRow: number; endRow: number } | null {
+        const sel = this._selection ? this._parseRect(this._selection) : null;
+        if (!sel) return null;
+        const clipboard = this.clipboardManager.getClipboard();
+        if (!clipboard || clipboard.type !== 'cell' || !clipboard.cells) return sel;
+        let maxColspan = 1;
+        let maxRowspan = 1;
+        for (const cell of clipboard.cells) {
+            if (typeof cell.colspan === 'number' && cell.colspan > maxColspan) maxColspan = cell.colspan;
+            if (typeof cell.rowspan === 'number' && cell.rowspan > maxRowspan) maxRowspan = cell.rowspan;
+        }
+        if (maxColspan === 1 && maxRowspan === 1) return sel;
+        return {
+            startCol: sel.startCol,
+            startRow: sel.startRow,
+            endCol: sel.endCol + (maxColspan - 1),
+            endRow: sel.endRow + (maxRowspan - 1),
         };
     }
 
@@ -3572,6 +3616,22 @@ export class DataCollection extends EventEmitter {
             const c = this.getCellByName(this.getCellName(maxCol, row));
             if (c && c.borderRightWidth) { outline.right = c.borderRightWidth; noteColor(c); }
         }
+        // 【锚点兜底，勿删】对合并区里**任一格**设边框都会重定向到锚点
+        // （见 ensureWritableCell），于是「给整个合并块加外框」最终只在锚点 D3 上
+        // 留下四条边框；而上面四段扫描分别只认 minRow / maxRow / minCol / maxCol
+        // 上的格子 —— 锚点若不在那条边上（bottom 认第 5 行、right 认 F 列），
+        // 就永远扫不到，合并块会缺下边框 / 右边框。故未取到时用锚点对应边兜底。
+        // 纯加法：只填 undefined 的槽位，老数据（区域各格各自带边框）不受影响。
+        if (outline.top === undefined || outline.bottom === undefined
+            || outline.left === undefined || outline.right === undefined) {
+            const anchor = this.getCellByName(this.getCellName(minCol, minRow));
+            if (anchor) {
+                if (outline.top === undefined && anchor.borderTopWidth) { outline.top = anchor.borderTopWidth; noteColor(anchor); }
+                if (outline.bottom === undefined && anchor.borderBottomWidth) { outline.bottom = anchor.borderBottomWidth; noteColor(anchor); }
+                if (outline.left === undefined && anchor.borderLeftWidth) { outline.left = anchor.borderLeftWidth; noteColor(anchor); }
+                if (outline.right === undefined && anchor.borderRightWidth) { outline.right = anchor.borderRightWidth; noteColor(anchor); }
+            }
+        }
         return outline;
     }
 
@@ -4062,6 +4122,118 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 粘贴 / 格式刷把「源合并单元格」的跨度传播到目标后，清掉目标块内被覆盖的格子
+     *
+     * 语义与 {@link executeMergeCells} 完全同口径（两处必须保持一致，否则
+     * 「手动合并」与「粘出来的合并」行为会分叉）：
+     * - 块内**带边框 / 底色**的格子留在 `values` 里，只清空文字与筛选按钮 ——
+     *   它们是「取消合并后线能连起来」的唯一依据（详见 executeMergeCells 的说明）；
+     * - 其余（只有文字或全空）的格子整条删除 —— 它们在合并态下永远被遮挡层盖住，
+     *   留着只会让「按名查找 / 查找替换」扫到一条看不见的垃圾记录。
+     *
+     * 【两阶段分离】先只读收集，再一次性改 `_values`，最后只 `invalidateCellIndex()`
+     * 一次；交替「remove + 按名查找」会让每格重建整份索引（O(N)）。
+     *
+     * 【必须在撤销作用域内调用】删除格子属于 `values` 改动，不落在补丁影响面里
+     * 就撤不回来（大表下表现尤其明显：撤销后块内旧内容不回来）。
+     *
+     * @param anchors - 落点锚点及其**最终**跨度；`col`/`row` 须与 `name` 对应
+     *                  （写入被重定向时是锚点自己的坐标，不是被覆盖位置的）
+     */
+    private _pruneCoveredCellsBySpans(
+        anchors: { name: string; col: number; row: number; colspan: number; rowspan: number }[]
+    ): void {
+        if (anchors.length === 0) return;
+        // 同一锚点可能被登记多次（源按 % 回绕平铺时），按名去重，保留首次跨度
+        const list: { name: string; col: number; row: number; colspan: number; rowspan: number }[] = [];
+        const anchorNames = new Set<string>();
+        for (const a of anchors) {
+            if (anchorNames.has(a.name)) continue;
+            anchorNames.add(a.name);
+            list.push(a);
+        }
+        // ── 阶段一：只读（索引稳态，getCellByName 全 O(1)）──
+        const toRemove = new Set<string>();
+        const keepers: Cell[] = [];
+        for (const a of list) {
+            const endCol = a.col + a.colspan - 1;
+            const endRow = a.row + a.rowspan - 1;
+            for (let row = a.row; row <= endRow; row++) {
+                for (let col = a.col; col <= endCol; col++) {
+                    if (col === a.col && row === a.row) continue;
+                    const name = this.getCellName(col, row);
+                    if (anchorNames.has(name)) continue; // 另一个落点锚点，不删
+                    const cell = this.getCellByName(name);
+                    if (!cell) continue;
+                    if (this.hasPaintStyle(cell)) keepers.push(cell);
+                    else toRemove.add(name);
+                }
+            }
+        }
+        if (toRemove.size === 0 && keepers.length === 0) {
+            // 【勿删】跨度**已经写进锚点了**（H4 从此是 3×3 合并块），合并倒排索引必须重算 ——
+            // 哪怕块内原本一个格子都没有（无需删除）：`_mergeRects` 由 cell 的 colspan/rowspan
+            // 推导，而改跨度既不改 `_values.length` 也不置 `_indexStructurallyInvalid`，
+            // `_ensureCellIndex()` 看不出变化 → `findMergeRect` 给的是旧结论。
+            // 少这一句的后果：粘出来的合并块当帧不生效，选中框 / 渲染 / 后续
+            // 写入重定向全部按「没合并」处理，直到下一次碰巧的整份索引重建。
+            this.invalidateCellIndex();
+            return;
+        }
+        // ── 阶段二：结构性修改（此后不再按名查找）──
+        this._removeCellsByNames(toRemove);
+        for (let i = 0; i < keepers.length; i++) {
+            keepers[i].chars = [];
+            keepers[i].filter = undefined;
+        }
+        this.invalidateCellIndex();
+    }
+
+    /**
+     * 登记一个「落点最终带跨度」的锚点，供 {@link _pruneCoveredCellsBySpans} 结算
+     *
+     * 只在跨度 >1 时才解析坐标（普通粘贴是绝对多数路径，不该为它付 `getCellColAndRow` 的代价）。
+     * @param sink - 收集数组
+     * @param cell - 落点单元格（**已被写入最终跨度**）；重定向时 `cell.cell` 是锚点名
+     */
+    private _collectSpanAnchor(
+        sink: { name: string; col: number; row: number; colspan: number; rowspan: number }[],
+        cell: Cell
+    ): void {
+        const colspan = cell.colspan ?? 1;
+        const rowspan = cell.rowspan ?? 1;
+        if (colspan <= 1 && rowspan <= 1) return;
+        const { col, row } = this.getCellColAndRow(cell.cell);
+        if (!isFinite(col) || !isFinite(row) || col < 1 || row < 1) return;
+        sink.push({ name: cell.cell, col, row, colspan, rowspan });
+    }
+
+    /**
+     * 一段字符是否「单一样式」（不存在富文本多段样式）
+     *
+     * 用于粘贴时决定**能不能**刷单元格级字体：Cell 的字体 setter 写的是**全部**字符，
+     * 源是多段富文本时刷一遍就等于把分段抹平（Excel 的「粘贴」保留分段）。
+     * 空数组 / 单字符视为单一（无可分歧之处）。
+     * @param {Char[] | undefined} chars - 源单元格的字符序列
+     * @returns {boolean} 全部字符样式一致时 true
+     */
+    private _hasUniformCharStyle(chars: Char[] | undefined): boolean {
+        if (!chars || chars.length <= 1) return true;
+        const first = chars[0];
+        for (let i = 1; i < chars.length; i++) {
+            const c = chars[i];
+            if (c.fontFamily !== first.fontFamily
+                || c.fontSize !== first.fontSize
+                || c.fontWeight !== first.fontWeight
+                || c.fontStyle !== first.fontStyle
+                || c.fontColor !== first.fontColor
+                || c.underline !== first.underline
+                || c.strikethrough !== first.strikethrough) return false;
+        }
+        return true;
+    }
+
+    /**
      * 取消合并单元格
      * 将当前选中的合并单元格恢复为独立的单元格
      * 合并区域的内容和文字样式保留在左上角单元格中
@@ -4395,6 +4567,154 @@ export class DataCollection extends EventEmitter {
         const rect = this.findMergeRect(col, row);
         if (rect === null) return null;
         return `${rect.anchor}:${this.getColName(rect.endCol)}${rect.endRow}`;
+    }
+
+    /**
+     * 粘贴 / 格式刷收尾：把选区对齐到「这次操作真正影响到的范围」
+     *
+     * 两件事，取**并集**（谁大听谁的）：
+     * ① **整块粘贴范围**（Excel 行为）：粘完之后选中的是粘出来的那一片，而不是粘贴前
+     *    那个可能毫不相干的旧选区。传入 {@link getPasteTargetRect} / {@link getBrushTargetRect}
+     *    的矩形即可；矩形缺省（如「粘贴字符」这种只动活动格的路径）时本项不参与。
+     * ② **活动格所在的整个合并块**：把 3×3 的 D3 粘到 H4 → H4 当场成为 H4:J6 的锚点，
+     *    此时选区若只停在单个 H4，选中框只框住左上 1/9 格，紧接着的复制 / 删除 / 设格式
+     *    也就跟着只作用于 1/9。落点本就在既有合并块内部时同理（写在 D3:F5 里的 E4，
+     *    框必须是 D3:F5）。
+     *
+     * 【判定必须走数值矩形】用 {@link findMergeRect} 倒排索引 —— 勿写成
+     * `mergedCells.find(v => v.includes(name))`（`'B22:D24'.includes('B2')` 的坑）。
+     *
+     * 【两者都落空时不动选区】没有传入矩形、活动格也不在任何合并区内 → 保持原选区。
+     * @param {Object} [rect] - 本次操作影响到的矩形（粘贴落点 / 落刷影响面）
+     * @returns {void}
+     */
+    public syncSelectionToMergedActive(
+        rect?: { startCol: number; endCol: number; startRow: number; endRow: number }
+    ): void {
+        const active = this._activedCell;
+        if (!active) return;
+        const { col, row } = this.getCellColAndRow(active);
+        if (!isFinite(col) || !isFinite(row) || col < 1 || row < 1) return;
+
+        let startCol = Infinity, endCol = -Infinity, startRow = Infinity, endRow = -Infinity;
+        const include = (c1: number, c2: number, r1: number, r2: number): void => {
+            if (!isFinite(c1) || !isFinite(c2) || !isFinite(r1) || !isFinite(r2)) return;
+            if (c1 < startCol) startCol = c1;
+            if (c2 > endCol) endCol = c2;
+            if (r1 < startRow) startRow = r1;
+            if (r2 > endRow) endRow = r2;
+        };
+        const merged = this.findMergeRect(col, row);
+        if (merged !== null) include(merged.startCol, merged.endCol, merged.startRow, merged.endRow);
+        if (rect !== undefined) include(rect.startCol, rect.endCol, rect.startRow, rect.endRow);
+        if (endCol < startCol || endRow < startRow) return;      // 两者都落空 → 保持原选区
+
+        const range = `${this.getCellName(startCol, startRow)}:${this.getCellName(endCol, endRow)}`;
+        if (range === this._selection) return;
+        this.selection = range;
+    }
+
+    /**
+     * 取覆盖该位置的合并区域**锚点名**（如 `'D3'`）；不在任何合并区内、或该位置**就是**锚点时 `null`
+     *
+     * 与 {@link getMergedRangeAt} 的分工：后者返回「整个区域」的选区串（`'D3:F5'`），
+     * 供**选区展开**使用；这里只返回锚点，供**写入重定向**使用。
+     * 判定同样走 {@link findMergeRect} 的数值矩形 —— 勿写成字符串包含
+     * （`('B22:D24').includes('B2') === true`，理由见 {@link getMergedRangeAt}）。
+     * @param {number} col - 列号（1-based）
+     * @param {number} row - 行号（1-based）
+     * @returns {string | null} 覆盖该位置的合并区域锚点名；不需要重定向时 null
+     */
+    public findMergeAnchorName(col: number, row: number): string | null {
+        const rect = this.findMergeRect(col, row);
+        if (rect === null) return null;
+        if (col === rect.startCol && row === rect.startRow) return null;   // 自己就是锚点，无需重定向
+        return rect.anchor;
+    }
+
+    /**
+     * 该位置是否被合并区域**覆盖**（在某个合并区内，但不是锚点本身）
+     * @param {number} col - 列号（1-based）
+     * @param {number} row - 行号（1-based）
+     * @returns {boolean} 是「被合并吞掉的格子」时 true
+     */
+    public isCoveredByMerge(col: number, row: number): boolean {
+        return this.findMergeAnchorName(col, row) !== null;
+    }
+
+    /** @see resolveWriteTargetName(string) */
+    public resolveWriteTargetName(name: string): string;
+    /** @see resolveWriteTargetName(number, number) */
+    public resolveWriteTargetName(col: number, row: number): string;
+    /**
+     * 解析「这次修改该落到哪个格子名上」—— 合并区域内的非锚点位置一律重定向到锚点
+     *
+     * 【为什么要重定向】D3 合并了 D3:F5（colspan=3 / rowspan=3）之后，D4 / D5 / E3 /
+     * E4 / E5 / F3 / F4 / F5 在视觉上根本不存在：它们的底色、边框、文字全被
+     * `drawMergedCellCover` 的离屏遮挡层盖掉。若照旧「按名取不到就 `new Cell` 再
+     * push」，一次整片着色 / 刷格式就会往 `values` 里塞进成千上万条**永远看不见**
+     * 的记录 —— 快照体积、`JSON.parse` 耗时、撤销补丁条数全部跟着膨胀，
+     * 合并越多的表越明显。故这些位置的任何属性修改（值与样式）都落到锚点 D3。
+     *
+     * 两种入参（单元格名 / 行列号）只是入口差异，判定逻辑唯一：
+     * 走 {@link findMergeAnchorName}，取不到锚点就原样返回。
+     * @param {string | number} nameOrCol - 单元格名（如 `'E4'`）或列号（1-based）
+     * @param {number} [row] - 行号（1-based）；第一个参数是列号时必须给出
+     * @returns {string} 实际应写入的单元格名（未被覆盖时即入参本身）
+     */
+    public resolveWriteTargetName(nameOrCol: string | number, row?: number): string {
+        if (typeof nameOrCol === 'string') {
+            const pos = this.getCellColAndRow(nameOrCol);
+            return this.findMergeAnchorName(pos.col, pos.row) || nameOrCol;
+        }
+        const col = nameOrCol;
+        const r = row as number;
+        return this.findMergeAnchorName(col, r) || this.getCellName(col, r);
+    }
+
+    /**
+     * 取（必要时创建）「本次修改应落在的单元格」—— 返回活引用，改它即改表
+     *
+     * 合并区内的非锚点位置重定向到锚点（见 {@link resolveWriteTargetName}）：
+     * - 锚点已在 `values` → 直接返回它，就地改；
+     * - 锚点不在 `values` → 新建并 push（**只有锚点会被 push**，被覆盖的位置永不新建）。
+     *
+     * 【只读路径请勿使用】查询一律走 {@link getCellByName} / {@link getEffectiveCellAt}：
+     * 本方法会在格子缺失时**凭空造一个**，把「这格是空的」查成「这格存在且为空」。
+     * @param {string} name - 目标单元格名（**可以**是一个被合并覆盖的位置）
+     * @returns {Cell} 应写入的单元格（活引用）
+     */
+    public ensureWritableCell(name: string): Cell {
+        const target = this.resolveWriteTargetName(name);
+        const hit = this.getCellByName(target);
+        return hit !== undefined ? hit : this._createCell(target);
+    }
+
+    /**
+     * 新建单元格并入 `values`（同时**增量登记**进名索引）
+     *
+     * 【勿回退为「只 push 不登记」】push 让 `_values.length` 与 `_indexedLength`
+     * 拉开差距，下一次 `getCellByName` 就要重建整份索引（O(N)）；批量写入
+     * （刷字体 / 刷边框 / 刷数字格式，一次动辄上万格）那就是「每格重建一次」。
+     * 索引处于稳态时直接 `set` 一条并同步长度，代价 O(1)；本就失效时整体失效一次。
+     *
+     * 新格子没有 colspan/rowspan/filter，故合并倒排与筛选缓存都不受影响，
+     * 无需 {@link invalidateCellIndex} 之外的额外失效。
+     * @param {string} name - 单元格名
+     * @returns {Cell} 新建的单元格（活引用）
+     * @private
+     */
+    private _createCell(name: string): Cell {
+        const cell = new Cell();
+        cell.cell = name;
+        this._values.push(cell);
+        if (!this._indexStructurallyInvalid && this._values.length === this._indexedLength + 1) {
+            this._cellIndex.set(name, cell);
+            this._indexedLength = this._values.length;
+        } else {
+            this.invalidateCellIndex();
+        }
+        return cell;
     }
 
     /**
@@ -4912,95 +5232,84 @@ export class DataCollection extends EventEmitter {
             // 目标可见偏移序列：从激活单元格开始按序收集（隐藏行列被跳过，不产生空位）
             const targetColOffsets = this._collectVisibleOffsets(activedCol, Infinity, colOffsets.length, true);
             const targetRowOffsets = this._collectVisibleOffsets(activedRow, Infinity, rowOffsets.length, false);
+            // 落点最终带跨度的锚点（源是合并单元格 / 目标本来就是合并块）
+            const spanAnchors: { name: string; col: number; row: number; colspan: number; rowspan: number }[] = [];
             // 源可见位置与目标可见位置按序一一配对（紧凑排列）
             for (let i = 0; i < colOffsets.length && i < targetColOffsets.length; i++) {
                 for (let j = 0; j < rowOffsets.length && j < targetRowOffsets.length; j++) {
                     const tgtCol = activedCol + targetColOffsets[i];
                     const tgtRow = activedRow + targetRowOffsets[j];
-                    const cell = this.getCellByName(`${this.getColName(tgtCol)}${tgtRow}`);
                     const item = clipboard.cells.find(c => c.cell === `${this.getColName(startCol + colOffsets[i])}${startRow + rowOffsets[j]}`);
                     if (item) {
-                        if (cell) {
-                            cell.chars = [...item.chars.map(c => {
-                                const _char = new Char();
-                                _char.char = c.char;
-                                _char.fontFamily = c.fontFamily;
-                                _char.fontSize = c.fontSize;
-                                _char.fontWeight = c.fontWeight;
-                                _char.fontStyle = c.fontStyle;
-                                _char.fontColor = c.fontColor;
-                                _char.underline = c.underline;
-                                _char.strikethrough = c.strikethrough;
-                                return _char;
-                            })];
-                            cell.isEdit = item.isEdit;
+                        // 【合并写入重定向】落在合并区**内部**（如 D3:F5 里的 E4）时，
+                        // 照旧「按名取不到就 new Cell」只会造出一条永远被遮挡层盖住的
+                        // 垃圾记录（整片粘贴 = 上千条）。一律经 ensureWritableCell
+                        // 落到锚点；锚点不存在才新建，且只有它会被 push。
+                        const targetName = this.getCellName(tgtCol, tgtRow);
+                        const cell = this.ensureWritableCell(targetName);
+                        cell.chars = [...item.chars.map(c => {
+                            const _char = new Char();
+                            _char.char = c.char;
+                            _char.fontFamily = c.fontFamily;
+                            _char.fontSize = c.fontSize;
+                            _char.fontWeight = c.fontWeight;
+                            _char.fontStyle = c.fontStyle;
+                            _char.fontColor = c.fontColor;
+                            _char.underline = c.underline;
+                            _char.strikethrough = c.strikethrough;
+                            return _char;
+                        })];
+                        cell.isEdit = item.isEdit;
+                        // 【勿删】只在「写入落到本格 且 粘贴源自带跨度」时才改写跨度：
+                        // ① 写入被重定向到锚点（E4 → D3）时，本格不是一个能独立定跨度的
+                        //    位置，改它等于凭空改动整个合并块的几何；
+                        // ② 源不带跨度时照抄 undefined 会把目标自己的合并拆掉 ——
+                        //    「往合并块里粘一段普通内容」在 Excel 里不会取消合并。
+                        if (cell.cell === targetName && (item.colspan !== undefined || item.rowspan !== undefined)) {
                             cell.colspan = item.colspan;
                             cell.rowspan = item.rowspan;
-                            cell.borderTopWidth = item.borderTopWidth;
-                            cell.borderBottomWidth = item.borderBottomWidth;
-                            cell.borderLeftWidth = item.borderLeftWidth;
-                            cell.borderRightWidth = item.borderRightWidth;
-                            cell.textAlign = item.textAlign;
-                            cell.alignItems = item.alignItems;
-                            cell.backgroundColor = item.backgroundColor;
-                            cell.filter = item.filter;
-                            cell.wrap = item.wrap;
-                            cell.letterSpacing = item.letterSpacing;
-                            cell.lineSpacing = item.lineSpacing;
-                        } else {
-                            const _cell = new Cell();
-                            _cell.cell = `${this.getColName(tgtCol)}${tgtRow}`;
-                            _cell.colspan = item.colspan;
-                            _cell.rowspan = item.rowspan;
-                            _cell.borderTopWidth = item.borderTopWidth;
-                            _cell.borderBottomWidth = item.borderBottomWidth;
-                            _cell.borderLeftWidth = item.borderLeftWidth;
-                            _cell.borderRightWidth = item.borderRightWidth;
-                            _cell.textAlign = item.textAlign;
-                            _cell.alignItems = item.alignItems;
-                            _cell.backgroundColor = item.backgroundColor;
-                            _cell.filter = item.filter;
-                            _cell.wrap = item.wrap;
-                            _cell.letterSpacing = item.letterSpacing;
-                            _cell.lineSpacing = item.lineSpacing;
-                            _cell.chars = item.chars.map(c => {
-                                const _char = new Char();
-                                _char.char = c.char;
-                                _char.fontFamily = c.fontFamily;
-                                _char.fontSize = c.fontSize;
-                                _char.fontWeight = c.fontWeight;
-                                _char.fontStyle = c.fontStyle;
-                                _char.fontColor = c.fontColor;
-                                _char.underline = c.underline;
-                                _char.strikethrough = c.strikethrough;
-                                return _char;
-                            });
-                            this.values.push(_cell);
-                        }                        
+                        }
+                        // 【字体】上方的 chars 复制已把**逐字符**样式带过来。这里的单元格级
+                        // 字体只是补位，且**必须带守卫**：Cell 的字体 setter 写的是**全部**
+                        // 字符（`_chars.forEach(...)`），无条件刷一遍会把源的多段富文本抹平
+                        // —— 而「粘贴」在 Excel 里是保留分段样式的。源样式单一时刷与不刷等价。
+                        if (this._hasUniformCharStyle(item.chars)) {
+                            cell.fontFamily = item.fontFamily;
+                            cell.fontSize = item.fontSize;
+                            cell.fontWeight = item.fontWeight;
+                            cell.fontStyle = item.fontStyle;
+                            cell.fontColor = item.fontColor;
+                            cell.underline = item.underline;
+                            cell.strikethrough = item.strikethrough;
+                        }
+                        // 数字格式与边框颜色**不在 chars 上**（`Cell._numberFormat` /
+                        // `_borderColor`），只能靠这里搬过去 —— 缺了这两行，「把合并单元格
+                        // 粘到别处」会丢掉数字格式，正是本轮要补的洞。
+                        cell.numberFormat = item.numberFormat;
+                        cell.borderColor = item.borderColor;
+                        cell.borderTopWidth = item.borderTopWidth;
+                        cell.borderBottomWidth = item.borderBottomWidth;
+                        cell.borderLeftWidth = item.borderLeftWidth;
+                        cell.borderRightWidth = item.borderRightWidth;
+                        cell.textAlign = item.textAlign;
+                        cell.alignItems = item.alignItems;
+                        cell.backgroundColor = item.backgroundColor;
+                        cell.filter = item.filter;
+                        cell.wrap = item.wrap;
+                        cell.letterSpacing = item.letterSpacing;
+                        cell.lineSpacing = item.lineSpacing;
+                        // 登记跨度：源是合并单元格时目标也成为同尺寸合并块，
+                        // 接下来要把块内被覆盖的格子清掉（否则旧内容被遮挡层盖住却仍在 values 里）
+                        this._collectSpanAnchor(spanAnchors, cell);
                     }
                 }
             }
+            this._pruneCoveredCellsBySpans(spanAnchors);
         } else if (clipboard && clipboard.type === 'char' && clipboard.chars) {
-            const cell = this.getCellByName(this.activedCell);
-            if (cell){
-                if (cell.isEdit) {
-                    cell.chars = clipboard.chars.map(c => {
-                        const _char = new Char();
-                        _char.char = c.char;
-                        _char.fontFamily = c.fontFamily;
-                        _char.fontSize = c.fontSize;
-                        _char.fontWeight = c.fontWeight;
-                        _char.fontStyle = c.fontStyle;
-                        _char.fontColor = c.fontColor;
-                        _char.underline = c.underline;
-                        _char.strikethrough = c.strikethrough;
-                        return _char;
-                    })
-                }; // 粘贴选中的字符
-            } else {
-                const _cell = new Cell();
-                _cell.cell = this.activedCell;
-                _cell.chars = clipboard.chars.map(c => {
+            // 同上：活动格若落在合并区内部，写入落到锚点（ensureWritableCell）
+            const cell = this.ensureWritableCell(this.activedCell);
+            if (cell.isEdit) {
+                cell.chars = clipboard.chars.map(c => {
                     const _char = new Char();
                     _char.char = c.char;
                     _char.fontFamily = c.fontFamily;
@@ -5011,10 +5320,13 @@ export class DataCollection extends EventEmitter {
                     _char.underline = c.underline;
                     _char.strikethrough = c.strikethrough;
                     return _char;
-                });
-                this.values.push(_cell);
-            }        
+                })
+            }; // 粘贴选中的字符
         }
+        // 收尾：选区扩成整块粘贴范围（Excel 行为），落点若成为合并块再并上整个合并块。
+        // 字符型剪贴板只写活动格一个格子，不参与范围扩张（粘贴前的选择原样保留）。
+        this.syncSelectionToMergedActive(
+            (clipboard && clipboard.type === 'cell') ? (this.getPasteTargetRect() ?? undefined) : undefined);
 
         this.commitValues();
     }
@@ -5042,42 +5354,28 @@ export class DataCollection extends EventEmitter {
             for (let j = 0; j < rowOffsets.length && j < targetRowOffsets.length; j++) {
                 const tgtCol = activedCol + targetColOffsets[i];
                 const tgtRow = activedRow + targetRowOffsets[j];
-                const cell = this.getCellByName(`${this.getColName(tgtCol)}${tgtRow}`);
                 const item = clipboard.cells.find(c => c.cell === `${this.getColName(startCol + colOffsets[i])}${startRow + rowOffsets[j]}`);
                 if (item) {
-                    if (cell) {
-                        cell.chars = [...item.chars.map(c => {
-                            const _char = new Char();
-                            _char.char = c.char;
-                            _char.fontFamily = c.fontFamily;
-                            _char.fontSize = c.fontSize;
-                            _char.fontWeight = c.fontWeight;
-                            _char.fontStyle = c.fontStyle;
-                            _char.fontColor = c.fontColor;
-                            _char.underline = c.underline;
-                            _char.strikethrough = c.strikethrough;
-                            return _char;
-                        })];
-                    } else {
-                        const _cell = new Cell();
-                        _cell.cell = `${this.getColName(tgtCol)}${tgtRow}`;
-                        _cell.chars = item.chars.map(c => {
-                            const _char = new Char();
-                            _char.char = c.char;
-                            _char.fontFamily = c.fontFamily;
-                            _char.fontSize = c.fontSize;
-                            _char.fontWeight = c.fontWeight;
-                            _char.fontStyle = c.fontStyle;
-                            _char.fontColor = c.fontColor;
-                            _char.underline = c.underline;
-                            _char.strikethrough = c.strikethrough;
-                            return _char;
-                        });
-                        this.values.push(_cell);
-                    }                        
+                    // 合并区内部的位置重定向到锚点（见 ensureWritableCell 的说明）
+                    const cell = this.ensureWritableCell(this.getCellName(tgtCol, tgtRow));
+                    cell.chars = [...item.chars.map(c => {
+                        const _char = new Char();
+                        _char.char = c.char;
+                        _char.fontFamily = c.fontFamily;
+                        _char.fontSize = c.fontSize;
+                        _char.fontWeight = c.fontWeight;
+                        _char.fontStyle = c.fontStyle;
+                        _char.fontColor = c.fontColor;
+                        _char.underline = c.underline;
+                        _char.strikethrough = c.strikethrough;
+                        return _char;
+                    })];
                 }
             }
         }
+        // 同上：扩成整块粘贴范围 + 并上活动格所在的整个合并块
+        this.syncSelectionToMergedActive(
+            (clipboard && clipboard.type === 'cell') ? (this.getPasteTargetRect() ?? undefined) : undefined);
 
         this.commitValues();
     }
@@ -5103,7 +5401,6 @@ export class DataCollection extends EventEmitter {
                 for (let j = 0; j < rowOffsets.length && j < targetRowOffsets.length; j++) {
                     const tgtCol = activedCol + targetColOffsets[i];
                     const tgtRow = activedRow + targetRowOffsets[j];
-                    const cell = this.getCellByName(`${this.getColName(tgtCol)}${tgtRow}`);
                     const item = clipboard.cells.find(c => c.cell === `${this.getColName(startCol + colOffsets[i])}${startRow + rowOffsets[j]}`);
                     if (item) {
                         // 只拷贝字符内容，保留目标原有格式
@@ -5112,27 +5409,20 @@ export class DataCollection extends EventEmitter {
                             _char.char = c.char;
                             return _char;
                         });
-                        if (cell) {
-                            cell.chars = newChars;
-                        } else {
-                            const _cell = new Cell();
-                            _cell.cell = `${this.getColName(tgtCol)}${tgtRow}`;
-                            _cell.chars = newChars;
-                            this.values.push(_cell);
-                        }
+                        // 合并区内部的位置重定向到锚点（见 ensureWritableCell 的说明）
+                        this.ensureWritableCell(this.getCellName(tgtCol, tgtRow)).chars = newChars;
                     }
                 }
             }
         } else if (clipboard && clipboard.type === 'char' && clipboard.chars) {
-            const cell = this.getCellByName(this.activedCell);
-            if (cell) {
-                cell.chars = clipboard.chars.map(c => {
-                    const _char = new Char();
-                    _char.char = c.char;
-                    return _char;
-                });
-            }
+            this.ensureWritableCell(this.activedCell).chars = clipboard.chars.map(c => {
+                const _char = new Char();
+                _char.char = c.char;
+                return _char;
+            });
         }
+        this.syncSelectionToMergedActive(
+            (clipboard && clipboard.type === 'cell') ? (this.getPasteTargetRect() ?? undefined) : undefined);
         this.commitValues();
     }
 
@@ -5154,64 +5444,59 @@ export class DataCollection extends EventEmitter {
         // 目标可见偏移序列：从激活单元格开始按序收集（隐藏行列被跳过，不产生空位）
         const targetColOffsets = this._collectVisibleOffsets(activedCol, Infinity, colOffsets.length, true);
         const targetRowOffsets = this._collectVisibleOffsets(activedRow, Infinity, rowOffsets.length, false);
+        // 落点最终带跨度的锚点（源是合并单元格 / 目标本来就是合并块）
+        const spanAnchors: { name: string; col: number; row: number; colspan: number; rowspan: number }[] = [];
         // 源可见位置与目标可见位置按序一一配对（紧凑排列）
         for (let i = 0; i < colOffsets.length && i < targetColOffsets.length; i++) {
             for (let j = 0; j < rowOffsets.length && j < targetRowOffsets.length; j++) {
                 const tgtCol = activedCol + targetColOffsets[i];
                 const tgtRow = activedRow + targetRowOffsets[j];
-                const cell = this.getCellByName(`${this.getColName(tgtCol)}${tgtRow}`);
                 const item = clipboard.cells.find(c => c.cell === `${this.getColName(startCol + colOffsets[i])}${startRow + rowOffsets[j]}`);
                 if (item) {
-                    if (cell) {
-                        cell.isEdit = item.isEdit;
+                    // 合并区内部的位置重定向到锚点（见 ensureWritableCell 的说明）
+                    const targetName = this.getCellName(tgtCol, tgtRow);
+                    const cell = this.ensureWritableCell(targetName);
+                    cell.isEdit = item.isEdit;
+                    // 同 pasteSelection：只在「落到本格 且 源自带跨度」时才改写跨度
+                    if (cell.cell === targetName && (item.colspan !== undefined || item.rowspan !== undefined)) {
                         cell.colspan = item.colspan;
                         cell.rowspan = item.rowspan;
-                        cell.fontFamily = item.fontFamily;
-                        cell.fontSize = item.fontSize;
-                        cell.fontWeight = item.fontWeight;
-                        cell.fontStyle = item.fontStyle;
-                        cell.fontColor = item.fontColor;
-                        cell.underline = item.underline;
-                        cell.strikethrough = item.strikethrough;
-                        cell.borderTopWidth = item.borderTopWidth;
-                        cell.borderBottomWidth = item.borderBottomWidth;
-                        cell.borderLeftWidth = item.borderLeftWidth;
-                        cell.borderRightWidth = item.borderRightWidth;
-                        cell.textAlign = item.textAlign;
-                        cell.alignItems = item.alignItems;
-                        cell.backgroundColor = item.backgroundColor;
-                        cell.filter = item.filter;
-                        cell.wrap = item.wrap;
-                        cell.letterSpacing = item.letterSpacing;
-                        cell.lineSpacing = item.lineSpacing;
-                    } else {
-                        const _cell = new Cell();
-                        _cell.cell = `${this.getColName(tgtCol)}${tgtRow}`;
-                        _cell.colspan = item.colspan;
-                        _cell.rowspan = item.rowspan;
-                        _cell.fontFamily = item.fontFamily;
-                        _cell.fontSize = item.fontSize;
-                        _cell.fontWeight = item.fontWeight;
-                        _cell.fontStyle = item.fontStyle;
-                        _cell.fontColor = item.fontColor;
-                        _cell.underline = item.underline;
-                        _cell.strikethrough = item.strikethrough;
-                        _cell.borderTopWidth = item.borderTopWidth;
-                        _cell.borderBottomWidth = item.borderBottomWidth;
-                        _cell.borderLeftWidth = item.borderLeftWidth;
-                        _cell.borderRightWidth = item.borderRightWidth;
-                        _cell.textAlign = item.textAlign;
-                        _cell.alignItems = item.alignItems;
-                        _cell.backgroundColor = item.backgroundColor;
-                        _cell.filter = item.filter;
-                        _cell.wrap = item.wrap;
-                        _cell.letterSpacing = item.letterSpacing;
-                        _cell.lineSpacing = item.lineSpacing;
-                        this.values.push(_cell);
-                    }                        
+                    }
+                    // 【只粘贴格式】这里**必须**无条件刷单元格级字体：本方法刻意不触碰
+                    // chars（见下方 exeBrush 单格分支的注释），字体只能靠 setter 写进
+                    // 目标既有字符 —— 与 pasteSelection 不同（那边 chars 自带样式，刷会抹平分段）。
+                    cell.fontFamily = item.fontFamily;
+                    cell.fontSize = item.fontSize;
+                    cell.fontWeight = item.fontWeight;
+                    cell.fontStyle = item.fontStyle;
+                    cell.fontColor = item.fontColor;
+                    cell.underline = item.underline;
+                    cell.strikethrough = item.strikethrough;
+                    cell.borderTopWidth = item.borderTopWidth;
+                    cell.borderBottomWidth = item.borderBottomWidth;
+                    cell.borderLeftWidth = item.borderLeftWidth;
+                    cell.borderRightWidth = item.borderRightWidth;
+                    cell.textAlign = item.textAlign;
+                    cell.alignItems = item.alignItems;
+                    cell.backgroundColor = item.backgroundColor;
+                    cell.filter = item.filter;
+                    cell.wrap = item.wrap;
+                    cell.letterSpacing = item.letterSpacing;
+                    cell.lineSpacing = item.lineSpacing;
+                    // 数字格式与边框颜色不在 chars 上，格式清单里漏了它们就等于「只粘贴格式」
+                    // 之后数字格式丢失（与 pasteSelection 同步补齐）
+                    cell.numberFormat = item.numberFormat;
+                    cell.borderColor = item.borderColor;
+                    // 同 pasteSelection：源是合并单元格时目标也成为同尺寸合并块
+                    this._collectSpanAnchor(spanAnchors, cell);
                 }
             }
         }
+        // 清掉落点块内被覆盖的格子（旧内容若留在 values 里，会被遮挡层盖住却仍能被查到）
+        this._pruneCoveredCellsBySpans(spanAnchors);
+        // 落点成为合并块（或本就在某个合并块内）时，选中框要覆盖**整个**合并区域
+        this.syncSelectionToMergedActive(
+            (clipboard && clipboard.type === 'cell') ? (this.getPasteTargetRect() ?? undefined) : undefined);
 
         this.commitValues();
     }
@@ -5259,34 +5544,15 @@ export class DataCollection extends EventEmitter {
      * @returns {number} 粘贴完成后光标应处的绝对位置（插入起点 + 新增字符数）
      */
     public pasteChars(insertIndex: number, chars: Char[]): number {
-        const cell = this.getCellByName(this.activedCell);
-        let caretAbsolutePosition: number;
-        if (cell){
-            const startIndex = this.getSelectedCharsStartIndex();
-            const endIndex = this.getSelectedCharsEndIndex();
-            const deleteCount = endIndex - startIndex;
-            // 有选区时从选区起点替换，无选区时从光标位置插入
-            const insertPos = deleteCount > 0 ? startIndex : insertIndex;
-            if (cell.isEdit) {
-                cell.chars.splice(insertPos, deleteCount, ...chars.map(c => {
-                    const _char = new Char();
-                    _char.char = c.char;
-                    _char.fontFamily = c.fontFamily;
-                    _char.fontSize = c.fontSize;
-                    _char.fontWeight = c.fontWeight;
-                    _char.fontStyle = c.fontStyle;
-                    _char.fontColor = c.fontColor;
-                    _char.underline = c.underline;
-                    _char.strikethrough = c.strikethrough;
-                    return _char;
-                }));
-            }
-            // 光标落在粘贴内容之后
-            caretAbsolutePosition = insertPos + chars.length;
-        } else {
-            const _cell = new Cell();
-            _cell.cell = this.activedCell;
-            _cell.chars = chars.map(c => {
+        // 活动格若落在合并区内部，写入落到锚点（见 ensureWritableCell 的说明）
+        const cell = this.ensureWritableCell(this.activedCell);
+        const startIndex = this.getSelectedCharsStartIndex();
+        const endIndex = this.getSelectedCharsEndIndex();
+        const deleteCount = endIndex - startIndex;
+        // 有选区时从选区起点替换，无选区时从光标位置插入
+        const insertPos = deleteCount > 0 ? startIndex : insertIndex;
+        if (cell.isEdit) {
+            cell.chars.splice(insertPos, deleteCount, ...chars.map(c => {
                 const _char = new Char();
                 _char.char = c.char;
                 _char.fontFamily = c.fontFamily;
@@ -5297,11 +5563,10 @@ export class DataCollection extends EventEmitter {
                 _char.underline = c.underline;
                 _char.strikethrough = c.strikethrough;
                 return _char;
-            });
-            this.values.push(_cell);
-            // 新建单元格，光标在所有字符之后
-            caretAbsolutePosition = chars.length;
+            }));
         }
+        // 光标落在粘贴内容之后
+        const caretAbsolutePosition = insertPos + chars.length;
         this.selectionOnEditting = null;
         this.commitValues();
         return caretAbsolutePosition;
@@ -5323,40 +5588,25 @@ export class DataCollection extends EventEmitter {
         const apply = (): void => {
             const selectedCells = this.getSelectedCells();
             selectedCells.forEach(_cell => {
-                const cell = this.getCellByName(_cell);
-                if (cell) {
-                    if(cell.isEdit) {
-                        if (fontStyle.fontFamily !== cell.fontFamily && fontStyle.fontFamily !== undefined) cell.fontFamily = fontStyle.fontFamily;
-                        if (fontStyle.fontSize !== cell.fontSize && fontStyle.fontSize !== undefined) cell.fontSize = fontStyle.fontSize;
-                        if (fontStyle.fontWeight !== cell.fontWeight && fontStyle.fontWeight !== undefined) cell.fontWeight = fontStyle.fontWeight;
-                        if (fontStyle.fontStyle !== cell.fontStyle && fontStyle.fontStyle !== undefined) cell.fontStyle = fontStyle.fontStyle;
-                        if (fontStyle.fontColor !== cell.fontColor && fontStyle.fontColor !== undefined) cell.fontColor = fontStyle.fontColor;
-                        if (fontStyle.underline !== cell.underline && fontStyle.underline !== undefined) cell.underline = fontStyle.underline;
-                        if (fontStyle.strikethrough !== cell.strikethrough && fontStyle.strikethrough !== undefined) cell.strikethrough = fontStyle.strikethrough;
-                        if (fontStyle.textAlign !== cell.textAlign && fontStyle.textAlign !== undefined) cell.textAlign = fontStyle.textAlign as TextAlign;
-                        if (fontStyle.alignItems !== cell.alignItems && fontStyle.alignItems !== undefined) cell.alignItems = fontStyle.alignItems as VerticalAlign;
-                        if (fontStyle.backgroundColor !== cell.backgroundColor && fontStyle.backgroundColor !== undefined) cell.backgroundColor = fontStyle.backgroundColor;
-                        if (fontStyle.letterSpacing !== cell.letterSpacing && fontStyle.letterSpacing !== undefined) cell.letterSpacing = fontStyle.letterSpacing;
-                        if (fontStyle.lineSpacing !== cell.lineSpacing && fontStyle.lineSpacing !== undefined) cell.lineSpacing = fontStyle.lineSpacing;
-                        if (fontStyle.wrap !== cell.wrap && fontStyle.wrap !== undefined) cell.wrap = fontStyle.wrap;
-                    }
-                } else {
-                    const newCell = new Cell();
-                    newCell.cell = _cell;
-                    newCell.fontFamily = fontStyle.fontFamily;
-                    newCell.fontSize = fontStyle.fontSize;
-                    newCell.fontWeight = fontStyle.fontWeight;
-                    newCell.fontStyle = fontStyle.fontStyle;
-                    newCell.fontColor = fontStyle.fontColor;
-                    newCell.underline = fontStyle.underline;
-                    newCell.strikethrough = fontStyle.strikethrough;
-                    newCell.textAlign = fontStyle.textAlign as TextAlign;
-                    newCell.alignItems = fontStyle.alignItems as VerticalAlign;
-                    newCell.backgroundColor = fontStyle.backgroundColor;
-                    newCell.letterSpacing = fontStyle.letterSpacing;
-                    newCell.lineSpacing = fontStyle.lineSpacing;
-                    newCell.wrap = fontStyle.wrap;
-                    this.values.push(newCell);
+                // 【合并写入重定向】选中整块合并区（D3:F5）时，getSelectedCells 会列出
+                // D4/D5/E3…F5 八个「被吞掉」的位置。它们被遮挡层盖着，为它们新建 Cell
+                // 只会制造永远看不见的记录（快照/撤销补丁/装载时间全部跟着膨胀），
+                // 故一律经 ensureWritableCell 落到锚点 D3；锚点缺失才新建。
+                const cell = this.ensureWritableCell(_cell);
+                if(cell.isEdit) {
+                    if (fontStyle.fontFamily !== cell.fontFamily && fontStyle.fontFamily !== undefined) cell.fontFamily = fontStyle.fontFamily;
+                    if (fontStyle.fontSize !== cell.fontSize && fontStyle.fontSize !== undefined) cell.fontSize = fontStyle.fontSize;
+                    if (fontStyle.fontWeight !== cell.fontWeight && fontStyle.fontWeight !== undefined) cell.fontWeight = fontStyle.fontWeight;
+                    if (fontStyle.fontStyle !== cell.fontStyle && fontStyle.fontStyle !== undefined) cell.fontStyle = fontStyle.fontStyle;
+                    if (fontStyle.fontColor !== cell.fontColor && fontStyle.fontColor !== undefined) cell.fontColor = fontStyle.fontColor;
+                    if (fontStyle.underline !== cell.underline && fontStyle.underline !== undefined) cell.underline = fontStyle.underline;
+                    if (fontStyle.strikethrough !== cell.strikethrough && fontStyle.strikethrough !== undefined) cell.strikethrough = fontStyle.strikethrough;
+                    if (fontStyle.textAlign !== cell.textAlign && fontStyle.textAlign !== undefined) cell.textAlign = fontStyle.textAlign as TextAlign;
+                    if (fontStyle.alignItems !== cell.alignItems && fontStyle.alignItems !== undefined) cell.alignItems = fontStyle.alignItems as VerticalAlign;
+                    if (fontStyle.backgroundColor !== cell.backgroundColor && fontStyle.backgroundColor !== undefined) cell.backgroundColor = fontStyle.backgroundColor;
+                    if (fontStyle.letterSpacing !== cell.letterSpacing && fontStyle.letterSpacing !== undefined) cell.letterSpacing = fontStyle.letterSpacing;
+                    if (fontStyle.lineSpacing !== cell.lineSpacing && fontStyle.lineSpacing !== undefined) cell.lineSpacing = fontStyle.lineSpacing;
+                    if (fontStyle.wrap !== cell.wrap && fontStyle.wrap !== undefined) cell.wrap = fontStyle.wrap;
                 }
             });
             this.commitValues();
@@ -5443,6 +5693,10 @@ export class DataCollection extends EventEmitter {
         targetCell.wrap = sourceCell.wrap;
         targetCell.letterSpacing = sourceCell.letterSpacing;
         targetCell.lineSpacing = sourceCell.lineSpacing;
+        // 数字格式与边框颜色不在 chars 上：格式刷漏了它们，「把合并单元格的样式刷到别处」
+        // 就丢掉数字格式（与 pasteSelection / pasteFormatOnly 同步补齐）
+        targetCell.numberFormat = sourceCell.numberFormat;
+        targetCell.borderColor = sourceCell.borderColor;
 
         // —— 字符级格式（仅对目标已存在字符逐个同步样式，不创建/删除字符）——
         const srcChars = sourceCell.chars ?? [];
@@ -5516,7 +5770,8 @@ export class DataCollection extends EventEmitter {
             // （pasteFormatOnly 本身不触碰 chars；commitValues 由它内部自行调用一次）
             this.pasteFormatOnly();
             // 字符级格式补刀（循环取源首格，对应单目标单源最常见的使用路径）
-            const targetCell = this.getCellByName(start);
+            // 目标落在合并区内部时，pasteFormatOnly 已把格式写到锚点上 → 这里同样取锚点
+            const targetCell = this.getCellByName(this.resolveWriteTargetName(start));
             const sourceCell = clipboard.cells.find(c => c.cell === `${this.getColName(sStartCol)}${sStartRow}`);
             if (targetCell && sourceCell && targetCell.chars && targetCell.chars.length > 0 && sourceCell.chars && sourceCell.chars.length > 0) {
                 for (let i = 0; i < targetCell.chars.length; i++) {
@@ -5540,6 +5795,8 @@ export class DataCollection extends EventEmitter {
         // （隐藏行/列不占序列位置，保证刷出的结果紧凑排列）
         const targetColOffsets = this._collectVisibleOffsets(tStartCol, tEndCol, Infinity, true);
         const targetRowOffsets = this._collectVisibleOffsets(tStartRow, tEndRow, Infinity, false);
+        // 落点最终带跨度的锚点（源是合并单元格 / 目标本来就是合并块）
+        const spanAnchors: { name: string; col: number; row: number; colspan: number; rowspan: number }[] = [];
         for (let i = 0; i < targetColOffsets.length; i++) {
             for (let j = 0; j < targetRowOffsets.length; j++) {
                 const tCol = tStartCol + targetColOffsets[i];
@@ -5551,15 +5808,37 @@ export class DataCollection extends EventEmitter {
                 // 源偏移位置没有单元格（空格子）则不刷，与 Excel 保持一致
                 if (!sourceCell) continue;
 
-                let targetCell = this.getCellByName(targetCellName);
-                if (!targetCell) {
-                    targetCell = new Cell();
-                    targetCell.cell = targetCellName;
-                    this.values.push(targetCell);
-                }
+                // 【合并写入重定向】合并区内部的位置不单独立条目，格式刷到锚点上
+                // （见 ensureWritableCell）。重定向时必须保住锚点的 colspan/rowspan：
+                // _applyFormatToCell 会照抄源的跨度，而源通常不带跨度 → 合并被拆掉。
+                const targetCell = this.ensureWritableCell(targetCellName);
+                const spanColBefore = targetCell.colspan;
+                const spanRowBefore = targetCell.rowspan;
                 this._applyFormatToCell(targetCell, sourceCell);
+                // 【勿删，三条分支的顺序也不能换】_applyFormatToCell 会照抄源的跨度：
+                // ① 写入被重定向到锚点（E4 → D3）：锚点跨度是**既有合并块的几何**，
+                //    绝不能被源的跨度改写 —— 否则刷一下整块合并的尺寸就变了；
+                // ② 源不带跨度而目标原本是合并：照抄 undefined 会把目标自己的合并拆掉
+                //    （「往合并块上刷普通格式」在 Excel 里不会取消合并）；
+                // ③ 源自带跨度且落到本格：保留刚写入的源跨度 —— 这就是「把合并单元格的
+                //    样式刷到别处时，目标也成为同尺寸合并块」，随后清理块内覆盖格。
+                const sourceHasSpan = sourceCell.colspan !== undefined || sourceCell.rowspan !== undefined;
+                if (targetCell.cell !== targetCellName) {
+                    targetCell.colspan = spanColBefore;
+                    targetCell.rowspan = spanRowBefore;
+                } else if (!sourceHasSpan && (spanColBefore !== undefined || spanRowBefore !== undefined)) {
+                    targetCell.colspan = spanColBefore;
+                    targetCell.rowspan = spanRowBefore;
+                }
+                this._collectSpanAnchor(spanAnchors, targetCell);
             }
         }
+        // 清掉落点块内被覆盖的格子（与 executeMergeCells 同口径）
+        this._pruneCoveredCellsBySpans(spanAnchors);
+        // 收尾：选区 = 用户圈定的目标选区 ∪ 落点所在的合并块。
+        // 【勿用 getBrushTargetRect()】那是**撤销影响面**，刻意按源最大跨度向右下多撑开
+        // 一格（宁可多克隆几个空格子也不能漏记）；拿它当选区会把框画到没刷到的地方。
+        this.syncSelectionToMergedActive({ startCol: tStartCol, endCol: tEndCol, startRow: tStartRow, endRow: tEndRow });
 
         if (this.brushMode === 'single') this.brushMode = null;
         this.commitValues();
@@ -5617,21 +5896,14 @@ export class DataCollection extends EventEmitter {
                 // 局部边框模式：本格四条边都不需要改时跳过，避免触碰选区内部格子的原有边框
                 if (!setTop && !setBottom && !setLeft && !setRight) return;
 
-                const cell = this.getCellByName(_cell);
-                if (cell) {
-                    if (setTop) cell.borderTopWidth = borderTopWidth;
-                    if (setBottom) cell.borderBottomWidth = borderBottomWidth;
-                    if (setLeft) cell.borderLeftWidth = borderLeftWidth;
-                    if (setRight) cell.borderRightWidth = borderRightWidth;
-                } else {
-                    const newCell = new Cell();
-                    newCell.cell = _cell;
-                    if (setTop) newCell.borderTopWidth = borderTopWidth;
-                    if (setBottom) newCell.borderBottomWidth = borderBottomWidth;
-                    if (setLeft) newCell.borderLeftWidth = borderLeftWidth;
-                    if (setRight) newCell.borderRightWidth = borderRightWidth;
-                    this.values.push(newCell);
-                }
+                // 【合并写入重定向】同上：合并区内部的格子不单独立条目，四条边一律
+                // 记到锚点上（外轮廓由 getMergedOutlineBorders 从锚点兜底取出，
+                // 见该方法内的说明），否则「给整个合并块加外框」会只留下半个轮廓。
+                const cell = this.ensureWritableCell(_cell);
+                if (setTop) cell.borderTopWidth = borderTopWidth;
+                if (setBottom) cell.borderBottomWidth = borderBottomWidth;
+                if (setLeft) cell.borderLeftWidth = borderLeftWidth;
+                if (setRight) cell.borderRightWidth = borderRightWidth;
             })
             this.commitValues();
         };
@@ -5918,16 +6190,9 @@ export class DataCollection extends EventEmitter {
             this.runWithFullStateUndo('添加筛选按钮', () => {
                 for (let c = startCol - 1; c < endCol; c++) {
                     if (!this.validataColInFilter(c)) continue;
-                    const cell = this.getCellName(c + 1, startRow);
-                    const _cell = this.getCellByName(cell);
-                    if (_cell) {
-                        _cell.filter = startRow;
-                    } else {
-                        const newCell = new Cell();
-                        newCell.cell = cell;
-                        newCell.filter = startRow;
-                        this.values.push(newCell);
-                    }
+                    // 合并区内部的列不单独立筛选按钮：那一格在合并态下被遮挡层盖住，
+                    // 按钮根本画不出来。重定向到该合并块的锚点（见 ensureWritableCell）。
+                    this.ensureWritableCell(this.getCellName(c + 1, startRow)).filter = startRow;
                 }
                 this.invalidateFilterCells();
                 this.emit(DataEvents.VALUES_CHANGED, this._values);
@@ -6859,7 +7124,9 @@ export class DataCollection extends EventEmitter {
     public setCellsBackgroundColor(startCol: number, endCol: number, startRow: number, endRow: number, color: string): void {
         for (let r = startRow; r <= endRow; r++) {
             for (let c = startCol; c <= endCol; c++) {
-                const cell = this.getCellByName(this.getCellName(c, r));
+                // 合并区内部的位置重定向到锚点；本方法不改「有没有这个格子」，
+                // 故只重定向、不新建（新建是 ensureWritableCell 的事）
+                const cell = this.getCellByName(this.resolveWriteTargetName(c, r));
                 if (cell) cell.backgroundColor = color;
             }
         }
@@ -6876,16 +7143,8 @@ export class DataCollection extends EventEmitter {
     public setCellsNumberFormat(startCol: number, endCol: number, startRow: number, endRow: number, format: string): void {
         for (let r = startRow; r <= endRow; r++) {
             for (let c = startCol; c <= endCol; c++) {
-                const cellName = this.getCellName(c, r);
-                let cell = this.getCellByName(cellName);
-                if (cell) {
-                    cell.numberFormat = format;
-                } else {
-                    cell = new Cell();
-                    cell.cell = cellName;
-                    cell.numberFormat = format;
-                    this.values.push(cell);
-                }
+                // 合并区内部的位置重定向到锚点（见 ensureWritableCell 的说明）
+                this.ensureWritableCell(this.getCellName(c, r)).numberFormat = format;
             }
         }
     }
@@ -6901,7 +7160,8 @@ export class DataCollection extends EventEmitter {
     public setCellsBorderColor(startCol: number, endCol: number, startRow: number, endRow: number, color: string): void {
         for (let r = startRow; r <= endRow; r++) {
             for (let c = startCol; c <= endCol; c++) {
-                const cell = this.getCellByName(this.getCellName(c, r));
+                // 同 setCellsBackgroundColor：只重定向到锚点，不新建格子
+                const cell = this.getCellByName(this.resolveWriteTargetName(c, r));
                 if (cell) cell.borderColor = color;
             }
         }

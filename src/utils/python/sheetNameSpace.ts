@@ -404,29 +404,28 @@ export function applyWrites(data: DataCollection, writesJson: string, label: str
     const names = Object.keys(raw);
     if (names.length === 0) return 0;
 
-    const cells: Cell[] = [];
-    const created: Cell[] = [];
+    // 【合并写入重定向】脚本写「被合并覆盖的位置」（D3:F5 里的 E4）时一律落到锚点 D3，
+    // 与 UI 侧完全同口径（详见 DataCollection#ensureWritableCell）：
+    // 那些位置在视觉上根本不存在（被 drawMergedCellCover 的遮挡层盖住），按名新建
+    // 只会往 values 里塞一条永远看不见、却能被「查找/替换」扫到的垃圾记录。
+    // 锚点不在 values 时才新建，且**只新建锚点**（ensureWritableCell 内部保证）。
+    // 多个被覆盖位置落到同一锚点时，按脚本的书写顺序取最后一个（后者覆盖前者）。
+    const writes = new Map<string, string>();
     for (const name of names) {
-        const existing = data.getCellByName(name);
-        if (existing) {
-            cells.push(existing);
-            continue;
-        }
-        const cell = new Cell();
-        cell.cell = name;
-        cells.push(cell);
-        created.push(cell);
+        writes.set(data.resolveWriteTargetName(name), raw[name]);
     }
+
+    const cells: Cell[] = [];
+    writes.forEach((_value, targetName) => {
+        cells.push(data.ensureWritableCell(targetName));
+    });
 
     data.runWithCellsUndo(label, cells, () => {
         for (const cell of cells) {
-            const value = raw[cell.cell];
-            if (value === '') cell.clearValue();
+            const value = writes.get(cell.cell);
+            if (value === undefined || value === '') cell.clearValue();
             else cell.addValue(value);
         }
-        // 新建格子在 action 内入列：入列前的补丁快照为「空内容」，
-        // 与入列后的内容构成 before/after 差异，本次写入才能被撤销覆盖
-        for (const cell of created) data.values.push(cell);
     });
 
     return cells.length;
