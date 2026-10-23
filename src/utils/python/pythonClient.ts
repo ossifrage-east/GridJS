@@ -52,6 +52,12 @@ export interface PythonRunRequest {
     sheetName: string;
     /** 当前工作表快照（`{"A1": "文本", ...}` 的 JSON 字符串） */
     snapshotJson: string;
+    /** 当前工作表样式快照（`{"A1": {"fontColor": "#fff", ...}}`，只含有样式的格子） */
+    stylesJson: string;
+    /** 脚本里 `open_grid()` 引用到的其它表格（JSON 数组） */
+    openedJson: string;
+    /** 当前表元信息（maxCol / maxRow / files） */
+    metaJson: string;
     /** 当前表格行数 */
     rowCount: number;
     /** 当前表格列数 */
@@ -124,6 +130,12 @@ export interface PythonRunOptions {
     sheetName: string;
     /** 当前工作表快照 JSON（见 sheetNameSpace.buildSnapshot） */
     snapshotJson: string;
+    /** 当前工作表样式快照 JSON（见 sheetNameSpace.buildSnapshot 的 stylesJson） */
+    stylesJson: string;
+    /** `open_grid()` 引用的其它表格（见 sheetNameSpace.buildOpenedJson） */
+    openedJson: string;
+    /** 当前表元信息（见 sheetNameSpace.buildMetaJson） */
+    metaJson: string;
     /** 当前表格行数 */
     rowCount: number;
     /** 当前表格列数 */
@@ -290,6 +302,9 @@ export function runPython(options: PythonRunOptions): Promise<{ writesJson: stri
         script: options.script,
         sheetName: options.sheetName,
         snapshotJson: options.snapshotJson,
+        stylesJson: options.stylesJson,
+        openedJson: options.openedJson,
+        metaJson: options.metaJson,
         rowCount: options.rowCount,
         colCount: options.colCount,
         namespaceSource: options.namespaceSource,

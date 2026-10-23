@@ -355,6 +355,23 @@ export class IndexDB {
         return this.wrapRequest<ValueRecord[]>(store.getAll());
     }
 
+    /**
+     * 只取所有工作表**名称**（键），不反序列化存档内容
+     *
+     * 【勿用 `getAllValues().map(r => r.sheetName)` 代替】`getAll()` 会把每条存档的
+     * `value` 一起读出来 —— 大表的工作区里那是几十万格的快照，纯粹为了几个名字
+     * 付一次全量反序列化。`getAllKeys()` 走的是键空间游标，代价与记录大小无关。
+     * @returns {Promise<string[]>} 工作表名称（即存档键）列表
+     */
+    public async getAllSheetNames(): Promise<string[]> {
+        await this.ensureInitialized();
+        const transaction = this.getTransaction('readonly', STORE_NAMES.VALUES);
+        const store = this.getObjectStore(transaction, STORE_NAMES.VALUES);
+
+        return this.wrapRequest<IDBValidKey[]>(store.getAllKeys()).then(keys =>
+            keys.map(key => String(key)));
+    }
+
     // ==================== Images 相关方法 ====================
 
     /**

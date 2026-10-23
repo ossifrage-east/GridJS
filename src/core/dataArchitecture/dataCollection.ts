@@ -36,6 +36,24 @@ export interface MergeRect {
 }
 
 /**
+ * 脚本（Python）可写的单元格字段白名单（值以外的样式 / 展示属性）
+ *
+ * 键名就是 `Cell` 上的公开属性名：Python 侧的别名（`color` / `bgColor` / `bold` …）
+ * 在 `sheetNameSpace.PY_NAMESPACE_SOURCE` 里翻译成这些名字再回传，两边必须同时改。
+ * 用**白名单**而不是「拿到的键全赋值」：脚本回传的是 JSON，键由用户脚本决定，
+ * 直接赋值等于把 `cell` 身上的任意属性（含 `cell` 自身、`chars`）暴露给脚本。
+ * 合并跨度（colspan / rowspan）单独处理，见 {@link DataCollection.applyScriptWrites}。
+ */
+const SCRIPT_WRITABLE_FIELDS: ReadonlySet<string> = new Set([
+    'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'fontColor',
+    'underline', 'strikethrough',
+    'backgroundColor', 'borderColor',
+    'borderTopWidth', 'borderBottomWidth', 'borderLeftWidth', 'borderRightWidth',
+    'textAlign', 'alignItems', 'wrap', 'letterSpacing', 'lineSpacing',
+    'numberFormat',
+]);
+
+/**
  * 查询 / 替换的作用范围矩形（1-based 闭区间）
  *
  * 是**数值**矩形而非 `'A1:C9'` 字符串：扫描循环里每格都要用它做比较，
@@ -666,6 +684,34 @@ export class DataCollection extends EventEmitter {
         // 打印设置统一入口随文档恢复（未保存过时保持接口默认值）
         this._printSetting = data.printSetting || {};
         this.values = data.values;
+    }
+
+    /**
+     * 按存档键装载一张**临时**表（供 Python 脚本 `open()` 其它文件时使用）
+     *
+     * 与 {@link syncValuesFromDB} 的区别：那个装载的是当前表并会广播事件，
+     * 这里只为「读数据 / 写回那一份存档」造一个离屏实例 —— 它不进 UI、不进撤销栈，
+     * 也不碰当前表的数据。写回由调用方 `applyScriptWrites(...)` + `syncValuesToDB()` 完成。
+     *
+     * 刻意不装载图片：脚本能读写的只有值与样式。
+     * @param {string} key - 存档键（见 `utils/fileName.toArchiveKey`）
+     * @returns {Promise<DataCollection | null>} 临时实例；该键没有存档时 null
+     */
+    public static async loadScratch(key: string): Promise<DataCollection | null> {
+        if (!key) return null;
+        const scratch = new DataCollection();
+        scratch.activedSheetName = key;
+        const raw = await scratch.db.getValue(key);
+        // 存档缺省时 IndexDB 返回 '{}'（见 IndexDB#getValue 的兜底），据此判定「没有这个文件」
+        if (raw === undefined || raw === null || raw === '{}') return null;
+        scratch._suppressValuesUndo = true;
+        try {
+            scratch._applyLoadedState(await DataCollection.fromSnapshotChunked(raw));
+        } finally {
+            scratch._refreshBaseline();
+            scratch._suppressValuesUndo = false;
+        }
+        return scratch;
     }
 
     /**
@@ -2724,6 +2770,125 @@ export class DataCollection extends EventEmitter {
             this._refreshBaseline();
             this.emit(DataEvents.VALUES_CHANGED, this._values);
         }
+    }
+
+    /**
+     * 把一批「脚本写入」（值 + 样式 + 合并跨度）落到工作表上，整体纳入撤销栈
+     *
+     * ## 为什么要放在数据层，而不是留在 Python 桥里
+     *
+     * 脚本写表和手点写表**必须是同一套规则**，否则同一个动作两种结果：
+     * - 写「被合并覆盖的位置」（D3:F5 里的 E4）要重定向到锚点（见 {@link ensureWritableCell}），
+     *   否则会往 `values` 里塞一条永远被遮挡层盖住、却能被子查找/替换扫到的垃圾记录；
+     * - 给锚点写 `colspan` / `rowspan` 等于「用脚本合并」，块内被覆盖的格子必须按
+     *   {@link executeMergeCells} 的口径清理，并重算合并倒排；
+     * - 被清掉的格子必须**先捕获进补丁**，否则撤销只回得来锚点、回不来被删的那几格。
+     *
+     * ## 两阶段分离
+     *
+     * 阶段一只读（解析落点、取格子、算跨度与覆盖格），阶段二才在撤销作用域内改数据；
+     * 交替「改 + 按名查找」会让每格都重建一次整份索引（O(N)）。
+     *
+     * @param {string} label - 撤销栈里的操作标签
+     * @param {Object} payload - 单元格名 → 字段字典（`value` / 样式 / `colspan` / `rowspan`）
+     * @returns {number} 实际写回的格子数（被合并重定向折叠后）
+     */
+    public applyScriptWrites(label: string, payload: Record<string, Record<string, unknown>>): number {
+        const names = Object.keys(payload);
+        if (names.length === 0) return 0;
+
+        // ── 阶段一：只读 ──
+        // ① 合并重定向 + 同一锚点的多次写入合并（后写覆盖先写）
+        const targets = new Map<string, Record<string, unknown>>();
+        for (let i = 0; i < names.length; i++) {
+            const name = names[i];
+            const target = this.resolveWriteTargetName(name);
+            const fields = payload[name];
+            const prev = targets.get(target);
+            if (prev === undefined) targets.set(target, Object.assign({}, fields));
+            else Object.assign(prev, fields);
+        }
+
+        // ② 取落点格（必要时新建；只新建锚点）
+        const byName = new Map<string, Cell>();
+        const cells: Cell[] = [];
+        targets.forEach((_fields, targetName) => {
+            const cell = this.ensureWritableCell(targetName);
+            byName.set(targetName, cell);
+            cells.push(cell);
+        });
+
+        // ③ 跨度锚点：本次写入了 colspan / rowspan 的落点（先按「写入后」的跨度算清理范围）
+        const spanTouched = new Set<string>();
+        const anchors: { name: string; col: number; row: number; colspan: number; rowspan: number }[] = [];
+        targets.forEach((fields, targetName) => {
+            if (!('colspan' in fields) && !('rowspan' in fields)) return;
+            spanTouched.add(targetName);
+            const cell = byName.get(targetName) as Cell;
+            const colspan = this._toSpan(fields.colspan, cell.colspan);
+            const rowspan = this._toSpan(fields.rowspan, cell.rowspan);
+            if (colspan <= 1 && rowspan <= 1) return;      // 改成 1 = 取消合并，无覆盖格
+            const { col, row } = this.getCellColAndRow(targetName);
+            if (!isFinite(col) || !isFinite(row) || col < 1 || row < 1) return;
+            anchors.push({ name: targetName, col, row, colspan, rowspan });
+        });
+
+        // ④ 被覆盖的格子也必须进补丁：清理会把它们从 values 里摘掉，不捕获就撤不回来
+        for (let i = 0; i < anchors.length; i++) {
+            const a = anchors[i];
+            for (let row = a.row; row <= a.row + a.rowspan - 1; row++) {
+                for (let col = a.col; col <= a.col + a.colspan - 1; col++) {
+                    if (col === a.col && row === a.row) continue;
+                    const name = this.getCellName(col, row);
+                    if (byName.has(name)) continue;         // 本身就是另一个落点，会在阶段二被写入
+                    const cell = this.getCellByName(name);
+                    if (cell === undefined) continue;
+                    byName.set(name, cell);
+                    cells.push(cell);
+                }
+            }
+        }
+
+        // ── 阶段二：结构性修改 ──
+        this.runWithCellsUndo(label, cells, () => {
+            targets.forEach((fields, targetName) => {
+                const cell = byName.get(targetName) as Cell;
+                if ('value' in fields) {
+                    const value = fields.value;
+                    if (value === undefined || value === null || value === '') cell.clearValue();
+                    else cell.addValue(String(value));
+                }
+                // 样式：白名单驱动（键来自脚本，不能直接反射赋值）
+                const raw = cell as unknown as Record<string, unknown>;
+                for (const key in fields) {
+                    if (key === 'value' || key === 'colspan' || key === 'rowspan') continue;
+                    if (!SCRIPT_WRITABLE_FIELDS.has(key)) continue;
+                    raw[key] = fields[key];
+                }
+                if ('colspan' in fields) cell.colspan = this._toSpan(fields.colspan, cell.colspan);
+                if ('rowspan' in fields) cell.rowspan = this._toSpan(fields.rowspan, cell.rowspan);
+            });
+            // 与「手动合并」同口径：清掉落点块内被覆盖的格子（带边框/底色的留着只清文字）
+            this._pruneCoveredCellsBySpans(anchors);
+            // 跨度被改写过（含改回 1 = 取消合并）：合并倒排必须重算，
+            // 否则 findMergeRect 还按旧跨度回答（既不改长度也不置脏，索引看不出变化）
+            if (spanTouched.size > 0) this.invalidateCellIndex();
+        });
+
+        return targets.size;
+    }
+
+    /**
+     * 解析跨度值（脚本传进来的可能是字符串 / 小数 / 缺省）
+     * @param value - 写入值
+     * @param fallback - 未给出时沿用的现值
+     * @returns {number} 不小于 1 的整数跨度
+     * @private
+     */
+    private _toSpan(value: unknown, fallback: number | undefined): number {
+        const n = typeof value === 'number' ? value : Number(value);
+        if (isFinite(n) && n >= 1) return Math.floor(n);
+        return fallback === undefined ? 1 : fallback;
     }
 
     /**

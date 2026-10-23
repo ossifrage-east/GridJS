@@ -135,7 +135,7 @@ const RUN_PROGRAM = [
     'exec(compile(_scan["namespace"], "' + NAMESPACE_MODULE + '", "exec"), _mod.__dict__)',
     'sys.modules["' + NAMESPACE_MODULE + '"] = _mod',
     // 2) 注入工作表快照与表信息（内部接口 _load 见 sheetNameSpace.PY_NAMESPACE_SOURCE）
-    '_mod._load(_scan["snapshotJson"], _scan["sheet"], _scan["rows"], _scan["cols"])',
+    '_mod._load(_scan["snapshotJson"], _scan["stylesJson"], _scan["openedJson"], _scan["sheet"], _scan["rows"], _scan["cols"], _scan["metaJson"])',
     'from ' + NAMESPACE_MODULE + ' import *',
     // 3) 执行用户脚本：独立字典 + __name__='__main__'，使脚本末尾的
     //    `if __name__ == "__main__": main()` 能按预期触发。
@@ -160,6 +160,12 @@ interface RunArgs {
     script: string;
     /** 工作表快照 JSON（`{"A1": "文本", ...}`） */
     snapshotJson: string;
+    /** 工作表样式快照 JSON（`{"A1": {"fontColor": "#fff", ...}}`） */
+    stylesJson: string;
+    /** 脚本里 `open_grid()` 引用到的其它表格（JSON 数组，见 sheetNameSpace.buildOpenedJson） */
+    openedJson: string;
+    /** 当前表元信息（maxCol / maxRow / files，见 sheetNameSpace.buildMetaJson） */
+    metaJson: string;
     /** 当前工作表名 */
     sheet: string;
     /** 表格行数 */
@@ -183,6 +189,9 @@ async function runScript(pyodide: PyodideAPI, request: PythonRunRequest): Promis
         namespace: request.namespaceSource,
         script: request.script,
         snapshotJson: request.snapshotJson,
+        stylesJson: request.stylesJson,
+        openedJson: request.openedJson,
+        metaJson: request.metaJson,
         sheet: request.sheetName,
         rows: request.rowCount,
         cols: request.colCount,

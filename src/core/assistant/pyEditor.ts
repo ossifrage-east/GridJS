@@ -10,7 +10,10 @@ import { IndexDB } from '../dataArchitecture/indexDB';
 import { DataCollection } from '../dataArchitecture/dataCollection';
 import { createDiv, createElement, createSpan } from '../../utils/dom';
 import { runPython, stopPython } from '../../utils/python/pythonClient';
-import { PY_NAMESPACE_SOURCE, buildSnapshot, applyWrites } from '../../utils/python/sheetNameSpace';
+import {
+    PY_NAMESPACE_SOURCE, buildSnapshot, applyWritesAll, buildOpenedJson, buildMetaJson,
+    buildScriptMeta, extractOpenGridPaths, listGridFiles, prepareOpenedSheets, OpenedSheet,
+} from '../../utils/python/sheetNameSpace';
 import '../style/pyEditor.scss';
 
 /** Python 关键字（高亮为「关键字」色） */
@@ -194,11 +197,34 @@ export class PYEditor {
             '# 在此编写脚本，内容会自动保存在本机（IndexedDB）',
             '#',
             '# 可用 API（读写当前工作表）：',
-            '#   sheet_name / row_count / col_count   当前工作表名、行数、列数',
+            '#   sheet_name / row_count / col_count   当前工作表名、行数、列数（表头尺寸）',
+            '#   sheet.maxCol / sheet.maxRow          有内容的最大列号 / 行号（按格子算，1 起始）',
+            '#   files                                工作区里所有表格文件（不含文件夹），可直接 open_grid(files[0])',
             '#   get_cell("A1")                        读取单元格文本（空格子返回空串）',
             '#   set_cell("A1", "值") / clear_cell("A1")  写入 / 清空单元格，运行后可 Ctrl+Z 撤销',
             '#   get_range("A1:C3")                    读取区域，返回二维列表',
             '#   set_range("A1:C3", [["a1","b1"],["a2","b2"]])  写入区域，以 A1 为左上角',
+            '#',
+            '# 对象式（单元格名当属性，读得到值也读得到样式）：',
+            '#   print(sheet.A1, sheet.A1.value)       文本',
+            '#   print(sheet.A1.color, sheet.A1.bgColor, sheet.A1.bold)   字体色 / 背景色 / 加粗',
+            '#   print(sheet.A1)                       最终显示文本（日期 / 货币 / 百分比都按格式）',
+            '#   sheet.A1.raw / .number                原始文本 / 数值',
+            '#   sheet.A1.datetime / .date             日期对象；写它自动换算成 Excel 序列号',
+            '#   sheet.A1 = 56                         写值',
+            '#   sheet.A1.bgColor = "#fff"             写样式（还可写 font/size/italic/underline/',
+            '#                                         strike/align/valign/wrap/numFmt/border/colspan/rowspan）',
+            '#',
+            '# 下标式（适合循环，（列号, 行号）从 1 开始）：',
+            '#   print(sheet.cells(4, 3), sheet.cells("D3"), sheet.cells(1, 1).bgColor)',
+            '#   sheet.cells(4, 3) = "12"              写值',
+            '#   sheet.cells(4, 3).colspan = 3         设合并跨度（块内被覆盖的格子会自动清掉）',
+            '#',
+            '# 打开工作区里的其它表格（相对路径以当前文件所在目录为基准）：',
+            '#   other = open_grid("明细.xlsx")        同目录；"../汇总.xlsx" 上一级；',
+            '#   other = open_grid("/数据/明细")       以 / 开头从根算起；扩展名可省',
+            '#   print(other.B2, other.B2.bgColor)     读；属性 / 下标 / cells() 都与 sheet 一致',
+            '#   other.B2 = "改这一格"                 写回的是那个文件的存档，不影响当前表',
             '#',
             '# 也可把单元格名直接当变量名（列字母须大写，x1 / b2 这类小写名仍按普通变量），',
             '# 模块级与 def 函数体内都成立：',
@@ -328,19 +354,36 @@ export class PYEditor {
         this.appendOutput('正在运行…（首次运行需先加载 Python 运行环境）', false);
 
         const snapshot = buildSnapshot(this.data);
+        const script = this.getValue();
         try {
+            // open_grid("路径") 是同步调用，而读别的文件的存档只能异步 —— 只能先静态扫出
+            // 全部字面量路径、主线程预加载，再把数据一起下发给 Worker（详见 extractOpenGridPaths）。
+            const paths = extractOpenGridPaths(script);
+            // 脚本用到 files（工作区文件清单）时，open_grid(files[i]) 这种**动态**参数才有表可查
+            // —— 只能把全部表格都预加载进来。代价是表多时这一次运行会慢，故仅在真的用到时触发。
+            const preloadAll = /\bfiles\b/.test(script);
+            const files = await listGridFiles(this.data);
+            let opened: { sheets: OpenedSheet[]; scratch: Map<string, DataCollection> } = { sheets: [], scratch: new Map() };
+            if (paths.length > 0 || preloadAll) {
+                opened = await prepareOpenedSheets(this.data, paths, { keys: files, preloadAll });
+            }
             const { writesJson } = await runPython({
-                script: this.getValue(),
+                script,
                 sheetName: snapshot.sheetName,
                 snapshotJson: snapshot.json,
+                stylesJson: snapshot.stylesJson,
+                openedJson: buildOpenedJson(opened.sheets),
+                metaJson: buildMetaJson(buildScriptMeta(this.data, files, snapshot.display)),
                 rowCount: snapshot.rowCount,
                 colCount: snapshot.colCount,
                 namespaceSource: PY_NAMESPACE_SOURCE,
                 onStdout: (text: string) => this.appendOutput(text, false),
                 onStderr: (text: string) => this.appendOutput(text, true),
             });
-            const count = applyWrites(this.data, writesJson, '运行 Python 脚本');
-            this.appendOutput(count > 0 ? `运行完成，已写入 ${count} 个单元格` : '运行完成', false);
+            const { count, others } = await applyWritesAll(
+                this.data, writesJson, '运行 Python 脚本', opened.scratch);
+            const otherNote = others.length > 0 ? `，另写入 ${others.length} 个表格` : '';
+            this.appendOutput(count > 0 ? `运行完成，已写入 ${count} 个单元格${otherNote}` : '运行完成', false);
         } catch (err) {
             this.appendOutput(err instanceof Error ? err.message : String(err), true);
         } finally {

@@ -374,7 +374,26 @@ export class Canvas extends EventEmitter {
     public calculateCharGeometry(cell: string, charIndex: number): { charWidth: number; charHeight: number; fontColor: string; fontWeight: string; fontStyle: string; fontSize: number; fontFamily: string; underline: boolean; strikethrough: boolean } {
         const cellObj = this.data.getCellByName(cell);
         // chars 数组是字符内容与样式的唯一数据源，避免额外重建整串字符串
-        const charObj = cellObj?.chars?.[charIndex];
+        let charObj = cellObj?.chars?.[charIndex];
+
+        // 从 chars 数组读取字符内容，索引越界或换行等关键字不占宽度
+        // 若单元格设置了数字格式，则从格式化后的显示文本中取字符进行测量
+        let char = charObj?.char;
+        const numberFormat = cellObj?.numberFormat;
+        if (numberFormat && numberFormat !== 'General' && numberFormat !== '@') {
+            const rawText = this.data.getCellValue(cell);
+            const displayText = getCellDisplayText(rawText, numberFormat);
+            if (displayText !== rawText) {
+                // 【逐字符样式对格式化文本不成立】画出来的是格式化结果（`1234.5` → `1,234.50`），
+                // 它和 chars 不是同一串字符，长度也对不上：
+                // - 格式化串**更长**时，尾部字符按索引取不到 charObj → 一路回退到默认样式，
+                //   表现就是「右边那半截字体/字号/粗细不对」（用户报的就是这个）；
+                // - 更短时索引虽然都在范围内，但字符与 char 段早已错位，样式同样不可信。
+                // 格式化串不是原文，逐段样式对它没有意义，故统一取**首字符**的样式（整串同一样式）。
+                char = displayText[charIndex];
+                charObj = cellObj?.chars?.[0];
+            }
+        }
 
         // 样式继承：字符级样式 → 默认样式
         // 刻意不抽 `pick` 闭包：本函数在文本绘制里**按字符**调用，
@@ -387,15 +406,6 @@ export class Canvas extends EventEmitter {
         const fontStyle = (charObj?.fontStyle !== undefined ? charObj.fontStyle : false) ? 'italic' : '';
         const fontSize = Math.round((charObj?.fontSize !== undefined ? charObj.fontSize : DEFAULT_FONT_SIZE) * this.data.zoom);
 
-        // 从 chars 数组读取字符内容，索引越界或换行等关键字不占宽度
-        // 若单元格设置了数字格式，则从格式化后的显示文本中取字符进行测量
-        let char = charObj?.char;
-        const numberFormat = cellObj?.numberFormat;
-        if (numberFormat && numberFormat !== 'General' && numberFormat !== '@') {
-            const rawText = this.data.getCellValue(cell);
-            const displayText = getCellDisplayText(rawText, numberFormat);
-            char = displayText[charIndex];
-        }
         const isMeasurable = typeof char === 'string' && char.length > 0 && !KEYWORDS.includes(char);
 
         const fontParts: string[] = [];

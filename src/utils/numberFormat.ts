@@ -27,6 +27,18 @@
  * @param code  - 格式码字符串
  * @returns 格式化后的显示文本
  */
+/**
+ * 给结果补负号（已经带负号时原样返回）
+ *
+ * 负段格式 `-0.00%` / `"¥"#,##0.00` 里的 `-` 会先被当成字面量前缀写进结果，
+ * 这时再补一次负号就会得到 `--25.00%`。
+ * @param text - 已格式化好的文本
+ * @returns {string} 带负号的文本
+ */
+function withMinus(text: string): string {
+    return text.charAt(0) === '-' ? text : `-${text}`;
+}
+
 export function formatNumberValue(value: number, code: string): string {
     // 多段格式码：按 正;负;零 切分，选择对应段
     const sections = code.split(';');
@@ -77,8 +89,10 @@ export function formatNumberValue(value: number, code: string): string {
         const expPadded = String(exponent).padStart(expDigits, '0');
         let result = `${mantissa}E${expSign}${expPadded}`;
         if (isPercent) result += '%';
+        // 负号只在「这一段自己没写负号」时才补：`0.00%;-0.00%` 的负段自带 `-`，
+        // 再补一次就成了 `--25.00%`（Excel 只显示一个）
         if (isNegative) {
-            result = useParentheses ? `(${result})` : `-${result}`;
+            result = useParentheses ? `(${result})` : withMinus(result);
         }
         return result;
     }
@@ -92,8 +106,10 @@ export function formatNumberValue(value: number, code: string): string {
     // 货币符号前缀/后缀：提取格式字符（0#,.）以外的字符
     const prefixMatch = section.match(/^[^0#,.]+/);
     const suffixMatch = section.match(/[^0#,.]+$/);
-    const prefix = prefixMatch ? prefixMatch[0] : '';
-    const suffix = suffixMatch ? suffixMatch[0] : '';
+    // 双引号是 Excel 的「字面量」语法：`"¥"#,##0.00` 应当输出 ¥1,234.50，
+    // 引号本身不是要显示的内容（早期实现原样带出，画布与脚本里都多了一对引号）
+    const prefix = prefixMatch ? prefixMatch[0].replace(/"/g, '') : '';
+    const suffix = suffixMatch ? suffixMatch[0].replace(/"/g, '') : '';
 
     // 格式化数值
     let formatted = numValue.toFixed(decimalPlaces);
@@ -104,13 +120,9 @@ export function formatNumberValue(value: number, code: string): string {
     let result = `${prefix}${formatted}${suffix}`;
     if (isPercent) result += '%';
 
-    // 应用负数样式
+    // 应用负数样式（同上：负段自带负号时不重复补）
     if (isNegative) {
-        if (useParentheses) {
-            result = `(${result})`;
-        } else {
-            result = `-${result}`;
-        }
+        result = useParentheses ? `(${result})` : withMinus(result);
     }
 
     return result;
