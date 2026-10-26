@@ -569,6 +569,20 @@ export class DataCollection extends EventEmitter {
     public undoManager: UndoManager;
     /** 剪贴板管理器实例 */
     public clipboardManager: ClipboardManager;
+    /**
+     * 复制/剪切后留在源范围上的范围串（如 'A1:C5'）
+     *
+     * 仅用于界面层绘制「流动虚线框」（{@link CopyMarquee}），不参与数据/存档；
+     * null 表示当前没有待粘贴的源范围。
+     */
+    private _copyRange: string | null = null;
+    /**
+     * {@link _copyRange} 所属的工作表名
+     *
+     * 虚线框只属于复制发生的那张表：切到其它表时 {@link copyRange} 对外返回 null
+     * （界面隐藏），切回原表时又恢复显示；内部剪贴板不受影响，切表后仍可粘贴。
+     */
+    private _copyRangeSheet: string | null = null;
     /** @type {'single' | 'continuous'} 格式刷模式（单次模式或连续模式） */
     private _brushMode: 'single' | 'continuous' | null = null;
     /** 数据加载完成的 Promise，供外部组件等待数据就绪 */
@@ -5013,7 +5027,20 @@ export class DataCollection extends EventEmitter {
      * @returns {{ left: number, top: number, width: number, height: number }} 选中的矩形区域
      */
     public getSelectedRect(): { left: number, top: number, width: number, height: number } {
-        const [start, end] = this.selection ? this.selection.split(':') : [this.activedCell, this.activedCell];
+        return this.getRangeRect(this.selection);
+    }
+
+    /**
+     * 获取任意范围串对应的矩形区域
+     *
+     * 与 {@link getSelectedRect} 是同一套几何口径（网格矩形、跳过隐藏行列），
+     * 供复制/剪切的流动虚线框复用：它必须跟着当前选区一起滚动/缩放，
+     * 而不是把复制瞬间的屏幕坐标缓存下来。
+     * @param {string | null} range - 范围串（如 'A1:C5'）；为空时退化为活动单元格
+     * @returns {{ left: number, top: number, width: number, height: number }} 范围矩形区域
+     */
+    public getRangeRect(range: string | null): { left: number, top: number, width: number, height: number } {
+        const [start, end] = range ? range.split(':') : [this.activedCell, this.activedCell];
         const { col: startCol0, row: startRow0 } = this.getCellColAndRow(start);
         const { col: endCol0, row: endRow0 } = this.getCellColAndRow(end);
         const minCol = Math.min(startCol0, endCol0);
@@ -5277,6 +5304,48 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 当前复制/剪切的源范围（无则为 null）
+     *
+     * 记录的范围属于复制时所在的工作表：切换到其它工作表后对外返回 null，
+     * 让流动虚线框只在原表显示；切回原表时再次返回该范围。
+     * @returns {string | null} 源范围串
+     */
+    public get copyRange(): string | null {
+        return this._copyRangeSheet === this._activedSheetName ? this._copyRange : null;
+    }
+
+    /**
+     * 设置/清除复制源范围并广播
+     *
+     * 界面层（{@link CopyMarquee}）只监听这个事件来显示/隐藏流动虚线框，
+     * 不订阅剪贴板内部数据，避免数据层与界面层互相依赖。
+     * 设置时把范围绑定到当前工作表，之后切换表格只隐藏显示、不丢失标记。
+     * @param {string | null} range - 源范围串；null 表示清除
+     */
+    public setCopyRange(range: string | null): void {
+        if (range === null) {
+            if (this._copyRange === null && this._copyRangeSheet === null) return;
+            this._copyRange = null;
+            this._copyRangeSheet = null;
+            this.emit(DataEvents.COPY_RANGE_CHANGED, null);
+            return;
+        }
+        if (this._copyRange === range && this._copyRangeSheet === this._activedSheetName) return;
+        this._copyRange = range;
+        this._copyRangeSheet = this._activedSheetName;
+        this.emit(DataEvents.COPY_RANGE_CHANGED, range);
+    }
+
+    /**
+     * 清除复制/剪切的流动虚线框（Esc）
+     *
+     * 只清界面标记，不清内部剪贴板 —— 与 Excel 一致：取消选取不影响已复制的内容。
+     */
+    public clearCopyRange(): void {
+        this.setCopyRange(null);
+    }
+
+    /**
      * 复制选中的单元格内容
      *
      * 遍历选区时忽略隐藏的行/列：隐藏行列中的单元格不进入剪贴板，
@@ -5315,6 +5384,8 @@ export class DataCollection extends EventEmitter {
             }
         }
 
+        // 复制/剪切后源范围转为流动虚线框（Excel 行为），直到 Esc 或下一次复制/剪切
+        this.setCopyRange(this.selection);
         this.clipboardManager.setClipboard({ type: 'cell', cells: selectedCells, sourceRange: this.selection, visibleColOffsets, visibleRowOffsets });
     }
 
@@ -5349,6 +5420,8 @@ export class DataCollection extends EventEmitter {
             }
         }
 
+        // 复制/剪切后源范围转为流动虚线框（Excel 行为），直到 Esc 或下一次复制/剪切
+        this.setCopyRange(this.selection);
         this.clipboardManager.setClipboard({ type: 'cell', cells: selectedCells, sourceRange: this.selection, visibleColOffsets, visibleRowOffsets });
         this.commitValues();
     }
@@ -5782,6 +5855,41 @@ export class DataCollection extends EventEmitter {
         }
         this.runWithFullStateUndo('设置字体格式', apply, 'selection');
         // 包裹期间 commitValues 的自动广播被抑制，这里补一次驱动重绘（app.ts 按 rAF 排程，重复发射会自动合并）
+        this.emit(DataEvents.VALUES_CHANGED, this._values);
+    }
+
+    /**
+     * 调整选中单元格的缩进（左缩进，单位 CSS px）
+     *
+     * 与 {@link setSelectedCellsFont} 的区别：字体样式是「设置绝对值」，重复点击
+     * 结果不变；缩进是「按增量调整」，重复点击应当累积，故单独成方法。
+     *
+     * ## 去重合并锚点
+     *
+     * 选中整块合并区时，{@link getSelectedCells} 会列出 D4/D5/E3…F3 这些被吞掉的
+     * 位置；它们经 {@link ensureWritableCell} 全部重定向到同一个锚点 D3。
+     * 若逐名累加，锚点会被加 N 次（2×3 合并块 = 6 次），故先按**格子对象**去重再累加。
+     *
+     * ## 撤销
+     *
+     * 非编辑态整体经 `runWithFullStateUndo`（'selection' 档）包裹，口径与其它
+     * 工具栏格式操作一致；编辑态裸执行，避免污染编辑内撤销栈。
+     *
+     * @param delta - 增量像素值（正数增加、负数减少）；结果小于 0 时归零
+     */
+    public changeSelectedCellsIndent(delta: number): void {
+        const apply = (): void => {
+            const targets = new Set<Cell>();
+            this.getSelectedCells().forEach(_cell => targets.add(this.ensureWritableCell(_cell)));
+            targets.forEach(cell => { cell.indent = (cell.indent ?? 0) + delta; });
+            this.commitValues();
+        };
+        if (this.isEditting) {
+            apply();
+            return;
+        }
+        this.runWithFullStateUndo('调整缩进', apply, 'selection');
+        // 包裹期间 commitValues 的自动广播被抑制，这里补一次驱动重绘
         this.emit(DataEvents.VALUES_CHANGED, this._values);
     }
 

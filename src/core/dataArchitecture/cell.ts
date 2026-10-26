@@ -145,6 +145,8 @@ export class Cell {
     private _letterSpacing?: number;
     /** 行高 */
     private _lineSpacing?: number;
+    /** 缩进（CSS px，左缩进；0 或未设置视为无缩进） */
+    private _indent?: number;
 
     /**
      * 构造函数
@@ -616,6 +618,25 @@ export class Cell {
     }
 
     /**
+     * 获取缩进
+     * @returns {number | undefined} 左缩进像素值（未设置或为 0 时为 undefined）
+     */
+    get indent(): number | undefined {
+        return this._indent;
+    }
+
+    /**
+     * 设置缩进
+     *
+     * 只保留正值：0 / 负数一律归一为 undefined，使「减少缩进到 0」后的空格子
+     * 能被 {@link DataCollection} 的清扫流程正常移除（isEmpty 不再被缩进标记撑住）。
+     * @param {number | undefined} indent - 左缩进像素值
+     */
+    set indent(indent: number | undefined) {
+        this._indent = indent !== undefined && indent > 0 ? indent : undefined;
+    }
+
+    /**
      * 添加单元格值，不带样式
      * @param {string} value - 单元格值字符串
      */
@@ -654,6 +675,7 @@ export class Cell {
         this._wrap = undefined;
         this._letterSpacing = undefined;
         this._lineSpacing = undefined;
+        this._indent = undefined;
         this._borderTopWidth = undefined;
         this._borderBottomWidth = undefined;
         this._borderLeftWidth = undefined;
@@ -698,6 +720,10 @@ export class Cell {
         // 边框
         if (this._borderTopWidth !== undefined || this._borderBottomWidth !== undefined
             || this._borderLeftWidth !== undefined || this._borderRightWidth !== undefined) {
+            return false;
+        }
+        // 缩进（仅缩进、无内容无其它样式的格子也必须保留，否则缩进会随清扫丢失）
+        if (this._indent !== undefined) {
             return false;
         }
         return true;
@@ -752,6 +778,7 @@ export class Cell {
         cell._wrap = this._wrap;
         cell._letterSpacing = this._letterSpacing;
         cell._lineSpacing = this._lineSpacing;
+        cell._indent = this._indent;
         cell._chars = this._chars ? this._chars.map((c: Char) => c.clone()) : new Array<Char>();
         return cell;
     }
@@ -808,7 +835,8 @@ export class Cell {
             filter: this._filter,
             wrap: this._wrap,
             letterSpacing: this._letterSpacing,
-            lineSpacing: this._lineSpacing
+            lineSpacing: this._lineSpacing,
+            indent: this._indent
         });
     }
 
@@ -844,6 +872,7 @@ export class Cell {
             cell._wrap = item.wrap;
             cell._letterSpacing = item.letterSpacing;
             cell._lineSpacing = item.lineSpacing;
+            cell._indent = item.indent;
             cell.fromCharsJSON(item.chars || []);
             return cell;
         });
@@ -882,6 +911,7 @@ export class Cell {
     //   c=cell  e=isEdit(false)  cs=colspan  rs=rowspan
     //   bt/bb/bl/br=四边边框宽  ta=textAlign  ai=alignItems  bg=backgroundColor
     //   nf=numberFormat  bc=borderColor  fl=filter  w=wrap  ls=letterSpacing  lns=lineSpacing
+    //   in=indent
     //   t=文本  f=共享字体  a=逐字符数组  s=样式表下标（v3）
     // 字体短名：n=fontFamily  s=fontSize  b=fontWeight  i=fontStyle  o=fontColor
     //   u=underline  k=strikethrough
@@ -956,6 +986,7 @@ export class Cell {
         if (this._wrap !== undefined) { out.w = this._wrap ? 1 : 0; n++; }
         if (this._letterSpacing !== undefined) { out.ls = this._letterSpacing; n++; }
         if (this._lineSpacing !== undefined) { out.lns = this._lineSpacing; n++; }
+        if (this._indent !== undefined) { out.in = this._indent; n++; }
         return n;
     }
 
@@ -1035,6 +1066,7 @@ export class Cell {
         if (style.w !== undefined) cell._wrap = !!style.w;
         if (style.ls !== undefined) cell._letterSpacing = style.ls;
         if (style.lns !== undefined) cell._lineSpacing = style.lns;
+        if (style.in !== undefined) cell._indent = style.in;
         cell._chars = Cell.readChars(raw, style);
         return cell;
     }

@@ -8,6 +8,7 @@ import { ColHeaderCanvas } from "./colHeaderCanvas";
 import { SheetCanvas } from "./sheetCanvas";
 import { AllSelect } from "./allSelect";
 import { EditCanvas } from "./editCanvas";
+import { CopyMarquee } from "./copyMarquee";
 import { Menu } from "../common/menu";
 import '../style/sheets.scss';
 
@@ -68,6 +69,8 @@ export class Sheets extends EventEmitter {
     private sheetCanvas: SheetCanvas;
     /** 编辑画布元素 */
     private editCanvas: EditCanvas;
+    /** 复制/剪切后的流动虚线框（DOM 层，位置由每帧 draw 同步） */
+    private copyMarquee: CopyMarquee | null = null;
     /**
      * 表格区域内是否正在拖拽（mousedown 起于画布、尚未 mouseup）
      *
@@ -184,6 +187,9 @@ export class Sheets extends EventEmitter {
         this.colHeaderCanvas = new ColHeaderCanvas({parentElement: this.sheets, data: this.data, menu: this.menu});
         this.sheetCanvas = new SheetCanvas({parentElement: this.sheets, data: this.data, menu: this.menu});
         this.editCanvas = new EditCanvas({parentElement: this.sheets, data: this.data, menu: this.menu});
+        // 流动虚线框挂在最上层 DOM（不画在 canvas 上）：CSS 动画跑在合成线程，
+        // 不必为「虚线跑动」每帧全量重绘表格
+        this.copyMarquee = new CopyMarquee({parentElement: this.sheets, data: this.data});
     }
 
     /**
@@ -297,6 +303,8 @@ export class Sheets extends EventEmitter {
                     this.colHeaderCanvas.draw();
                     this.sheetCanvas.draw();
                     this.editCanvas.draw();
+                    // 虚线框位置跟随滚动/缩放/选区变化：每帧按最新的 copyRange 重算
+                    this.copyMarquee?.sync();
                     // 注意：这里**不再**调用 data.syncValuesToDB()。
                     // 每帧整表 toJSON() 序列化 + 写 IndexedDB 是打开大文件卡顿/崩溃的成因之一；
                     // 落库已改由 DataCollection 的「变更事件 → 置脏 → 防抖保存」驱动
@@ -546,6 +554,9 @@ export class Sheets extends EventEmitter {
         }
         
         this.removeAllListeners();
+
+        this.copyMarquee?.destroy();
+        this.copyMarquee = null;
         
         if (this.sheets.parentElement) {
             this.sheets.parentElement.removeChild(this.sheets);

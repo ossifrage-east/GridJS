@@ -531,12 +531,18 @@ export class SheetCanvas extends Canvas {
         // 选区完全滚出视口时不画背景，但描边仍按完整选区画（Canvas 自行裁剪，
         // 超出部分不显示，也不必为它单独算裁剪）
 
-        this.ctx.strokeStyle = DEFAULT_SELECTED_BORDER_COLOR;
-        this.setLineWidth(DEFAULT_SELECTED_BORDER_WIDTH);
-        this.strokeRect(left * zoom,
-            top * zoom,
-            width * zoom,
-            height * zoom);
+        // 复制/剪切后源范围改用流动虚线框（{@link CopyMarquee} 的 DOM 层动画）：
+        // 此刻若再画蓝色实线，会与虚线叠在同一位置，视觉上糊成一条实线，
+        // 看不出「正在转圈」。故仅当「待粘贴源范围 === 当前选区」时跳过描边，
+        // 选区背景与右下角锚点仍照常绘制（与 Excel 一致）。
+        if (this.data.copyRange !== this.data.selection) {
+            this.ctx.strokeStyle = DEFAULT_SELECTED_BORDER_COLOR;
+            this.setLineWidth(DEFAULT_SELECTED_BORDER_WIDTH);
+            this.strokeRect(left * zoom,
+                top * zoom,
+                width * zoom,
+                height * zoom);
+        }
         this.ctx.restore();
         this.drawAnchor();
     }
@@ -656,7 +662,7 @@ export class SheetCanvas extends Canvas {
      * 构造单元格文本位图的缓存键
      *
      * 键覆盖所有能影响光栅化结果的输入：位图物理尺寸（含列宽行高/zoom/dpr）、
-     * 单元格级排版属性（换行/对齐/字距/行距/数字格式/单元格级字体兜底）、
+     * 单元格级排版属性（换行/对齐/字距/行距/缩进/数字格式/单元格级字体兜底）、
      * 以及逐字符的内容与 7 个字体字段。任一项变化都会得到不同的键。
      *
      * @param {Cell} cellObj - 单元格
@@ -685,6 +691,7 @@ export class SheetCanvas extends Canvas {
         }
         return `${bitmapW}x${bitmapH}|${z}|${dpr}|${cellObj.wrap ? 1 : 0}`
             + `|${cellObj.letterSpacing ?? 0}|${cellObj.lineSpacing ?? 0}`
+            + `|${cellObj.indent ?? 0}`
             + `|${cellObj.numberFormat ?? ''}`
             + `|${cellObj.textAlign ?? ''}|${cellObj.alignItems ?? ''}`
             + `|${cellObj.fontFamily ?? ''}|${cellObj.fontSize ?? ''}|${sig}`;

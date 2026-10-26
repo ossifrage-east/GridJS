@@ -210,6 +210,8 @@ export class Canvas extends EventEmitter {
         const letterSpacing = cellObj.letterSpacing || 0;
         const wrap = cellObj.wrap || false;
         const lineSpacing = cellObj.lineSpacing || 0;
+        // 缩进按 zoom 换算成画布像素；换行可用宽度同步扣减，避免文字折行后越过右边界
+        const indent = Math.round((cellObj.indent || 0) * this.data.zoom);
         
         const paragraphs = displayValue.split('\n');
         let cellValueWidth = 0, cellValueHeight = 0, charStartIndex = 0;
@@ -228,10 +230,11 @@ export class Canvas extends EventEmitter {
             const { lineWidth: paragraphWidth, lineHeight: paragraphHeight } 
                 = this.calculateSingleLineGeometry(cell, charStartIndex, paragraph, letterSpacing);
             
-            if (wrap && paragraphWidth + CELL_PADDING * 2 > cellWidth * this.data.zoom) {
+            if (wrap && paragraphWidth + CELL_PADDING * 2 + indent > cellWidth * this.data.zoom) {
                 let startIndex = 0;
                 while (startIndex < paragraph.length) {
-                    let endIndex = this.findOptimalLineBreak(cell, paragraph, startIndex, cellWidth * this.data.zoom, letterSpacing, charStartIndex);
+                    const wrapWidth = Math.max(0, cellWidth * this.data.zoom - indent);
+                    let endIndex = this.findOptimalLineBreak(cell, paragraph, startIndex, wrapWidth, letterSpacing, charStartIndex);
                     const lineText = paragraph.substring(startIndex, endIndex);
                     const { lineWidth, lineHeight } = this.calculateSingleLineGeometry(cell, charStartIndex + startIndex, lineText, letterSpacing);
                     cellValueWidth = Math.max(cellValueWidth, lineWidth);
@@ -259,12 +262,13 @@ export class Canvas extends EventEmitter {
         const textAlign = cellObj.textAlign;
         const alignItems = cellObj.alignItems;
         for (const [lineIndex, line] of lines.entries()) {
+            // 缩进统一作用在水平基准位置上：三种对齐都向右偏移 indent 像素
             if (textAlign === 'left') {
-                lines[lineIndex].x = CELL_PADDING;
+                lines[lineIndex].x = CELL_PADDING + indent;
             } else if (textAlign === 'right') {
-                lines[lineIndex].x = Math.round(cellWidth * this.data.zoom - line.lineWidth - CELL_PADDING);
+                lines[lineIndex].x = Math.round(cellWidth * this.data.zoom - line.lineWidth - CELL_PADDING) + indent;
             } else {
-                lines[lineIndex].x = Math.round((cellWidth * this.data.zoom - line.lineWidth) / 2);
+                lines[lineIndex].x = Math.round((cellWidth * this.data.zoom - line.lineWidth) / 2) + indent;
             }
             
             if (alignItems === 'top') {
@@ -293,7 +297,7 @@ export class Canvas extends EventEmitter {
         return {
             editLeft: editLeft,
             editTop: editTop,
-            charsWidth: Math.round(cellValueWidth + CELL_PADDING * 4),
+            charsWidth: Math.round(cellValueWidth + indent + CELL_PADDING * 4),
             charsHeight: Math.round(cellValueHeight + CELL_PADDING * 4),
             contentWidth: Math.round(contentWidth + (contentWidth > cellWidth * this.data.zoom + CELL_PADDING * 2 ? CELL_PADDING : 0)),
             contentHeight: Math.round(contentHeight),

@@ -284,6 +284,8 @@ enum SheetProperty {
     VALUES_CHANGED = 'sheet:values:changed',
     SELECTION_CHANGED = 'sheet:selection:changed',
     ANCHOR_SELECTION_CHANGED = 'sheet:anchorSelection:changed',
+    /** 复制/剪切的源范围变化（CopyMarquee 据此显示/隐藏流动虚线框） */
+    COPY_RANGE_CHANGED = 'sheet:copyRange:changed',
     ZOOM_CHANGED = 'sheet:zoom:changed',
     RESIZE_CHANGED = 'sheet:resize:changed',
     OFFSETX_CHANGED = 'offsetx:changed',

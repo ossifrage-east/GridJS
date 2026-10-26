@@ -12,6 +12,7 @@ import { DataCollection } from "../../dataArchitecture/dataCollection";
 import { BtnBase } from "../../common/button";
 import { Menu } from "../../common/menu";
 import { Cell, TextAlign, VerticalAlign } from "../../dataArchitecture/cell";
+import { indentStepPx } from "../../../utils/textWidth";
 
 /**
  * SectionAlign 构造选项接口
@@ -192,17 +193,7 @@ export class SectionAlign {
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
-                // for (const cell of this.sheetCanvas.data.getSelectedCells()) {
-                //     const cellIndex = this.sheetCanvas.data.cells.findIndex(v => v.cell === cell);            
-                //     if (cellIndex >= 0) {
-                //         this.sheetCanvas.data.cells[cellIndex].indent += 4;
-                //     } else {
-                //         this.sheetCanvas.data.cells.push({
-                //             cell: cell,
-                //             indent: 4
-                //         });
-                //     }
-                // }
+                this.data.changeSelectedCellsIndent(this.getIndentStep());
             }
         });
 
@@ -217,17 +208,7 @@ export class SectionAlign {
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
-                // for (const cell of this.sheetCanvas.data.getSelectedCells()) {
-                //     const cellIndex = this.sheetCanvas.data.cells.findIndex(v => v.cell === cell);            
-                //     if (cellIndex >= 0) {
-                //         this.sheetCanvas.data.cells[cellIndex].indent -= 4;
-                //     } else {
-                //         this.sheetCanvas.data.cells.push({
-                //             cell: cell,
-                //             indent: -4
-                //         });
-                //     }
-                // }
+                this.data.changeSelectedCellsIndent(-this.getIndentStep());
             }
         }); 
         
@@ -358,6 +339,40 @@ export class SectionAlign {
         this.setupDataListeners();
     }
     
+    /**
+     * 获取单次缩进量（2 个字符宽，「2em」）
+     *
+     * ## 基准是**当前单元格**的字号
+     *
+     * em 取活动单元格的实时字号（不是根元素字号）：16px 的格子汉字缩进 32px，
+     * 20px 则是 40px —— 缩进与文字大小始终同比例。
+     * 每次点击都现取（{@link indentStepPx} 不做缓存），改过字号立刻生效。
+     * 单元格为空（字号挂在字符上，空格取不到）时回退根元素字号。
+     *
+     * ## 单字节 / 双字节分别折算
+     *
+     * 一次缩进 = 2 个字符宽，而字符宽取决于内容：双字节（汉字/全角）1 字 = 1em、
+     * 单字节（数字/英文）1 字 = 0.5em。故同样是一次缩进：
+     * - 汉字单元格：2 × 1em = 2em（32px @16px）
+     * - 数字单元格：2 × 0.5em = 1em（16px @16px）
+     * 两者视觉上都是「缩进两个字」，不会出现「中文正好、数字缩了四个字」。
+     * @returns {number} 单次缩进像素值（已含缩放）
+     * @private
+     */
+    private getIndentStep(): number {
+        // 【必须每次现取】字号是逐字符属性（挂在 chars 上），改完字号立刻点击也要拿到新值，
+        // 因此这里不做任何缓存：`Cell.fontSize` 取首字符字号，无字符时是 undefined。
+        const cell = this.data.getCellByName(this.data.activedCell);
+        let fontSize = cell?.fontSize;
+        if (fontSize === undefined || !(fontSize > 0)) {
+            // 单元格为空（字号无处可挂）时回退到根元素字号 —— 仍是「相对当前环境」的 1em
+            fontSize = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+        }
+        // 单/双字节字符宽度不同：汉字 1em、数字字母 0.5em，取首字符判断（与 Cell.fontSize 同源）
+        const sampleChar = cell?.chars?.[0]?.char;
+        return indentStepPx(fontSize, sampleChar) * this.data.zoom;
+    }
+
     /**
      * 处理合并单元格操作
      * @param {string} todo - 操作类型标识

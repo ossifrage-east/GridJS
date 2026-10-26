@@ -3,6 +3,33 @@ import { Char } from '../core/dataArchitecture/char';
 
 
 /**
+ * 解析单元格名（如 'AB12'）为行列号
+ * @param {string | undefined} name - 单元格名
+ * @returns {{col: number, row: number} | null} 列/行均从 1 起；格式非法返回 null
+ */
+function parseCellName(name: string | undefined): { col: number, row: number } | null {
+    if (!name) return null;
+    const match = /^([A-Za-z]+)(\d+)$/.exec(name);
+    if (!match) return null;
+    let col = 0;
+    for (const ch of match[1].toUpperCase()) {
+        col = col * 26 + (ch.charCodeAt(0) - 64);
+    }
+    return { col, row: parseInt(match[2], 10) };
+}
+
+/**
+ * TSV 字段转义
+ * 字段内含制表符、换行或双引号时按 CSV 规则加引号并双写内部引号（Excel/WPS 可识别）
+ * @param {string} text - 原始文本
+ * @returns {string} 可直接拼进 TSV 的字段
+ */
+function escapeTSVField(text: string): string {
+    if (!/[\t\r\n"]/.test(text)) return text;
+    return `"${text.replace(/"/g, '""')}"`;
+}
+
+/**
  * 剪贴板数据类型枚举
  */
 export type ClipboardDataType = 'cell' | 'char';
@@ -144,23 +171,56 @@ export class ClipboardManager {
 
     /**
      * 将剪贴板数据转换为文本
+     *
+     * 单元格数据输出为 **TSV**（制表符分列、CRLF 换行）：
+     * - 粘贴到 Excel / WPS 时按行列自动对齐到对应单元格；
+     * - 粘贴到纯文本编辑器时每个单元格内容以 tab 分隔。
+     *
      * @param {ClipboardData} data - 剪贴板数据
      * @returns {string} 转换后的文本
      */
     public clipboardDataToText(data: ClipboardData): string {
         if (data.type === 'cell') {
-            let text = ''; 
-            let lastCell = data.cells?.[0]?.cell;
-            data.cells?.forEach(cell => {
-                text += cell.chars.map(char => char.char).join('');
-                text += cell.cell?.replace(/[^\d]/g, '') === lastCell.replace(/[^\d]/g, '') ? '\n' : ' ';
-                lastCell = cell.cell;
-            });
-            return text;
+            return this.cellsToTSV(data.cells || []);
         } else if (data.type === 'char') {
-            return data.chars?.map(char => char.char).join('');
+            return data.chars?.map(char => char.char).join('') || '';
         }
         return '';
+    }
+
+    /**
+     * 将单元格数组序列化为 TSV 文本
+     *
+     * 通过单元格名还原真实行列坐标，并以「最小~最大行列」为矩形补空字段：
+     * 源范围内没有数据的空白单元格会输出为空字段，因此粘到 Excel 不会错列。
+     * 行尾连续的空白字段会被裁掉，避免每行拖一串多余制表符。
+     * @param {Cell[]} cells - 单元格数组（顺序不限）
+     * @returns {string} TSV 文本（无有效单元格时为空串）
+     */
+    private cellsToTSV(cells: Cell[]): string {
+        const textByPos = new Map<string, string>();
+        let minCol = Infinity, maxCol = 0, minRow = Infinity, maxRow = 0;
+        for (const cell of cells) {
+            const pos = parseCellName(cell.cell);
+            if (!pos) continue;
+            minCol = Math.min(minCol, pos.col);
+            maxCol = Math.max(maxCol, pos.col);
+            minRow = Math.min(minRow, pos.row);
+            maxRow = Math.max(maxRow, pos.row);
+            textByPos.set(`${pos.col},${pos.row}`, cell.chars.map(char => char.char).join(''));
+        }
+        if (textByPos.size === 0) return '';
+
+        const lines: string[] = [];
+        for (let row = minRow; row <= maxRow; row++) {
+            const fields: string[] = [];
+            for (let col = minCol; col <= maxCol; col++) {
+                fields.push(escapeTSVField(textByPos.get(`${col},${row}`) ?? ''));
+            }
+            while (fields.length > 0 && fields[fields.length - 1] === '') fields.pop();
+            lines.push(fields.join('\t'));
+        }
+        return lines.join('\r\n');
     }
 
     // public textToClipboardData(text: string): ClipboardData {

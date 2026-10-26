@@ -1,0 +1,74 @@
+/*  # 复制/剪切后的流动虚线框（Excel 的 marching ants）
+    # 四条 1px 边缘 + CSS 位移动画，动画跑在合成线程，与表格重绘解耦
+*/
+
+.copy-marquee {
+    position: absolute;
+    pointer-events: none; // 不挡鼠标：否则会拦住画布的选区拖拽/双击
+    z-index: 3; // 高于 #sheetCanvas(2)，低于行头/列头与右下工具条(4)
+    box-sizing: border-box;
+}
+
+.copy-marquee-edge {
+    position: absolute;
+    background-repeat: repeat;
+}
+
+// 线宽与选中框的绿色边框一致（DEFAULT_SELECTED_BORDER_WIDTH = 3px）
+.copy-marquee-top,
+.copy-marquee-bottom {
+    left: 0;
+    width: 100%;
+    height: 3px;
+    // 水平方向的「8px 实线 + 8px 透明」虚线
+    background-image: repeating-linear-gradient(90deg, #4CAF50 0 8px, transparent 8px 16px);
+}
+
+.copy-marquee-left,
+.copy-marquee-right {
+    top: 0;
+    width: 3px;
+    height: 100%;
+    // 垂直方向同理
+    background-image: repeating-linear-gradient(180deg, #4CAF50 0 8px, transparent 8px 16px);
+}
+
+// 顺时针跑动：上边向右、右边向下、下边向左、左边向上，视觉上绕圈行进
+.copy-marquee-top {
+    top: 0;
+    animation: copy-marquee-x 0.5s linear infinite;
+}
+
+.copy-marquee-right {
+    right: 0;
+    animation: copy-marquee-y 0.5s linear infinite;
+}
+
+.copy-marquee-bottom {
+    bottom: 0;
+    animation: copy-marquee-x 0.5s linear infinite reverse;
+}
+
+.copy-marquee-left {
+    left: 0;
+    animation: copy-marquee-y 0.5s linear infinite reverse;
+}
+
+// 位移距离必须等于虚线的重复周期（8px 实 + 8px 空 = 16px），否则循环处会跳一下
+@keyframes copy-marquee-x {
+    from {
+        background-position: 0 0;
+    }
+    to {
+        background-position: 16px 0;
+    }
+}
+
+@keyframes copy-marquee-y {
+    from {
+        background-position: 0 0;
+    }
+    to {
+        background-position: 0 16px;
+    }
+}

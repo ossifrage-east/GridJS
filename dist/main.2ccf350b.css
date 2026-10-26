@@ -2078,6 +2078,96 @@ input.filter-input:disabled, input.filter-input[readonly] {
   border: 1px solid #ccc;
   border-radius: 0.375rem;
 }
+/*!************************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/copyMarquee.scss ***!
+  \************************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # 复制/剪切后的流动虚线框（Excel 的 marching ants）
+    # 四条 1px 边缘 + CSS 位移动画，动画跑在合成线程，与表格重绘解耦
+*/
+.copy-marquee {
+  position: absolute;
+  pointer-events: none;
+  z-index: 3;
+  box-sizing: border-box;
+}
+
+.copy-marquee-edge {
+  position: absolute;
+  background-repeat: repeat;
+}
+
+.copy-marquee-top,
+.copy-marquee-bottom {
+  left: 0;
+  width: 100%;
+  height: 3px;
+  background-image: repeating-linear-gradient(90deg, #4CAF50 0 8px, transparent 8px 16px);
+}
+
+.copy-marquee-left,
+.copy-marquee-right {
+  top: 0;
+  width: 3px;
+  height: 100%;
+  background-image: repeating-linear-gradient(180deg, #4CAF50 0 8px, transparent 8px 16px);
+}
+
+.copy-marquee-top {
+  top: 0;
+  -webkit-animation: copy-marquee-x 0.5s linear infinite;
+          animation: copy-marquee-x 0.5s linear infinite;
+}
+
+.copy-marquee-right {
+  right: 0;
+  -webkit-animation: copy-marquee-y 0.5s linear infinite;
+          animation: copy-marquee-y 0.5s linear infinite;
+}
+
+.copy-marquee-bottom {
+  bottom: 0;
+  animation: copy-marquee-x 0.5s linear infinite reverse;
+}
+
+.copy-marquee-left {
+  left: 0;
+  animation: copy-marquee-y 0.5s linear infinite reverse;
+}
+
+@-webkit-keyframes copy-marquee-x {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 16px 0;
+  }
+}
+
+@keyframes copy-marquee-x {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 16px 0;
+  }
+}
+@-webkit-keyframes copy-marquee-y {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 0 16px;
+  }
+}
+@keyframes copy-marquee-y {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 0 16px;
+  }
+}
 /*!*******************************************************************************************************************************************************************************************!*\
   !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/sheets.scss ***!
   \*******************************************************************************************************************************************************************************************/

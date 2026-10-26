@@ -1020,6 +1020,10 @@ export class App {
             this.data.on(DataEvents.VALUES_CHANGED, (newValues) => {
                 this.sheets.draw();
             });
+            // 复制/剪切后源范围的流动虚线框：位置由 Sheets.draw 同步（跟随滚动/缩放）
+            this.data.on(DataEvents.COPY_RANGE_CHANGED, () => {
+                this.sheets.draw();
+            });
             this.data.on(DataEvents.COLUMNS_CHANGED, () => {
                 this.sheets.draw();
             });

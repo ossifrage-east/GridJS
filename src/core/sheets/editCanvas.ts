@@ -822,6 +822,11 @@ export class EditCanvas extends Canvas {
     public startEditting(refresh: boolean = false) {
         const cell = this.data.activedCell;
         if (!cell) return;
+
+        // 进入编辑态即结束「复制/剪切待粘贴」：移除源范围上的流动虚线框。
+        // 覆盖全部入口（双击、直接输入、F2 等），与 Excel 一致；
+        // 内部剪贴板不清空，退出编辑后仍可粘贴。
+        this.data.clearCopyRange();
         
         // 保存初始值用于撤销记录（在编辑开始时记录整个单元格状态）
         const cellObj = this.data.getCellByName(cell);
@@ -940,6 +945,11 @@ export class EditCanvas extends Canvas {
              keyTarget instanceof HTMLTextAreaElement ||
              keyTarget.isContentEditable)) {
             return;
+        }
+        // Esc 结束「复制/剪切待粘贴」状态：移除源范围上的流动虚线框（Excel 行为）。
+        // 不 return，编辑态下的 Esc 仍需继续交给下方 switch 的 finishEditting 处理。
+        if (e.key === 'Escape' || e.key === 'Esc') {
+            this.data.clearCopyRange();
         }
         if (e.key && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
             this.newChars.push(e.key);
