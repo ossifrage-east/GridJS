@@ -35,6 +35,30 @@ export const TOOLBAR_CLASS_NAME = {
     GROUP: 'toolbar-group',
     SECTION: 'toolbar-section',
     SECTION_LINE: 'toolbar-section-line',
+    /** 紧凑模式下的「一级菜单」条（各分区的名字做成一排小标签） */
+    SECTION_NAV: 'toolbar-section-nav',
+    /** 一级菜单里的单个分区标签 */
+    SECTION_CHIP: 'toolbar-section-chip',
+    /** 紧凑模式下当前展开的那个分区 */
+    SECTION_ACTIVE: 'toolbar-section-active',
+    /** 容器上的紧凑模式开关（宽度不够时加） */
+    COMPACT: 'toolbar-compact',
+    /** 量「内容自然宽度」时临时加在分组上（absolute + max-content + 隐藏） */
+    MEASURING: 'toolbar-measuring',
+    /** 根分类折叠模式（一页签那行放不下时加在容器上） */
+    ROOT_COMPACT: 'toolbar-root-compact',
+    /** 根分类清单（浮层）展开中 */
+    ROOT_OPEN: 'toolbar-root-open',
+    /** 根折叠模式下**露出来的那一个**分类（活动分类；没有活动分类时是第一个） */
+    TAB_ROOT: 'toolbar-tab-root',
+    /** 根折叠后的「分类清单」浮层 */
+    TABS_NAV: 'toolbar-tabs-nav',
+    /** 分类清单里的单个分类标签 */
+    TABS_CHIP: 'toolbar-tab-chip',
+    /** 快速访问区的按钮组（窄屏时整组收进浮层） */
+    QUICK_PANEL: 'toolbar-quick-access-panel',
+    /** 快速访问区的浮层展开中 */
+    QUICK_OPEN: 'toolbar-quick-access-open',
 }
 export const NAV_PANEL: string[] = ['文件', '工具', '脚本']
 /**

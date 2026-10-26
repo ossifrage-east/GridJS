@@ -28,9 +28,25 @@
  * @returns 格式化后的显示文本
  */
 /**
+ * 「舍弃多余小数」标记：出现在格式码最前面（与 `[Red]` 等颜色标签同一位置），
+ * 不参与文本输出，仅把小数位的四舍五入改为直接截断。
+ * 例：`[Trunc]#,##0.00` 把 1234.569 显示为 1,234.56。
+ */
+const TRUNCATE_TAG = '[Trunc]';
+
+/**
+ * 判断格式码是否带「舍弃多余小数」标记
+ * @param code - 格式码
+ * @returns {boolean} 是否截断多余小数
+ */
+export function hasTruncateFlag(code: string): boolean {
+    return /^\[trunc\]/i.test(code);
+}
+
+/**
  * 给结果补负号（已经带负号时原样返回）
  *
- * 负段格式 `-0.00%` / `"¥"#,##0.00` 里的 `-` 会先被当成字面量前缀写进结果，
+ * 负段格式 `-0.00%` / `"¥"#,##0.00` 里的 `-` 会先当成字面量前缀写进结果，
  * 这时再补一次负号就会得到 `--25.00%`。
  * @param text - 已格式化好的文本
  * @returns {string} 带负号的文本
@@ -39,7 +55,55 @@ function withMinus(text: string): string {
     return text.charAt(0) === '-' ? text : `-${text}`;
 }
 
+/**
+ * 把数值转成「最短往返十进制」的普通小数文本（展开科学记数形式）
+ *
+ * `String(0.29)` 是 `"0.29"`，而 `(0.29).toFixed(20)` 是
+ * `"0.28999999999999998002"` —— 后者是 double 的二进制真相，不是用户输入的那个数。
+ * 截断必须以十进制直觉为准，否则 `0.29` 保留 2 位会被截成 `0.28`。
+ *
+ * @param value - 非负有限数值
+ * @returns {string} 形如 "0.0000001" / "123.45" 的十进制文本
+ * @private
+ */
+function toPlainDecimalString(value: number): string {
+    const s = String(value);
+    const expMatch = s.match(/^(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/);
+    if (!expMatch) return s;
+    // 指数形式 → 按小数点位置展开（小数位不足补 0，超出则移动小数点）
+    const digits = expMatch[1] + (expMatch[2] ?? '');
+    const point = expMatch[1].length + parseInt(expMatch[3], 10);
+    if (point <= 0) return `0.${'0'.repeat(-point)}${digits}`;
+    if (point >= digits.length) return digits + '0'.repeat(point - digits.length);
+    return `${digits.slice(0, point)}.${digits.slice(point)}`;
+}
+
+/**
+ * 按固定小数位截断数值（不四舍五入）
+ *
+ * 以十进制字符串为准直接切掉多余位数（`1.005` 截 2 位得 `1.00`）；
+ * 不用 `Math.trunc(v * 10^n) / 10^n`，那会先被乘法引入误差再截断。
+ *
+ * @param value    - 非负数值
+ * @param decimals - 保留的小数位数
+ * @returns {string} 截断后的定长小数字符串
+ * @private
+ */
+function truncateToFixed(value: number, decimals: number): string {
+    if (!Number.isFinite(value)) return String(value);
+    const fixed = toPlainDecimalString(value);
+    const dot = fixed.indexOf('.');
+    const intPart = dot === -1 ? fixed : fixed.slice(0, dot);
+    if (decimals <= 0) return intPart;
+    const decPart = dot === -1 ? '' : fixed.slice(dot + 1);
+    return `${intPart}.${(decPart + '0'.repeat(decimals)).slice(0, decimals)}`;
+}
+
 export function formatNumberValue(value: number, code: string): string {
+    // 「舍弃多余小数」标记：先剥离，避免被当作字面量前缀输出
+    const truncateDecimals = hasTruncateFlag(code);
+    if (truncateDecimals) code = code.slice(TRUNCATE_TAG.length);
+
     // 多段格式码：按 正;负;零 切分，选择对应段
     const sections = code.split(';');
     const isNegative = value < 0;
@@ -111,8 +175,10 @@ export function formatNumberValue(value: number, code: string): string {
     const prefix = prefixMatch ? prefixMatch[0].replace(/"/g, '') : '';
     const suffix = suffixMatch ? suffixMatch[0].replace(/"/g, '') : '';
 
-    // 格式化数值
-    let formatted = numValue.toFixed(decimalPlaces);
+    // 格式化数值（勾选「舍弃多余小数」时截断，否则四舍五入）
+    let formatted = truncateDecimals
+        ? truncateToFixed(numValue, decimalPlaces)
+        : numValue.toFixed(decimalPlaces);
     if (useThousands) {
         formatted = addThousandsSeparator(formatted);
     }

@@ -16,7 +16,7 @@ import { DataCollection } from "../dataArchitecture/dataCollection";
 import { Menu, MenuContent, createCompositeIcon } from "../common/menu";
 import { Dialog } from "../common/dialog";
 import { createDiv, createInput, createButton } from "../../utils/dom";
-import { getCellDisplayText, formatNumberValue, isDateTimeCode, formatDateTimeValue } from "../../utils/numberFormat";
+import { getCellDisplayText, formatNumberValue, isDateTimeCode, formatDateTimeValue, hasTruncateFlag } from "../../utils/numberFormat";
 
 
 /**
@@ -1535,6 +1535,7 @@ export class Canvas extends EventEmitter {
         let numberCategory = 'general';
         let decimalPlaces = 2;
         let useThousands = false;
+        let truncateDecimals = false;  // 舍弃多余小数：截断而非四舍五入
         let negativeStyle = 0; // 0:-1234.10  1:(1234.10)  2:-1234.10红  3:(1234.10)红
         let currencySymbol = '¥';
         let lineStyle = 1;   // 1: 细实线  2: 粗实线
@@ -1591,6 +1592,7 @@ export class Canvas extends EventEmitter {
             } else {
                 numberCategory = 'number';
                 useThousands = currentFormat.includes('#,##');
+                truncateDecimals = hasTruncateFlag(currentFormat);
                 if (currentFormat.includes(';(')) negativeStyle = 1;
                 const m = currentFormat.match(/\.(0+)/);
                 if (m) decimalPlaces = m[1].length;
@@ -1606,10 +1608,12 @@ export class Canvas extends EventEmitter {
                     const intPart = useThousands ? '#,##0' : '0';
                     const dec = decimalPlaces > 0 ? '.' + '0'.repeat(decimalPlaces) : '';
                     const fmt = intPart + dec;
+                    // 「舍弃多余小数」以 [Trunc] 标记写进格式码最前面（与颜色标签同位置）
+                    const prefix = truncateDecimals ? '[Trunc]' : '';
                     if (negativeStyle === 1 || negativeStyle === 3) {
-                        return fmt + ';(' + fmt + ')';
+                        return prefix + fmt + ';(' + fmt + ')';
                     }
-                    return fmt;
+                    return prefix + fmt;
                 }
                 case 'currency':
                 case 'accounting': {
@@ -1899,7 +1903,7 @@ export class Canvas extends EventEmitter {
                 style: { display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }
             }));
 
-            // 使用千位分隔符（仅数值）
+            // 使用千位分隔符 + 舍弃多余小数（仅数值）
             if (cat === 'number') {
                 const thousandsCheck = createInput({ type: 'checkbox' });
                 thousandsCheck.checked = useThousands;
@@ -1907,11 +1911,27 @@ export class Canvas extends EventEmitter {
                     useThousands = thousandsCheck.checked;
                     updatePreview();
                 });
+                const truncateCheck = createInput({ type: 'checkbox' });
+                // 与左侧「使用千位分隔符」拉开间距，避免误认为同一组设置
+                truncateCheck.style.marginLeft = '20px';
+                truncateCheck.checked = truncateDecimals;
+                truncateCheck.addEventListener('change', () => {
+                    truncateDecimals = truncateCheck.checked;
+                    updatePreview();
+                });
                 controlsContainer.appendChild(createDiv({
-                    children: [thousandsCheck, createDiv({
-                        textContent: '使用千位分隔符 (,)', style: { fontSize: '0.8rem' }
-                    })],
-                    style: { display: 'flex', alignItems: 'center', gap: '0.25rem', marginBottom: '0.5rem' }
+                    children: [
+                        thousandsCheck,
+                        createDiv({
+                            textContent: '使用千位分隔符 (,)', style: { fontSize: '0.8rem' }
+                        }),
+                        truncateCheck,
+                        createDiv({
+                            textContent: '舍弃多余小数',
+                            style: { fontSize: '0.8rem', marginLeft: '0.25rem', whiteSpace: 'nowrap' }
+                        }),
+                    ],
+                    style: { display: 'flex', alignItems: 'center', gap: '0.25rem', flexWrap: 'wrap', marginBottom: '0.5rem' }
                 }));
             }
 

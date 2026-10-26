@@ -10,24 +10,49 @@
     border-bottom: 1px solid #ddd;
     background-color: #f3f3f3;
         
+    /* 快速访问区（品牌 + 撤销/重做/打印）**钉死在最左侧**。
+       绝对定位、不参与页签行的流式排布，于是「固定在左」与「不压住居中的页签」可以同时成立：
+       页签用 --qa-space（= 本区宽度，由 Toolbar#updateCompact 每次量完写回）左右让出空间。 */
     .toolbar-quick-access {
-        position: fixed;
+        position: absolute;
         left: 0;
+        top: 0;
+        bottom: 0;
+        z-index: 6;
         display: flex;
+        align-items: center;
         gap: 6px;
         i {
             font-size: 16px;
         }
+
+        /* 按钮组：宽屏时只是普通的一行；根折叠时整组收进品牌下方的浮层 */
+        .toolbar-quick-access-panel {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
     }
     
     .toolbar-category {
+        /* 快速访问区（绝对定位）的定位基准 */
+        position: relative;
         display: flex;        
         width: 100%;
-        height: 25px;
+        /* 原来是写死的 height: 25px —— 极窄屏下会被裁掉，改成最小高度 + 自动撑开 */
+        min-height: 25px;
         align-items: center;
         justify-content: center; 
         .toolbar-tabs {
             display: flex;
+            /* 一行放不下就折叠到「根分类」（见 toolbar-root-compact），不再换行 ——
+               换行会让页签行变高、把工具区挤下去，窄屏下更像错乱 */
+            flex-wrap: nowrap;
+            align-items: center;
+            justify-content: center;
+            /* 给钉在左侧的快速访问区让位；左右对称，页签才是视觉居中的 */
+            padding-left: var(--qa-space, 0px);
+            padding-right: var(--qa-space, 0px);
 
             .toolbar-tab {
                 width: 48px;
@@ -47,9 +72,18 @@
                 background: white;
             }
         }
+
+        /* 根分类的「分类清单」：宽屏下所有分类并排铺开，用不到它。
+           没有这条它会当成普通 div 流进分类行，竖着摊成一列（还占着宽度把页签挤走）。 */
+        .toolbar-tabs-nav {
+            display: none;
+        }
     }
     .toolbar-content {
         display: flex;
+        /* 紧凑模式下分组是 width:auto 的窄面板，居中才与上面的分类标签对齐
+           （宽屏模式下分组 width:100%，这条不起作用） */
+        justify-content: center;
         .toolbar-group {
             display: none;
             width: 100%;
@@ -75,6 +109,12 @@
                 height: 30px;
                 background-color: #ddd;
             }
+
+            /* 「一级菜单」条：宽屏下所有分区并排铺开，用不到它 */
+            .toolbar-section-nav {
+                display: none;
+            }
+
         }
     }
 
@@ -102,6 +142,241 @@
             border-radius: 10px;
             box-shadow: lightgrey 0px 0px 10px;
     }
+}
+
+/* ============================================================
+   紧凑模式（宽度装不下时由 Toolbar#updateCompact 加上）
+   ------------------------------------------------------------
+   根部分类（开始 / 页面）仍然显示 → 一排分区小标签（一级菜单）
+   → 点开的分区里才是具体工具（二级菜单）。
+   ============================================================ */
+.toolbar-container.toolbar-compact {
+    .toolbar-tabs {
+        max-width: 100%;
+    }
+
+    .toolbar-group {
+        flex-direction: column;
+        align-items: center;
+        /* width:auto（贴合内容）+ 上限容器宽度：窄到一行标签放不下时，标签才会真的换行
+           （没有这个上限，flex 项会撑到 max-content 并溢出容器） */
+        width: auto;
+        max-width: calc(100% - 8px);
+        margin: 4px 4px 6px;
+        gap: 4px;
+
+        .toolbar-section-nav {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 4px;
+            width: 100%;
+
+            .toolbar-section-chip {
+                padding: 1px 10px;
+                font-size: 13px;
+                line-height: 18px;
+                color: #333;
+                background-color: #e9e9e9;
+                border-radius: 10px;
+                cursor: pointer;
+                white-space: nowrap;
+                user-select: none;
+            }
+
+            .toolbar-section-chip:hover {
+                background-color: #dedede;
+            }
+
+            .toolbar-section-chip.active {
+                background-color: #fff;
+                box-shadow: lightgrey 0 0 6px;
+            }
+        }
+
+        /* 只显示当前选中的分区 */
+        .toolbar-section {
+            display: none;
+            flex-wrap: wrap;
+            justify-content: center;
+            max-width: 100%;
+        }
+
+        .toolbar-section.toolbar-section-active {
+            display: flex;
+        }
+
+        /* 紧凑模式下分区之间的竖分隔线没有意义，省出横向空间 */
+        .toolbar-section-line {
+            display: none;
+        }
+
+        /* 分区内部的「行」也允许换行，极窄屏下不会顶出容器 */
+        .toolbar-section > div {
+            max-width: 100%;
+        }
+
+        .toolbar-section > div > div {
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+    }
+}
+
+/* ============================================================
+   测量态：只用来量「自然宽度」，量完立刻移除（同一帧内，不会闪）
+   ------------------------------------------------------------
+   关键：把分组摘出文档流并摊成 max-content，量出来的宽度与当前模式无关；
+   否则紧凑模式下分区被折叠，量到的永远是「只剩标签」的宽度，模式再也退不回去。
+   ============================================================ */
+.toolbar-group.toolbar-measuring {
+    position: absolute;
+    left: 0;
+    top: 0;
+    display: flex !important;
+    width: max-content !important;
+    visibility: hidden;
+    pointer-events: none;
+
+    .toolbar-section {
+        display: flex !important;
+    }
+
+    .toolbar-section-line {
+        display: block !important;
+    }
+}
+
+/* ============================================================
+   根折叠（连页签那一行都装不下时由 Toolbar#updateCompact 加上）
+   ------------------------------------------------------------
+   与分区折叠同一套思路，只是层级再往上收一级：
+   根部只露出**一个**分类（活动分类；没有活动分类时是第一个）→ 点它展开分类清单
+   → 选中分类之后再按分区的一级 / 二级菜单展开。
+   快速访问区同理：只露品牌图标，点开才见到撤销 / 重做 / 打印。
+   之所以「只露一个」而不是继续换行：页签行一换行就把工具区整体往下推，
+   窄屏下高度被吃掉，看着比折叠更乱。
+   ============================================================ */
+.toolbar-container.toolbar-root-compact {
+    .toolbar-tabs {
+        /* 只剩一个页签：从紧贴品牌的位置开始排（占满整行，靠左） */
+        width: 100%;
+        justify-content: flex-start;
+        padding-right: 4px;
+    }
+
+    /* 只露一个分类 */
+    .toolbar-tabs .toolbar-tab {
+        display: none;
+    }
+
+    .toolbar-tabs .toolbar-tab.toolbar-tab-root {
+        display: block;
+        width: auto;
+        min-width: 44px;
+        white-space: nowrap;
+    }
+
+    /* 露出来的那个角标：提示「点我可以换分类」 */
+    .toolbar-tabs .toolbar-tab.toolbar-tab-root::after {
+        content: '▾';
+        margin-left: 4px;
+        font-size: 11px;
+        color: #666;
+    }
+
+    /* 快速访问区：只留品牌，按钮组收进浮层 */
+    .toolbar-quick-access .toolbar-quick-access-panel {
+        display: none;
+    }
+
+    .toolbar-quick-access .brand {
+        cursor: pointer;
+        align-items: center;
+    }
+
+    .toolbar-quick-access .brand::after {
+        content: '▾';
+        margin-left: 2px;
+        font-size: 10px;
+        color: #666;
+    }
+}
+
+/* 分类清单浮层（根折叠 + 已展开）：横跨整行、居中排布的分类小标签 */
+.toolbar-container.toolbar-root-open .toolbar-tabs-nav {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 6px;
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 100%;
+    z-index: 40;
+    padding: 8px;
+    background-color: #fff;
+    border: 1px solid #ddd;
+    border-top: none;
+    border-radius: 0 0 10px 10px;
+    box-shadow: lightgrey 0 6px 10px;
+
+    .toolbar-tab-chip {
+        padding: 3px 14px;
+        font-size: 14px;
+        line-height: 20px;
+        color: #333;
+        background-color: #e9e9e9;
+        border-radius: 12px;
+        cursor: pointer;
+        white-space: nowrap;
+        user-select: none;
+    }
+
+    .toolbar-tab-chip:hover {
+        background-color: #dedede;
+    }
+
+    .toolbar-tab-chip.active {
+        background-color: #fff;
+        box-shadow: lightgrey 0 0 6px;
+    }
+}
+
+/* 快速访问区的浮层（根折叠 + 已展开）：品牌正下方竖排 */
+.toolbar-container.toolbar-root-compact .toolbar-quick-access.toolbar-quick-access-open .toolbar-quick-access-panel {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    /* 图标按钮本身只有 20 多像素，给个下限免得浮层窄成一条 */
+    min-width: 34px;
+    position: absolute;
+    left: 0;
+    top: 100%;
+    z-index: 41;
+    padding: 6px 4px;
+    background-color: #fff;
+    border: 1px solid #ddd;
+    border-radius: 0 0 8px 8px;
+    box-shadow: lightgrey 0 6px 10px;
+}
+
+/* ============================================================
+   页签行的测量态：一行摊开、去掉「让位」padding，量出与当前模式无关的自然宽度
+   ------------------------------------------------------------
+   不这么做的话，根折叠时其它页签是 display:none，量到的永远「装得下」，模式退不回去。
+   ============================================================ */
+.toolbar-tabs.toolbar-measuring {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: max-content;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+    flex-wrap: nowrap;
+    visibility: hidden;
+    pointer-events: none;
 }
 
 .toolbar-select {

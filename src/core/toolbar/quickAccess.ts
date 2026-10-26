@@ -26,6 +26,8 @@ export interface QuickAccessOptions {
 
 export class QuickAccess {
     private quickAccess: HTMLDivElement;
+    /** 撤销/重做/打印/打印预览的容器：窄屏时整组收进浮层 */
+    private panel: HTMLDivElement;
     private data: DataCollection;
     private menu: Menu;
     constructor(options: QuickAccessOptions) {
@@ -38,6 +40,14 @@ export class QuickAccess {
         this.data = options.data;  
         this.menu = options.menu;
         this.init();
+
+        // 点空白处收起浮层（根折叠时按钮组是浮层，不点它就会一直挂着）
+        document.addEventListener('pointerdown', (e: PointerEvent) => {
+            if (!this.quickAccess.classList.contains(TOOLBAR_CLASS_NAME.QUICK_OPEN)) return;
+            const target = e.target as Node | null;
+            if (target && this.quickAccess.contains(target)) return;
+            this.quickAccess.classList.remove(TOOLBAR_CLASS_NAME.QUICK_OPEN);
+        });
     }
 
     public init() {        
@@ -47,11 +57,22 @@ export class QuickAccess {
         const brandImg = new Image();
         brandImg.src = favicon;  // 添加图片地址
         brand.append(brandImg);
+        brand.title = '快速访问';
         this.quickAccess.append(brand);
+
+        // 窄屏（工具栏根折叠）时只露品牌图标，点它才展开这一组按钮
+        brand.addEventListener('click', () => {
+            this.quickAccess.classList.toggle(TOOLBAR_CLASS_NAME.QUICK_OPEN);
+        });
+
+        // 按钮统一放进 panel：宽屏时它只是普通的一行 flex 项，
+        // 根折叠时才变成品牌下方的浮层（样式见 toolbar.scss）
+        this.panel = createDiv({ className: TOOLBAR_CLASS_NAME.QUICK_PANEL });
+        this.quickAccess.append(this.panel);
 
         const backBtn = new BtnBase(  // 撤销按钮
             {
-                parentElement: this.quickAccess, 
+                parentElement: this.panel, 
                 data: this.data,
                 isDisabledOnEditting: false,
                 menu: this.menu,
@@ -68,7 +89,7 @@ export class QuickAccess {
 
         const forwardBtn = new BtnBase(  // 恢复按钮
             {
-                parentElement: this.quickAccess,
+                parentElement: this.panel,
                 data: this.data,
                 isDisabledOnEditting: false,
                 menu: this.menu,
@@ -100,7 +121,7 @@ export class QuickAccess {
 
         const printBtn = new BtnBase(  // 打印按钮
             {
-                parentElement: this.quickAccess,
+                parentElement: this.panel,
                 data: this.data,
                 menu: this.menu,
                 toDo: 'print',
@@ -116,7 +137,7 @@ export class QuickAccess {
 
         const printViewBtn = new BtnBase(  // 打印预览按钮
             {
-                parentElement: this.quickAccess,
+                parentElement: this.panel,
                 data: this.data,
                 menu: this.menu,
                 toDo: 'printView',
@@ -134,6 +155,7 @@ export class QuickAccess {
     public getElements() {
         return {
             container: this.quickAccess,
+            panel: this.panel,
         }
     }
 }

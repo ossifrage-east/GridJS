@@ -191,6 +191,10 @@ export class App {
             menu: this.menu,
             title: '快速访问'
         });
+        // 快速访问区是构造完工具栏之后才挂进页签行的：页签行凭空多了一截宽度，
+        // 但内容区尺寸没变（ResizeObserver 不会触发），得主动重排一次，
+        // 否则「加上快速访问区之后已经装不下」这种情况要等到下一次窗口变化才被发现。
+        this.toolbar.refreshLayout();
     }
 
     /**
