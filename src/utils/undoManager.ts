@@ -45,6 +45,14 @@ export interface ValuesSnapshot {
     before: any[];
     /** 变更后的 this.values 深拷贝 */
     after: any[];
+    /**
+     * 本次变更实际触及的首个单元格名（可选，旧快照无此字段）
+     *
+     * 整表快照本身不携带「改的是哪一格」，而撤销/重做必须把活动格与选区带到
+     * 内容真正变化的位置（否则用户在 C3 选中时撤销对 B2 的写入，选择框仍停在 C3，
+     * 看起来像「撤销没生效」）。由 DataCollection 在入栈时对比前后快照求得。
+     */
+    focusCell?: string;
 }
 
 /**
@@ -425,7 +433,7 @@ export class UndoManager extends EventEmitter {
             const last = actions[actions.length - 1].data as ValuesSnapshot;
             return {
                 type: 'values',
-                data: { before: first.before, after: last.after },
+                data: { before: first.before, after: last.after, focusCell: first.focusCell ?? last.focusCell },
                 timestamp: Date.now(),
                 groupId,
                 label: actions[0].label

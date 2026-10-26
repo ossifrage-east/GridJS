@@ -6,7 +6,7 @@ import { VisibleView } from "./visibleView";
 import { CELL_PADDING, DataEvents, DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, DEFAULT_SELECTED_BORDER_WIDTH, MouseLocation } from "../constant";
 import { EventEmitter } from "../../utils/eventEmitter";
 import { IndexDB } from "./indexDB";
-import { UndoManager, UndoAction, FullStateSnapshot, CellPatchEntry, UndoAnchor, StatePatchSnapshot, StructuralSnapshot, ContinuousUndoSnapshot, SortPermutationSnapshot } from "../../utils/undoManager";
+import { UndoManager, UndoAction, FullStateSnapshot, CellPatchEntry, UndoAnchor, StatePatchSnapshot, StructuralSnapshot, ContinuousUndoSnapshot, SortPermutationSnapshot, ValuesSnapshot } from "../../utils/undoManager";
 import { ClipboardManager } from "../../utils/clipboardManager";
 import { MessageBox } from "../common/message";
 import { MatrixSorter, type SortConfig } from "./matrixSorter";
@@ -1146,7 +1146,18 @@ export class DataCollection extends EventEmitter {
         this._values = value;
         this._pruneEmptyCells();
         this.invalidateCellIndex();
-        this._recordValuesChange(oldValue);
+        // 「变化前」基准不能无条件取旧数组的引用：调用方可能先把旧数组里的 Cell
+        // 原地改掉（chars.splice / Object.assign 等），再把同一个数组赋回来，
+        // 此时旧引用与当前值逐字段相等，录制阶段会判成「无变化」而**静默丢掉**
+        // 这次撤销记录 —— 随后的 Ctrl+Z 实际回退的是更早的一次操作，
+        // 表现为「撤销后单元格内容变空、选区还留在原处」。
+        // 旧引用已无法表达「变化前」时，退回上一次提交的基准快照
+        // （_lastValuesSnapshot 是深拷贝，不会跟着原地修改一起变）。
+        const before = this._lastValuesSnapshot
+            && this._valuesSnapshotsEqual(oldValue, this._values)
+            ? this._lastValuesSnapshot
+            : oldValue;
+        this._recordValuesChange(before);
     }
 
     /**
@@ -1760,6 +1771,38 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 求两份整表快照中「首个发生变化」的单元格名
+     *
+     * 撤销/重做要把活动格与选区带到内容真正变化的位置，而整表快照本身不含
+     * 「改的是哪一格」。遍历次序与 `values` 数组一致（行优先），
+     * 返回的格子对撤销（before）与重做（after）两个方向都适用：
+     * - 两快照都有该格 → 比字段；
+     * - 仅 after 有 → 本次新增（撤销时会消失）；
+     * - 仅 before 有 → 本次删除（同样需要把视图带过去）。
+     * @param {Cell[]} before - 变化前快照
+     * @param {Cell[]} after - 变化后快照
+     * @returns {string | null} 首个变化单元格名；无差异时为 null
+     * @private
+     */
+    private _findFirstChangedCell(before: Cell[], after: Cell[]): string | null {
+        const beforeByName = new Map<string, Cell>();
+        for (const cell of before) {
+            if (cell && cell.cell) beforeByName.set(cell.cell, cell);
+        }
+        const afterNames = new Set<string>();
+        for (const cell of after) {
+            if (!cell || !cell.cell) continue;
+            afterNames.add(cell.cell);
+            const prev = beforeByName.get(cell.cell);
+            if (!prev || !this._cellsEqual(prev, cell)) return cell.cell;
+        }
+        for (const cell of before) {
+            if (cell && cell.cell && !afterNames.has(cell.cell)) return cell.cell;
+        }
+        return null;
+    }
+
+    /**
      * 记录一次 this.values 变更并广播
      * 以 before 为「变化前」基准，当前 _values 的深拷贝为「变化后」after，
      * 满足条件时推入撤销栈，随后刷新 _lastValuesSnapshot 基准并触发 VALUES_CHANGED。
@@ -1794,8 +1837,15 @@ export class DataCollection extends EventEmitter {
         if (!this._isApplyingUndo && !this._valuesSnapshotsEqual(before, after)) {
             // values setter 不碰选区，故前后锚点取同一份即可（仍挂上，供撤销后滚动定位）
             const anchor = this._captureAnchor();
+            // 同时记下「实际变化的格子」：锚点只说明操作发生时选区在哪，
+            // 撤销/重做时活动格与选区要落到内容真正变化处（见 _resolveUndoTargetCell）
+            const focusCell = this._findFirstChangedCell(before, after);
             this.undoManager.push({
-                type: 'values', data: { before: this.cloneValues(before), after: this.cloneValues(after) },
+                type: 'values',
+                data: {
+                    before: this.cloneValues(before), after: this.cloneValues(after),
+                    focusCell: focusCell ?? undefined
+                } as ValuesSnapshot,
                 timestamp: Date.now(), anchorBefore: anchor, anchorAfter: anchor
             });
         }
@@ -3291,6 +3341,28 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
+     * 判断单元格是否落在选区内（按行列号做数值矩形判定）
+     *
+     * **勿用字符串 `includes`**：`'B22:D24'` 会误判 `B2`、`D2`（见 {@link getMergedRangeAt}）。
+     * @param {string} cell - 单元格名称
+     * @param {string | null} selection - 选区串（`'A1:C3'`）；null 视为无选区
+     * @returns {boolean} 是否在选区内
+     * @private
+     */
+    private _isCellInsideSelection(cell: string, selection: string | null): boolean {
+        if (!selection) return false;
+        const [startName, endName] = selection.split(':');
+        const start = this.getCellColAndRow(startName);
+        const end = this.getCellColAndRow(endName ?? startName);
+        const target = this.getCellColAndRow(cell);
+        if (!isFinite(target.col) || !isFinite(target.row)) return false;
+        return target.col >= Math.min(start.col, end.col)
+            && target.col <= Math.max(start.col, end.col)
+            && target.row >= Math.min(start.row, end.row)
+            && target.row <= Math.max(start.row, end.row);
+    }
+
+    /**
      * 撤销/重做恢复回调
      * 处理两种操作类型：撤销回写 before，重做回写 after。
      * - 'values'：仅回写单元格数组；
@@ -3338,15 +3410,24 @@ export class DataCollection extends EventEmitter {
         this._revealAnchor(anchor);
         // activedCell 指向「本次撤销/重做操作的单元格」（影响面首格）：
         // 锚点恢复的是操作前/后的光标位置，与「被操作格」未必同格（如在 A1 选中后
-        // 撤销 F10 的输入，锚点会把活动格留在 A1）；选区仍按锚点恢复，
-        // 活动格单独落到操作发生处
+        // 撤销 F10 的输入，锚点会把活动格留在 A1）；活动格与选区都改落到操作发生处
         const targetCell = this._resolveUndoTargetCell(action, isUndo);
         if (targetCell) {
             this.activedCell = targetCell;
             const { col, row } = this.getCellColAndRow(targetCell);
-            if (isFinite(col) && isFinite(row) && col >= 1 && row >= 1) {
-                this.scrollCellIntoView(col, row);
+            const valid = isFinite(col) && isFinite(row) && col >= 1 && row >= 1;
+            // 选区必须跟着活动格一起落到「内容真正变化」的格子上：
+            // 锚点恢复的是操作前/后的选区，与被改动的格子未必同处
+            // （典型场景：A1 处选中后，撤销脚本对 D10 的写入）。
+            // 只改 activedCell 的话，选择框会留在原处，视觉上「撤销没生效」，
+            // 且选区与活动格不一致会让后续进入编辑态的落点判断跟着错位。
+            // 目标格本就落在当前选区内时保持原选区（撤销 A1:C3 的批量格式不能塌成 A1）。
+            if (!this._isCellInsideSelection(targetCell, this._selection)) {
+                // 合并区内的目标格按整块选中，避免选择框只框住合并块的一角
+                const merged = valid ? this.getMergedRangeAt(col, row) : null;
+                this.selection = merged ?? `${targetCell}:${targetCell}`;
             }
+            if (valid) this.scrollCellIntoView(col, row);
         }
         this.emit(DataEvents.VALUES_CHANGED, this._values);
         // 回写完成后广播快照恢复事件：activedCell/selection 与当前值相同时
@@ -3366,7 +3447,8 @@ export class DataCollection extends EventEmitter {
      * - structural：行操作取 A{at}（首列），列操作取 {at}列1行（首行）；
      * - sortPermutation：置换范围首位置（positions 为 0-based，需 +1）；
      * - fullState：快照内记录的 activedCell；
-     * - values 及未知类型：返回 null，保持锚点恢复的活动格。
+     * - values：入栈时对比前后快照求得的首格（{@link ValuesSnapshot.focusCell}）。
+     *   旧快照没有该字段时返回 null，保持锚点恢复的活动格。
      * @param {UndoAction} action - 操作对象
      * @param {boolean} isUndo - true=撤销，false=重做
      * @returns {string | null} 目标单元格名，无法推导时为 null
@@ -3375,15 +3457,21 @@ export class DataCollection extends EventEmitter {
         const side = isUndo ? 'before' : 'after';
         const data = action.data as Record<string, any>;
         switch (action.type) {
+            case 'values':
+                // before/after 两侧指向同一格（内容变化格），无需按方向取
+                return (data?.focusCell as string | undefined) ?? null;
             case 'cellPatch': {
-                const before = data?.before as CellPatchEntry[] | undefined;
-                const after = data?.after as CellPatchEntry[] | undefined;
-                return before?.[0]?.cell ?? after?.[0]?.cell ?? null;
+                // 优先取**本次方向**那一侧的补丁：撤销看 before、重做看 after。
+                // 固定优先 before 会让重做落回「操作前」的格子；另一侧仅作回退
+                // （区域原本没有格子时该侧为空列表，见方法注释）。
+                const primary = data?.[side] as CellPatchEntry[] | undefined;
+                const fallback = (isUndo ? data?.after : data?.before) as CellPatchEntry[] | undefined;
+                return primary?.[0]?.cell ?? fallback?.[0]?.cell ?? null;
             }
             case 'statePatch': {
-                const before = data?.before as StatePatchSnapshot | undefined;
-                const after = data?.after as StatePatchSnapshot | undefined;
-                return before?.cells?.[0]?.cell ?? after?.cells?.[0]?.cell ?? null;
+                const primary = data?.[side] as StatePatchSnapshot | undefined;
+                const fallback = (isUndo ? data?.after : data?.before) as StatePatchSnapshot | undefined;
+                return primary?.cells?.[0]?.cell ?? fallback?.cells?.[0]?.cell ?? null;
             }
             case 'structural': {
                 const cmd = data as unknown as StructuralSnapshot;

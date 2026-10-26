@@ -823,6 +823,12 @@ export class EditCanvas extends Canvas {
         const cell = this.data.activedCell;
         if (!cell) return;
 
+        // 进入编辑态必须让隐藏输入框持有焦点：字符是经 textArea 的原生输入
+        // （input 事件）落进单元格的。撤销/重做（尤其是点工具栏按钮）会把焦点
+        // 留在按钮上，此时直接打字只会进入编辑态、字符却进不了 textArea，
+        // 表现为「编辑框里看不到输入的字符」。双击 / F2 / 输入法各入口统一在此兜住。
+        if (document.activeElement !== this.textArea) this.textArea.focus();
+
         // 进入编辑态即结束「复制/剪切待粘贴」：移除源范围上的流动虚线框。
         // 覆盖全部入口（双击、直接输入、F2 等），与 Excel 一致；
         // 内部剪贴板不清空，退出编辑后仍可粘贴。
@@ -952,8 +958,16 @@ export class EditCanvas extends Canvas {
             this.data.clearCopyRange();
         }
         if (e.key && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            // 焦点原本不在输入框时（如刚点过工具栏的撤销/重做按钮，焦点还在按钮上），
+            // 浏览器的默认插字不会进入 textArea，也就不会有 input 事件来落字 ——
+            // 结果就是「已进入编辑态，却看不到输入的字符」。此时阻止默认行为并主动落字。
+            const hadFocus = document.activeElement === this.textArea;
             this.newChars.push(e.key);
             this.startEditting(true);
+            if (!hadFocus) {
+                e.preventDefault();
+                this.handleValueChange();
+            }
             return;
         }
 
