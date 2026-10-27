@@ -136,6 +136,55 @@ interface ColPage {
 }
 
 /**
+ * 分页计划中的合并块：数值矩形 + 可见首末行列。
+ * 可见首末行列用于判断块体在本页是否被页边界截断（截断边不绘制边框）。
+ */
+interface PrintBlock {
+    /** 锚点单元格名 */
+    anchor: string;
+    /** 锚点行列（0-based） */
+    r0: number;
+    c0: number;
+    /** 原始跨度 */
+    rs: number;
+    cs: number;
+    /** 块内可见首末行/列（0-based，全网格坐标） */
+    firstRow: number;
+    lastRow: number;
+    firstCol: number;
+    lastCol: number;
+}
+
+/**
+ * 打印分页计划：只描述页面几何与合并块索引，不包含任何单元格内容与 HTML。
+ *
+ * 预览打开时先算这份计划（复杂度只与行列数、合并块数相关），随后按需渲染当前页，
+ * DOM 成本从「整张表所有页」降到「当前一页」。
+ */
+interface PrintPlan {
+    /** 纸张宽高（mm，已按方向换算） */
+    paperWmm: number;
+    paperHmm: number;
+    /** 本次分页使用的缩放系数 */
+    renderScale: number;
+    /** 参与打印的可见列/行（0-based） */
+    visCols: number[];
+    visRows: number[];
+    /** 可见行列的全局布局（缩放后尺寸） */
+    globalX: Map<number, { x: number; w: number }>;
+    globalY: Map<number, { y: number; h: number }>;
+    /** 水平/垂直分页结果 */
+    colPages: ColPage[];
+    rowPages: PageGeometry[];
+    /** 合并块索引：锚点名 → 数值矩形与可见范围 */
+    blocks: Map<string, PrintBlock>;
+    /** 总页数（列组数 × 行组数） */
+    totalPages: number;
+    /** 空白文档（无任何行列）时固定输出一张空白页 */
+    blank: boolean;
+}
+
+/**
  * 打印组件
  * 将 DataCollection 中的表格数据按纸张分页生成为 HTML 表格页面，提供两个功能模块：
  * - 打印预览（printPreview）：左右结构 —— 左侧为按纸张逐页生成的预览页面（单页显示），
@@ -232,8 +281,14 @@ export class Printer {
     private currentPage = 0;
     /** 预览总页数 */
     private totalPages = 0;
-    /** 预览各页容器元素（与页序一一对应，非当前页隐藏） */
-    private pageDivs: HTMLElement[] = [];
+    /** 当前分页计划（打开预览/设置变更时重建；只含几何与索引，不含页面 HTML） */
+    private _plan: PrintPlan | null = null;
+    /** 当前已渲染的预览页元素（预览为单页模式，只保留一页 DOM） */
+    private _pageDiv: HTMLElement | null = null;
+    /** 设置变更合并刷新定时器（同一轮同步设置变更只重建一次） */
+    private _renderTimer = 0;
+    /** 渲染任务令牌：关闭预览或再次变更时使旧任务失效 */
+    private _renderToken = 0;
     /** 底部页码指示器元素 */
     private pageIndicator: HTMLElement | null = null;
     /** 上一页 / 下一页按钮 */
@@ -247,7 +302,17 @@ export class Printer {
     private collate: 'page' | 'copies' = 'page';
     /** 追加注册的自定义字体 @font-face CSS（来自 options.fontFaceCss 与 registerFontCss 调用） */
     private _fontFaceCss: string[] = [];
-    /** 本次分页使用的缩放系数（_buildPageHtmls 解析后供 td 字号/行距/字距缩放读取） */
+    /** 汇总后的 @font-face CSS 缓存（样式表/注册表未变化时直接复用，避免每次打开预览全量扫描） */
+    private _fontFaceCssCache: string | null = null;
+    /** 缓存对应的签名（样式表数量 + 各来源条目数） */
+    private _fontFaceCssSignature = '';
+    /** 打印任务令牌：新的打印/关闭预览使旧的异步写入任务停止 */
+    private _printToken = 0;
+    /** 当前打印 iframe（新打印开始时清理旧 iframe） */
+    private _printIframe: HTMLIFrameElement | null = null;
+    /** 打印准备进度提示元素 */
+    private _printProgress: HTMLElement | null = null;
+    /** 本次渲染使用的缩放系数（_buildPlan 解析后供 td 字号/行距/字距缩放读取） */
     private renderScale = 1;
     /** 预览容器与设置面板控件引用（打印设置变更时同步回显并重绘） */
     private _pagesContainer: HTMLElement | null = null;
@@ -291,6 +356,7 @@ export class Printer {
         const trimmed = css?.trim();
         if (trimmed && !this._fontFaceCss.includes(trimmed)) {
             this._fontFaceCss.push(trimmed);
+            this._fontFaceCssCache = null;
         }
     }
 
@@ -305,6 +371,13 @@ export class Printer {
      * @private
      */
     private _getFontFaceCss(): string {
+        const registered = getRegisteredFontFaceCss();
+        // 签名使用各来源的条目数量：样式表/字体注册数量不变时复用缓存，
+        // 避免每次打开预览、每次打印都全量遍历 document.styleSheets 的规则
+        const signature = `${document.styleSheets.length}|${this._fontFaceCss.length}|${registered.length}`;
+        if (this._fontFaceCssCache !== null && signature === this._fontFaceCssSignature) {
+            return this._fontFaceCssCache;
+        }
         const collected: string[] = [];
         for (const sheet of Array.from(document.styleSheets)) {
             try {
@@ -315,7 +388,9 @@ export class Printer {
                 // 跨域样式表不允许访问 cssRules，跳过即可
             }
         }
-        return [...new Set([...collected, ...this._fontFaceCss, ...getRegisteredFontFaceCss()])].join('\n');
+        this._fontFaceCssSignature = signature;
+        this._fontFaceCssCache = [...new Set([...collected, ...this._fontFaceCss, ...registered])].join('\n');
+        return this._fontFaceCssCache;
     }
 
     /**
@@ -329,13 +404,48 @@ export class Printer {
     }
 
     /**
-     * 预览打开时同步设置面板控件回显并重绘预览页；未打开时不做任何事
+     * 预览打开时同步设置面板控件回显并重绘当前页；未打开时不做任何事。
+     * 重绘通过 {@link _scheduleRender} 合并到下一轮事件循环，连续设置变更只重建一次。
      * @private
      */
     private _refreshPreview(): void {
         if (!this.overlay) return;
         this._syncPanelControls();
-        this._renderPagesInto(this._pagesContainer);
+        this._scheduleRender(0);
+    }
+
+    /**
+     * 合并刷新：延迟重建分页计划并渲染指定页。
+     *
+     * 每次调用递增令牌，旧任务（包括拖动设置时的连续变更）自动失效；
+     * 同时给遮罩层留出一帧绘制时间，避免「点击预览 → 主线程被占满 → 白屏」。
+     * @param {number} page - 目标页索引（0-based）
+     * @private
+     */
+    private _scheduleRender(page: number): void {
+        const token = ++this._renderToken;
+        if (this._renderTimer) window.clearTimeout(this._renderTimer);
+        this._renderTimer = window.setTimeout(() => {
+            this._renderTimer = 0;
+            if (token !== this._renderToken || !this.overlay) return;
+            this._plan = this._buildPlan();
+            this.totalPages = this._plan.totalPages;
+            this._goToPage(page);
+        }, 0);
+    }
+
+    /**
+     * 在预览区显示加载占位（分页计划与首屏页面准备期间）
+     * @private
+     */
+    private _showPreviewLoading(): void {
+        const host = this._pagesContainer;
+        if (!host) return;
+        const loading = document.createElement('div');
+        loading.className = 'gs-print-loading';
+        loading.textContent = '正在生成打印预览…';
+        host.replaceChildren(loading);
+        this._pageDiv = null;
     }
 
     /**
@@ -524,7 +634,9 @@ export class Printer {
                 /* 主体列：预览滚动区 + 页脚（页脚仅覆盖预览区宽度）；右侧设置面板独占全高直达页面底部 */
                 .gs-print-main { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
                 .gs-print-scroll { flex: 1; overflow: auto; padding: 1.5rem; background: #6c757d; }
-                /* 预览页面：与实际纸张等比例（宽高与页边距 padding 由 _renderPagesInto 按当前设置内联指定），
+                /* 首屏加载占位：分页计划生成期间显示（避免白屏与“假死”观感） */
+                .gs-print-loading { padding: 3rem 1rem; text-align: center; color: #fff; font-size: 1rem; }
+                /* 预览页面：与实际纸张等比例（宽高与页边距 padding 由 _renderCurrentPage 按当前设置内联指定），
                    整页以 zoom 等比缩放——高度填满滚动区可用高度，宽度与内容随同一系数缩放（见 _applyPreviewZoom）；
                    单页显示模式，内容不足一页时白色背景仍是完整纸张 */
                 .gs-print-page { box-sizing: border-box; margin: 0 auto; background: #fff; overflow: hidden; border-radius: 0.375rem; box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15); }
@@ -699,6 +811,8 @@ export class Printer {
             </div>
         `;
         document.body.appendChild(overlay);
+        // 先登记遮罩层：后续渲染被延迟到下一轮事件循环，期间关闭预览/重开需要能正确清理
+        this.overlay = overlay;
 
         // 打印设置：回显当前纸张大小/方向（新开预览与用户上次设置一致），变更即时重绘预览页；
         // 控件引用存入实例字段，供工具栏设置变更时（_refreshPreview）同步回显
@@ -923,7 +1037,10 @@ export class Printer {
                 this._applyPreviewZoom(source !== 'track');
             },
         }) : null;
-        this._renderPagesInto(pagesContainer);
+        // 首屏：先挂加载占位，下一轮事件循环再计算分页计划并只渲染当前页。
+        // 全部页面 HTML 与 DOM 不再一次性生成，大表打开预览不再造成长时间主线程阻塞。
+        this._showPreviewLoading();
+        this._scheduleRender(0);
 
         // 事件委托：设置区打印/关闭按钮 + 底部分页导航按钮
         overlay.addEventListener('click', (e) => {
@@ -935,23 +1052,34 @@ export class Printer {
             if (target.dataset.gsPrintNav === 'next') this._goToPage(this.currentPage + 1);
         });
 
-        // Esc 键关闭预览
+        // Esc 键：打印准备期间先终止生成（此时打印对话框尚未出现），否则关闭预览
         this.boundPreviewKeyDown = (e: KeyboardEvent) => {
-            if (e.key === 'Escape') this.closePreview();
+            if (e.key !== 'Escape') return;
+            if (this._printProgress) {
+                this._cancelPrint();
+                return;
+            }
+            this.closePreview();
         };
         document.addEventListener('keydown', this.boundPreviewKeyDown);
 
         // 窗口尺寸变化：仅重算预览页等比缩放（高度始终填满可用区域），不重建内容、不跳页
         this.boundPreviewResize = () => this._applyPreviewZoom();
         window.addEventListener('resize', this.boundPreviewResize);
-
-        this.overlay = overlay;
     }
 
     /**
      * 关闭打印预览遮罩层并清理事件监听
      */
     public closePreview(): void {
+        // 打印准备尚未完成时关闭预览：一并终止分批生成并收起进度提示
+        if (this._printProgress) this._cancelPrint();
+        // 使延迟渲染任务失效，避免关闭后仍在后台重建
+        this._renderToken++;
+        if (this._renderTimer) {
+            window.clearTimeout(this._renderTimer);
+            this._renderTimer = 0;
+        }
         this.overlay?.remove();
         this.overlay = null;
         this._pagesContainer = null;
@@ -967,7 +1095,8 @@ export class Printer {
         this._zoomSlider?.destroy();
         this._zoomSlider = null;
         this._previewZoomPercent = null;
-        this.pageDivs = [];
+        this._plan = null;
+        this._pageDiv = null;
         this.pageIndicator = null;
         this.prevBtn = null;
         this.nextBtn = null;
@@ -979,9 +1108,23 @@ export class Printer {
 
     /**
      * 打印：按当前纸张设置生成各页表格 HTML，写入隐藏 iframe 并调用浏览器打印引擎，
-     * 不干扰当前页面，打印结束（afterprint）后自动移除 iframe
+     * 不干扰当前页面，打印结束（afterprint）后自动移除 iframe。
+     *
+     * 与预览一致复用分页计划；只生成「页面范围」选中的页，并按时间片分批写入 iframe，
+     * 避免一次性生成全量 HTML 造成长时间主线程阻塞。准备期间显示进度提示。
      */
     public print(): void {
+        const plan = this._buildPlan();
+        const selected = this._selectedPageIndices(plan.totalPages);
+        if (selected.length === 0) return;
+        const copies = Math.max(1, Math.floor(this.copies));
+        const sheetCount = selected.length * copies;
+
+        // 新的打印任务：使上一次未完成的异步写入失效并清理其 iframe/进度提示
+        const token = ++this._printToken;
+        this._clearPrintProgress();
+        this._printIframe?.remove();
+
         // 借助 iframe 隔离打印文档，避免当前页面样式与结构干扰
         const iframe = document.createElement('iframe');
         iframe.style.position = 'fixed';
@@ -991,59 +1134,197 @@ export class Printer {
         iframe.style.height = '0';
         iframe.style.border = '0';
         document.body.appendChild(iframe);
+        this._printIframe = iframe;
 
         const win = iframe.contentWindow;
         if (!win) {
             iframe.remove();
+            this._printIframe = null;
             return;
         }
 
-        // 打印结束后清理 iframe（afterprint 兼容性兜底：120s 后强制移除）
-        win.addEventListener('afterprint', () => iframe.remove());
-        window.setTimeout(() => iframe.remove(), 120000);
+        // 打印结束后清理 iframe（afterprint 兼容性兜底：120s 后强制移除）。
+        // 用户在打印对话框中取消同样触发 afterprint：立即终止仍在进行的分批生成并收起进度提示。
+        win.addEventListener('afterprint', () => {
+            if (this._printIframe === iframe) {
+                this._cancelPrint();
+                return;
+            }
+            iframe.remove();
+        });
+        const removeIframeLater = (): void => {
+            // 仍在准备（进度提示未消失）说明大表分批生成尚未结束，顺延检查，避免误删正在写入的 iframe
+            if (this._printProgress) {
+                window.setTimeout(removeIframeLater, 30000);
+                return;
+            }
+            if (this._printIframe === iframe) {
+                iframe.remove();
+                this._printIframe = null;
+            }
+        };
+        window.setTimeout(removeIframeLater, 120000);
 
         const doc = win.document;
         doc.open();
-        doc.write(this._buildPrintDocument(this._expandCopies(this._filterPageRange(this._buildPageHtmls()))));
+        doc.write(this._buildPrintHead());
         doc.close();
-        // 等待文档解析与图片加载完成后再唤起打印对话框
-        window.setTimeout(() => {
-            win.focus();
-            win.print();
-        }, 50);
+
+        this._showPrintProgress(sheetCount);
+
+        let cursor = 0;
+        const writeBatch = (): void => {
+            if (token !== this._printToken) {
+                iframe.remove();
+                return;
+            }
+            // 每批最多占用约 12ms，随后让出主线程，保证进度提示与界面可响应
+            const start = Date.now();
+            const chunks: string[] = [];
+            while (cursor < sheetCount && Date.now() - start < 12) {
+                const pageIndex = this._sheetPageIndex(cursor, selected, copies);
+                chunks.push(`<div class="gs-print-sheet">${this._renderPageHtml(plan, pageIndex)}</div>`);
+                cursor++;
+            }
+            if (chunks.length > 0) {
+                doc.body.insertAdjacentHTML('beforeend', chunks.join(''));
+            }
+            this._setPrintProgress(cursor, sheetCount);
+            if (cursor < sheetCount) {
+                window.setTimeout(writeBatch, 0);
+                return;
+            }
+            // 等待文档解析与图片加载完成后再唤起打印对话框
+            window.setTimeout(() => {
+                if (token !== this._printToken) return;
+                this._clearPrintProgress();
+                win.focus();
+                win.print();
+            }, 50);
+        };
+        writeBatch();
     }
 
     /**
-     * 将按当前设置生成的各页表格渲染进预览容器
-     * 预览为单页显示模式：全部页面预先生成，仅当前页可见，
-     * 通过底部导航切换；纸张设置变更重绘后回到第 1 页。
-     * 预览页面与实际纸张等比例：宽高按当前纸张大小/方向内联指定（mm），
-     * 整页以 zoom 等比缩放——高度填满滚动区可用高度，宽度与内容随同一系数缩放。
-     * @param {HTMLElement | null} container - 页面容器（.gs-print-pages）
+     * 解析「页面范围」设置，返回参与打印的页索引（0-based，升序）。
+     * 未设置/无法解析时返回全部页；页码范围只影响打印输出，不影响预览页数。
+     * @param {number} total - 总页数
+     * @returns {number[]} 参与打印的页索引（0-based）
      * @private
      */
-    private _renderPagesInto(container: HTMLElement | null): void {
-        if (!container) return;
-        container.innerHTML = '';
-        this.pageDivs = [];
-        // 纸张在当前方向下的宽高（mm），与打印文档 .gs-print-sheet 的尺寸规则一致
-        const size = PAPER_SIZES[this.paperSize];
-        const landscape = this.orientation === 'landscape';
-        const paperW = `${landscape ? size.height : size.width}mm`;
-        const paperH = `${landscape ? size.width : size.height}mm`;
-        for (const pageHtml of this._buildPageHtmls()) {
-            const pageDiv = document.createElement('div');
-            pageDiv.className = 'gs-print-page';
-            pageDiv.style.width = paperW;
-            pageDiv.style.height = paperH;
-            pageDiv.style.padding = this._marginCss();
-            pageDiv.innerHTML = pageHtml;
-            container.appendChild(pageDiv);
-            this.pageDivs.push(pageDiv);
+    private _selectedPageIndices(total: number): number[] {
+        if (total <= 0) return [];
+        const hits = this._parsePageRange(total);
+        if (!hits) {
+            const all: number[] = [];
+            for (let i = 0; i < total; i++) all.push(i);
+            return all;
         }
+        return Array.from(hits).sort((a, b) => a - b).map(p => p - 1);
+    }
+
+    /**
+     * 计算第 pos 张纸对应的页索引（0-based），避免为「份数 × 顺序」展开巨大的索引数组
+     * 逐页打印（page）：1,1,2,2,3,3；逐份打印（copies）：1,2,3,1,2,3
+     * @param {number} pos - 纸张序号（0-based）
+     * @param {number[]} selected - 参与打印的页索引（0-based）
+     * @param {number} copies - 份数（≥1）
+     * @returns {number} 页索引（0-based）
+     * @private
+     */
+    private _sheetPageIndex(pos: number, selected: number[], copies: number): number {
+        if (this.collate === 'copies') return selected[pos % selected.length];
+        return selected[Math.floor(pos / copies)];
+    }
+
+    /**
+     * 显示打印准备进度提示（固定居中，打印对话框出现前移除）。
+     * 大表分批生成耗时较长，提示条内置「取消」按钮，随时可终止生成。
+     * @param {number} total - 总纸张数
+     * @private
+     */
+    private _showPrintProgress(total: number): void {
+        this._clearPrintProgress();
+        const el = document.createElement('div');
+        el.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:10000;'
+            + 'display:flex;align-items:center;gap:1rem;'
+            + 'background:rgba(33,37,41,.92);color:#fff;padding:.75rem 1.25rem;border-radius:.5rem;'
+            + 'font:14px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.25);';
+        const text = document.createElement('span');
+        text.className = 'gs-print-progress-text';
+        text.textContent = `正在准备打印… 0/${total}`;
+        const cancel = document.createElement('button');
+        cancel.type = 'button';
+        cancel.className = 'gs-print-progress-cancel';
+        cancel.textContent = '取消';
+        cancel.style.cssText = 'cursor:pointer;border:1px solid rgba(255,255,255,.45);border-radius:.3rem;'
+            + 'background:transparent;color:#fff;font:inherit;padding:.15rem .6rem;';
+        cancel.addEventListener('click', () => this._cancelPrint());
+        el.append(text, cancel);
+        document.body.appendChild(el);
+        this._printProgress = el;
+    }
+
+    /**
+     * 更新打印进度提示
+     * @param {number} done - 已完成纸张数
+     * @param {number} total - 总纸张数
+     * @private
+     */
+    private _setPrintProgress(done: number, total: number): void {
+        const text = this._printProgress?.querySelector<HTMLElement>('.gs-print-progress-text');
+        if (text) text.textContent = `正在准备打印… ${done}/${total}`;
+    }
+
+    /**
+     * 取消打印准备：使进行中的分批写入任务失效、移除隐藏 iframe 并立即收起进度提示。
+     *
+     * 触发来源：进度提示条上的「取消」按钮、准备期间按 Esc、关闭预览、
+     * 以及打印对话框被取消（afterprint）。
+     * @private
+     */
+    private _cancelPrint(): void {
+        this._printToken++;
+        this._printIframe?.remove();
+        this._printIframe = null;
+        this._clearPrintProgress();
+    }
+
+    /**
+     * 移除打印进度提示
+     * @private
+     */
+    private _clearPrintProgress(): void {
+        this._printProgress?.remove();
+        this._printProgress = null;
+    }
+
+    /**
+     * 将当前页渲染进预览容器。
+     *
+     * 预览为单页显示模式：页面几何已在分页计划中算好，这里只生成「当前页」的 HTML，
+     * 并替换容器内已有页面；翻页/设置变更时按需重绘，绝不再一次性创建全部页 DOM。
+     * 页面与实际纸张等比例：宽高按当前纸张大小/方向内联指定（mm），整页以 zoom 等比缩放。
+     * @private
+     */
+    private _renderCurrentPage(): void {
+        const container = this._pagesContainer;
+        this._pageDiv = null;
+        if (!container || !this._plan) return;
+        if (this._plan.totalPages <= 0) {
+            container.replaceChildren();
+            this._applyPreviewZoom();
+            return;
+        }
+        const pageDiv = document.createElement('div');
+        pageDiv.className = 'gs-print-page';
+        pageDiv.style.width = `${this._plan.paperWmm}mm`;
+        pageDiv.style.height = `${this._plan.paperHmm}mm`;
+        pageDiv.style.padding = this._marginCss();
+        pageDiv.innerHTML = this._renderPageHtml(this._plan, this.currentPage);
+        container.replaceChildren(pageDiv);
+        this._pageDiv = pageDiv;
         this._applyPreviewZoom();
-        this.totalPages = this.pageDivs.length;
-        this._goToPage(0);
     }
 
     /**
@@ -1065,9 +1346,10 @@ export class Printer {
     }
 
     /**
-     * 将等比缩放系数应用到全部预览页（zoom 整体缩放：宽度、页边距与内容
+     * 将等比缩放系数应用到当前预览页（zoom 整体缩放：宽度、页边距与内容
      * 随同一系数缩放，矢量渲染不失真）。
      * 缩放来源：滑块/输入框的手动覆盖值（10-400%）优先；否则自动按可用高度适配。
+     * 只作用于当前页元素，避免为不存在的页面写样式。
      * @param {boolean} [syncControls=true] - 是否同步页脚滑块与输入框回显。
      * 滑块自身拖动产生的 input 事件必须传 false：拖动进行中程序赋值滑块 value
      * 会中断浏览器原生拖拽手势（滑块卡住不跟手），此时仅同步数字输入框即可。
@@ -1078,7 +1360,8 @@ export class Printer {
         const zoom = this._previewZoomPercent !== null
             ? Math.min(4, Math.max(0.1, this._previewZoomPercent / 100))
             : this._calcPreviewZoom();
-        for (const div of this.pageDivs) {
+        const div = this._pageDiv;
+        if (div) {
             if (zoom !== 1) {
                 div.style.setProperty('zoom', String(zoom));
             } else {
@@ -1091,15 +1374,13 @@ export class Printer {
     }
 
     /**
-     * 跳转到指定预览页（越界自动收敛），仅显示当前页并同步底部导航状态
+     * 跳转到指定预览页（越界自动收敛），按需渲染目标页并同步底部导航状态
      * @param {number} page - 目标页索引（0-based）
      * @private
      */
     private _goToPage(page: number): void {
         this.currentPage = this.totalPages > 0 ? Math.max(0, Math.min(page, this.totalPages - 1)) : 0;
-        this.pageDivs.forEach((div, i) => {
-            div.style.display = i === this.currentPage ? '' : 'none';
-        });
+        this._renderCurrentPage();
         this._updatePageIndicator();
     }
 
@@ -1117,23 +1398,52 @@ export class Printer {
     }
 
     /**
-     * 核心：按当前纸张设置计算分页并逐页生成表格 HTML。
-     * 内容按打印缩放系数（无缩放/适配一页/自定义比例）缩放后与纸张可打印区域比较：
-     * 宽度超出可打印宽度时水平分页（列不跨页拆分），高度超出时垂直分页（行不跨页拆分），
-     * 总页数 = 列组数 × 行组数，打印顺序「先下后右」；设置打印区域时仅区域内行列参与分页。
-     * 流程：筛选打印区域内的可见行列 → 解析缩放系数 → 建立缩放后全局布局 →
-     * 水平/垂直贪心分页 → 逐页生成表格。
-     * @returns {string[]} 各页表格 HTML
+     * 核心：按当前纸张设置计算分页计划（只含几何与合并块索引，不生成页面 HTML）。
+     *
+     * 内容按打印缩放系数缩放后与纸张可打印区域比较：宽度超出时水平分页（列不跨页拆分），
+     * 高度超出时垂直分页（行不跨页拆分），总页数 = 列组数 × 行组数，打印顺序「先下后右」；
+     * 设置打印区域时仅区域内行列参与分页。
+     *
+     * 相比历史实现：
+     * - 不再调用 matrixValues() 生成 rows×cols 稠密矩阵（避免偏远单元格导致的内存爆炸）；
+     * - 合并块直接复用 DataCollection 的合并区倒排索引，全表只扫描一次；
+     * - 页面 HTML 延迟到渲染时按页生成。
+     * @returns {PrintPlan} 分页计划
      * @private
      */
-    private _buildPageHtmls(): string[] {
-        const matrix = this.data.matrixValues();
-        const rows = matrix.length;
-        const cols = rows > 0 ? matrix[0].length : 0;
+    private _buildPlan(): PrintPlan {
         const colHeaders = this.data.colHeaders.colHeaders;
         const rowHeaders = this.data.rowHeaders.rowHeaders;
+        const size = PAPER_SIZES[this.paperSize];
+        const landscape = this.orientation === 'landscape';
+        const paperWmm = landscape ? size.height : size.width;
+        const paperHmm = landscape ? size.width : size.height;
+        const emptyPlan = (blank: boolean): PrintPlan => ({
+            paperWmm,
+            paperHmm,
+            renderScale: 1,
+            visCols: [],
+            visRows: [],
+            globalX: new Map(),
+            globalY: new Map(),
+            colPages: [],
+            rowPages: [],
+            blocks: new Map(),
+            totalPages: blank ? 1 : 0,
+            blank,
+        });
 
-        // 1) 参与打印的行列：隐藏行/列不参与打印；设置打印区域后仅保留区域内的行列
+        // 1) 内容范围：一次遍历数据即可（不分配 rows×cols 矩阵）
+        const bounds = this._contentBounds();
+        const rows = bounds.rows;
+        const cols = bounds.cols;
+        if (rows === 0 || cols === 0) {
+            // 完全空白的新文档也生成一张空白页：
+            // 预览始终显示纸张白区、打印输出一张空页（对齐 Excel 空表行为）
+            return emptyPlan(true);
+        }
+
+        // 2) 参与打印的行列：隐藏行/列不参与打印；设置打印区域后仅保留区域内的行列
         let colMin = 0;
         let colMax = cols - 1;
         let rowMin = 0;
@@ -1149,31 +1459,23 @@ export class Printer {
         for (let c = colMin; c <= colMax; c++) if (!this._isHidden(colHeaders, c)) visCols.push(c);
         const visRows: number[] = [];
         for (let r = rowMin; r <= rowMax; r++) if (!this._isHidden(rowHeaders, r)) visRows.push(r);
-        if (visCols.length === 0 || visRows.length === 0) {
-            // 完全空白的新文档（矩阵无行列）也生成一张空白页：
-            // 预览始终显示纸张白区、打印输出一张空页（对齐 Excel 空表行为）
-            if (rows === 0 || cols === 0) return [''];
-            return [];
-        }
+        if (visCols.length === 0 || visRows.length === 0) return emptyPlan(false);
 
-        // 2) 纸张几何：可打印区域 = 纸张尺寸 - 上下左右页边距（当前预设）
-        const size = PAPER_SIZES[this.paperSize];
-        const landscape = this.orientation === 'landscape';
-        const paperW = (landscape ? size.height : size.width) * MM_TO_PX;
-        const paperH = (landscape ? size.width : size.height) * MM_TO_PX;
+        // 3) 纸张几何：可打印区域 = 纸张尺寸 - 上下左右页边距（当前预设）
+        const paperW = paperWmm * MM_TO_PX;
+        const paperH = paperHmm * MM_TO_PX;
         const m = this.margins;
         const printableW = paperW - (m.left + m.right) * MM_TO_PX;
         const printableH = paperH - (m.top + m.bottom) * MM_TO_PX;
 
-        // 3) 缩放系数：按缩放模式解析（fit 系列只缩小不放大），布局与字体统一按其缩放
+        // 4) 缩放系数：按缩放模式解析（fit 系列只缩小不放大），布局与字体统一按其缩放
         let totalW = 0;
         for (const c of visCols) totalW += colHeaders[c]?.width ?? 100;
         let totalH = 0;
         for (const r of visRows) totalH += rowHeaders[r]?.height ?? 24;
         const scale = this._resolveScale(totalW, totalH, printableW, printableH);
-        this.renderScale = scale;
 
-        // 4) 可见行列的全局布局（缩放后尺寸），供分页与合并块跨页定位使用
+        // 5) 可见行列的全局布局（缩放后尺寸），供分页与合并块跨页定位使用
         const globalX = new Map<number, { x: number; w: number }>();
         let gx = 0;
         for (const c of visCols) {
@@ -1189,7 +1491,7 @@ export class Printer {
             gy += h;
         }
 
-        // 5) 水平分页：列宽累加超出可打印宽度即换页（列不跨页拆分）
+        // 6) 水平分页：列宽累加超出可打印宽度即换页（列不跨页拆分）
         const colPages: ColPage[] = [];
         let curCols: number[] = [];
         let curColsW = 0;
@@ -1203,11 +1505,9 @@ export class Printer {
             curCols.push(c);
             curColsW += w;
         }
-        if (curCols.length > 0) {
-            colPages.push({ cols: curCols });
-        }
+        if (curCols.length > 0) colPages.push({ cols: curCols });
 
-        // 6) 垂直分页：行高累加超出可打印高度即换页（行不跨页拆分）
+        // 7) 垂直分页：行高累加超出可打印高度即换页（行不跨页拆分）
         const rowPages: PageGeometry[] = [];
         let curRows: number[] = [];
         let curHeights: number[] = [];
@@ -1224,119 +1524,192 @@ export class Printer {
             curHeights.push(h);
             curH += h;
         }
-        if (curRows.length > 0) {
-            rowPages.push({ rows: curRows, heights: curHeights });
+        if (curRows.length > 0) rowPages.push({ rows: curRows, heights: curHeights });
+
+        // 8) 合并块索引：复用 DataCollection 已建好的合并区列表，全表只扫描一次，
+        //    记录块内可见首末行列（跨页截断判断用）。渲染每页时再按页窗口取相交子集。
+        const blocks = new Map<string, PrintBlock>();
+        for (const rect of this.data.getMergeRects()) {
+            const r0 = rect.startRow - 1;
+            const c0 = rect.startCol - 1;
+            const rs = rect.endRow - rect.startRow + 1;
+            const cs = rect.endCol - rect.startCol + 1;
+            let firstRow = -1;
+            let lastRow = -1;
+            let firstCol = -1;
+            let lastCol = -1;
+            for (let dr = 0; dr < rs; dr++) {
+                if (globalY.has(r0 + dr)) {
+                    if (firstRow < 0) firstRow = r0 + dr;
+                    lastRow = r0 + dr;
+                }
+            }
+            for (let dc = 0; dc < cs; dc++) {
+                if (globalX.has(c0 + dc)) {
+                    if (firstCol < 0) firstCol = c0 + dc;
+                    lastCol = c0 + dc;
+                }
+            }
+            if (firstRow < 0 || firstCol < 0) continue;  // 块内无可见行/列
+            blocks.set(rect.anchor, { anchor: rect.anchor, r0, c0, rs, cs, firstRow, lastRow, firstCol, lastCol });
         }
 
-        // 7) 合并块扫描（全表一次）：记录锚点、跨度与块内可见首末行列（跨页截断判断用）
-        const blocks: Array<{
-            cell: Cell; r0: number; c0: number; rs: number; cs: number;
-            firstRow: number; lastRow: number; firstCol: number; lastCol: number;
-        }> = [];
-        for (const row of matrix) {
-            for (const cell of row) {
-                if (!cell) continue;
-                const rs = cell.rowspan ?? 1;
-                const cs = cell.colspan ?? 1;
-                if (rs <= 1 && cs <= 1) continue;
-                const { row: r1, col: c1 } = this.data.getCellColAndRow(cell.cell);
-                const r0 = r1 - 1;
-                const c0 = c1 - 1;
-                // 块内可见首末行列（globalX/globalY 仅含可见行列）
-                let firstRow = -1;
-                let lastRow = -1;
-                let firstCol = -1;
-                let lastCol = -1;
-                for (let dr = 0; dr < rs; dr++) if (globalY.has(r0 + dr)) { if (firstRow < 0) firstRow = r0 + dr; lastRow = r0 + dr; }
-                for (let dc = 0; dc < cs; dc++) if (globalX.has(c0 + dc)) { if (firstCol < 0) firstCol = c0 + dc; lastCol = c0 + dc; }
-                if (firstRow < 0 || firstCol < 0) continue;  // 块内无可见行/列
-                blocks.push({ cell, r0, c0, rs, cs, firstRow, lastRow, firstCol, lastCol });
-            }
-        }
+        return {
+            paperWmm,
+            paperHmm,
+            renderScale: scale,
+            visCols,
+            visRows,
+            globalX,
+            globalY,
+            colPages,
+            rowPages,
+            blocks,
+            totalPages: colPages.length * rowPages.length,
+            blank: false,
+        };
+    }
 
-        // 8) 逐页生成：打印顺序「先下后右」——同一列组内的行页从上到下，再进入下一列组
-        const pages: string[] = [];
-        for (const colPage of colPages) {
-            for (const rowPage of rowPages) {
-                pages.push(this._buildPageTable(rowPage, colPage, blocks, globalX, matrix));
-            }
+    /**
+     * 取数据中「最远单元格」的行列号（1-based，作为行列总数使用）。
+     * 用一次遍历替代 matrixValues() 的稠密 rows×cols 分配。
+     * @returns {{rows: number, cols: number}} 行数/列数
+     * @private
+     */
+    private _contentBounds(): { rows: number; cols: number } {
+        let rows = 0;
+        let cols = 0;
+        for (const cell of this.data.values) {
+            const pos = this.data.getCellColAndRow(cell.cell);
+            if (pos.row > rows) rows = pos.row;
+            if (pos.col > cols) cols = pos.col;
         }
-        return pages;
+        return { rows, cols };
+    }
+
+    /**
+     * 渲染指定页的表格 HTML（按需调用：预览只渲染当前页，打印按时间片逐页生成）。
+     * 页面顺序「先下后右」：同一列组内的行页从上到下，再进入下一列组。
+     * @param {PrintPlan} plan - 分页计划
+     * @param {number} pageIndex - 页索引（0-based）
+     * @returns {string} 本页表格 HTML
+     * @private
+     */
+    private _renderPageHtml(plan: PrintPlan, pageIndex: number): string {
+        if (plan.blank || plan.totalPages <= 0) return '';
+        const rowPageCount = plan.rowPages.length;
+        const colIdx = Math.floor(pageIndex / rowPageCount);
+        const rowIdx = pageIndex % rowPageCount;
+        if (colIdx < 0 || colIdx >= plan.colPages.length || rowIdx < 0 || rowIdx >= rowPageCount) return '';
+        this.renderScale = plan.renderScale;
+        return this._buildPageTable(plan, plan.rowPages[rowIdx], plan.colPages[colIdx]);
     }
 
     /**
      * 生成本页表格 HTML：table-layout: fixed + colgroup 显式列宽 + 固定行高，
      * 文字与边框交由浏览器渲染/打印引擎矢量输出（精度优于 canvas 位图光栅化）。
-     * 合并块与本页窗口求交集：块体仅在本页发出一个 td——位于块内首个可见位置，
-     * colspan/rowspan 收缩为本页可见范围；被页边界截断的块体外缘不绘制边框。
+     *
+     * 合并块只取「与本页窗口相交」的子集（DataCollection 的列倒排索引 O(列数 + 块数)），
+     * 而非像历史实现那样每页遍历全表所有合并块；页内发出位置与跳过位置用一维数组记录，
+     * 避免为每个格子创建 `"r:c"` 字符串键。
+     * @param {PrintPlan} plan - 分页计划
      * @param {PageGeometry} rowPage - 本页行几何
      * @param {ColPage} colPage - 本页列组
-     * @param {Array<{cell: Cell; r0: number; c0: number; rs: number; cs: number; firstRow: number; lastRow: number; firstCol: number; lastCol: number}>} blocks - 全表合并块列表
-     * @param {Map<number, {x: number; w: number}>} globalX - 可见列全局布局（列宽来源）
-     * @param {(Cell | undefined)[][]} matrix - 数据矩阵
      * @returns {string} 本页表格 HTML
      * @private
      */
-    private _buildPageTable(
-        rowPage: PageGeometry,
-        colPage: ColPage,
-        blocks: Array<{ cell: Cell; r0: number; c0: number; rs: number; cs: number; firstRow: number; lastRow: number; firstCol: number; lastCol: number; }>,
-        globalX: Map<number, { x: number; w: number }>,
-        matrix: (Cell | undefined)[][]
-    ): string {
-        const pageRowSet = new Set(rowPage.rows);
-        const pageColSet = new Set(colPage.cols);
-        const rowHeight = new Map<number, number>();
-        rowPage.rows.forEach((r, i) => rowHeight.set(r, rowPage.heights[i]));
+    private _buildPageTable(plan: PrintPlan, rowPage: PageGeometry, colPage: ColPage): string {
         /** 合并块在本页的发出规格：收缩后的跨度、本页可见高度与四边边框显隐 */
         interface EmitSpec { cell: Cell; colspan: number; rowspan: number; height: number; showTop: boolean; showBottom: boolean; showLeft: boolean; showRight: boolean; }
-        const emits = new Map<string, EmitSpec>();
-        const skip = new Set<string>();
-        for (const b of blocks) {
-            const visCols: number[] = [];
-            for (let dc = 0; dc < b.cs; dc++) if (pageColSet.has(b.c0 + dc)) visCols.push(b.c0 + dc);
-            const visRows: number[] = [];
-            for (let dr = 0; dr < b.rs; dr++) if (pageRowSet.has(b.r0 + dr)) visRows.push(b.r0 + dr);
-            if (visCols.length === 0 || visRows.length === 0) continue;  // 与本页无交集
-            let height = 0;
-            for (const r of visRows) height += rowHeight.get(r) ?? 0;
-            emits.set(`${visRows[0]}:${visCols[0]}`, {
-                cell: b.cell,
-                colspan: visCols.length,
-                rowspan: visRows.length,
-                height,
-                showTop: visRows[0] === b.firstRow,
-                showBottom: visRows[visRows.length - 1] === b.lastRow,
-                showLeft: visCols[0] === b.firstCol,
-                showRight: visCols[visCols.length - 1] === b.lastCol,
-            });
-            for (const r of visRows) {
-                for (const c of visCols) skip.add(`${r}:${c}`);
+
+        const pageRows = rowPage.rows;
+        const pageCols = colPage.cols;
+        const rowCount = pageRows.length;
+        const colCount = pageCols.length;
+
+        // 页内位置：一维下标 = 行位置 * 列数 + 列位置
+        const emits: Array<EmitSpec | undefined> = new Array(rowCount * colCount);
+        const skip = new Uint8Array(rowCount * colCount);
+
+        if (plan.blocks.size > 0 && rowCount > 0 && colCount > 0) {
+            // 1-based 页窗口，取与本页相交的合并块（只返回相关子集）
+            const rects = this.data.getVisibleMergeRects(
+                pageCols[0] + 1,
+                pageCols[colCount - 1] + 1,
+                pageRows[0] + 1,
+                pageRows[rowCount - 1] + 1
+            );
+            for (const rect of rects) {
+                const b = plan.blocks.get(rect.anchor);
+                if (!b) continue;
+                // 块与本页的可见交集（页内局部下标）：页行列数很小，
+                // 直接按页窗口过滤，避免为跨越多页的高合并块重复遍历整段跨度
+                const visColsLocal: number[] = [];
+                for (let ci = 0; ci < colCount; ci++) {
+                    const c = pageCols[ci];
+                    if (c >= b.firstCol && c <= b.lastCol) visColsLocal.push(ci);
+                }
+                if (visColsLocal.length === 0) continue;
+                const visRowsLocal: number[] = [];
+                for (let ri = 0; ri < rowCount; ri++) {
+                    const r = pageRows[ri];
+                    if (r >= b.firstRow && r <= b.lastRow) visRowsLocal.push(ri);
+                }
+                if (visRowsLocal.length === 0) continue;
+                let height = 0;
+                for (const ri of visRowsLocal) height += rowPage.heights[ri];
+                const anchorCell = this.data.getCellByName(b.anchor);
+                if (!anchorCell) continue;  // 数据变化后锚点已不存在
+                const emitKey = visRowsLocal[0] * colCount + visColsLocal[0];
+                emits[emitKey] = {
+                    cell: anchorCell,
+                    colspan: visColsLocal.length,
+                    rowspan: visRowsLocal.length,
+                    height,
+                    showTop: pageRows[visRowsLocal[0]] === b.firstRow,
+                    showBottom: pageRows[visRowsLocal[visRowsLocal.length - 1]] === b.lastRow,
+                    showLeft: pageCols[visColsLocal[0]] === b.firstCol,
+                    showRight: pageCols[visColsLocal[visColsLocal.length - 1]] === b.lastCol,
+                };
+                for (const ri of visRowsLocal) {
+                    const base = ri * colCount;
+                    for (const ci of visColsLocal) skip[base + ci] = 1;
+                }
             }
         }
+
         // 表格宽度 = 本页列宽之和：列组可能不满页宽，不能被固定布局拉伸补齐
+        const colWidths: number[] = new Array(colCount);
         let tableW = 0;
-        for (const c of colPage.cols) tableW += globalX.get(c)!.w;
-        let html = `<table class="gs-print-table" style="width:${tableW}px"><colgroup>`;
-        for (const c of colPage.cols) html += `<col style="width:${globalX.get(c)!.w}px">`;
-        html += '</colgroup><tbody>';
-        for (let i = 0; i < rowPage.rows.length; i++) {
-            const r = rowPage.rows[i];
-            html += `<tr style="height:${rowPage.heights[i]}px">`;
-            for (const c of colPage.cols) {
-                const key = `${r}:${c}`;
-                const emit = emits.get(key);
+        for (let ci = 0; ci < colCount; ci++) {
+            const w = plan.globalX.get(pageCols[ci])!.w;
+            colWidths[ci] = w;
+            tableW += w;
+        }
+
+        const parts: string[] = [`<table class="gs-print-table" style="width:${tableW}px"><colgroup>`];
+        for (let ci = 0; ci < colCount; ci++) parts.push(`<col style="width:${colWidths[ci]}px">`);
+        parts.push('</colgroup><tbody>');
+        for (let ri = 0; ri < rowCount; ri++) {
+            const r = pageRows[ri];
+            const rowHeight = rowPage.heights[ri];
+            parts.push(`<tr style="height:${rowHeight}px">`);
+            const base = ri * colCount;
+            for (let ci = 0; ci < colCount; ci++) {
+                const emit = emits[base + ci];
                 if (emit) {
-                    html += this._buildCellTd(emit.cell, emit.colspan, emit.rowspan, emit.height, emit.showTop, emit.showBottom, emit.showLeft, emit.showRight);
+                    parts.push(this._buildCellTd(emit.cell, emit.colspan, emit.rowspan, emit.height,
+                        emit.showTop, emit.showBottom, emit.showLeft, emit.showRight));
                     continue;
                 }
-                if (skip.has(key)) continue;
-                html += this._buildCellTd(matrix[r]?.[c], 1, 1, rowPage.heights[i], true, true, true, true);
+                if (skip[base + ci]) continue;
+                const cell = this.data.getCellByName(this.data.getCellName(pageCols[ci] + 1, r + 1));
+                parts.push(this._buildCellTd(cell, 1, 1, rowHeight, true, true, true, true));
             }
-            html += '</tr>';
+            parts.push('</tr>');
         }
-        html += '</tbody></table>';
-        return html;
+        parts.push('</tbody></table>');
+        return parts.join('');
     }
 
     /**
@@ -1460,40 +1833,6 @@ export class Printer {
     }
 
     /**
-     * 按页面范围设置过滤各页表格 HTML（仅对实际打印输出生效，预览始终显示全部页）；
-     * 页序与 _buildPageHtmls 的输出顺序一致（「先下后右」）
-     * @param {string[]} pages - 各页表格 HTML
-     * @returns {string[]} 过滤后的页面序列
-     * @private
-     */
-    private _filterPageRange(pages: string[]): string[] {
-        const hits = this._parsePageRange(pages.length);
-        if (!hits) return pages;
-        return pages.filter((_, i) => hits.has(i + 1));
-    }
-
-    /**
-     * 按份数与打印顺序展开页面序列
-     * 逐份打印（copies）：1,2,3 → 1,2,3,1,2,3；逐页打印（page）：1,2,3 → 1,1,2,2,3,3
-     * @param {string[]} pages - 各页表格 HTML
-     * @returns {string[]} 展开后的页面序列
-     * @private
-     */
-    private _expandCopies(pages: string[]): string[] {
-        const copies = Math.max(1, Math.floor(this.copies));
-        if (copies <= 1 || pages.length === 0) return pages;
-        const seq: string[] = [];
-        if (this.collate === 'copies') {
-            for (let i = 0; i < copies; i++) seq.push(...pages);
-        } else {
-            for (const p of pages) {
-                for (let i = 0; i < copies; i++) seq.push(p);
-            }
-        }
-        return seq;
-    }
-
-    /**
      * 填充打印机下拉选项并回显用户上次选择
      * @param {HTMLSelectElement} select - 打印机下拉框
      * @private
@@ -1526,24 +1865,24 @@ export class Printer {
     }
 
     /**
-     * 生成完整打印文档：各页表格 HTML 按页分页输出。
+     * 生成打印文档骨架（head + 空 body）。
+     *
+     * 页面不再一次性拼进文档：print() 按时间片逐页生成并追加到 body，
+     * 大表打印时主线程不再被一次性字符串生成与 HTML 解析占满。
+     *
      * 自定义打印设置同步到浏览器打印对话框的方式：
      * - 纸张大小与方向：通过 @page size 规则同步，Chrome/Edge 打印预览随其变化；
      * - 页眉页脚：浏览器页眉页脚渲染在页边距区域内，@page 边距设为 0 后不再显示；
      *   页边距改由逐页包裹层（.gs-print-sheet）的 padding 实现，版面效果与原来一致；
      * - 打印机 / 份数 / 顺序：Web API 无法预设浏览器打印对话框，需在对话框中确认。
-     * @param {string[]} pages - 各页表格 HTML
-     * @returns {string} 可直接写入 iframe 的 HTML 文档字符串
+     * @returns {string} 可直接写入 iframe 的 HTML 文档骨架
      * @private
      */
-    private _buildPrintDocument(pages: string[]): string {
+    private _buildPrintHead(): string {
         const size = PAPER_SIZES[this.paperSize];
         // 纸张在当前方向下的实际高度（mm）：@page 边距为 0，逐页容器必须与纸张等高，
         // 否则页高超出可打印区域会导致出现空白页
         const paperH = this.orientation === 'portrait' ? size.height : size.width;
-        const sheets = pages
-            .map(pageHtml => `<div class="gs-print-sheet">${pageHtml}</div>`)
-            .join('');
         return `<!DOCTYPE html>
 <html>
 <head>
@@ -1563,7 +1902,7 @@ export class Printer {
         ${this._getFontFaceCss()}
     </style>
 </head>
-<body>${sheets}</body>
+<body></body>
 </html>`;
     }
 
