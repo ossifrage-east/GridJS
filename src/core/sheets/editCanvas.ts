@@ -56,6 +56,14 @@ export class EditCanvas extends Canvas {
     private lastInputStartPos: number = 0;
     /** 编辑开始时的单元格值（用于撤销记录） */
     private initialCellValue: Char[] = [];
+    /**
+     * refresh 模式（打字覆盖）下，**清空 chars 之前**的原文快照
+     *
+     * 由 {@link startEditting} 抓取、由 IS_EDITTING_CHANGED 监听转交给
+     * `data.beginEditSession(preEdit)`。顺序不能反：先清空再开编辑会话的话，
+     * 会话基准就是空壳，撤销会把原文撤成空白（大表实测：改内容后撤销，内容不再显示）。
+     */
+    private pendingPreEdit: Cell | null | undefined = undefined;
     /** 新输入的字符（用于单元格新增字符） */
     private newChars: string[] = [];
 
@@ -126,8 +134,12 @@ export class EditCanvas extends Canvas {
         });
         this.data.on(DataEvents.IS_EDITTING_CHANGED, (_, isEditting) => {
             if(isEditting) {
-                // 进入编辑态：开启编辑内撤销栈，捕获编辑前基准快照
-                this.data.beginEditSession();
+                // 进入编辑态：开启编辑内撤销栈，捕获编辑前基准快照。
+                // pendingPreEdit 是 refresh 模式下「清空 chars 之前」的原文（见字段注释），
+                // 必须在这里转交给会话，否则撤销基准会是被清空的空壳。
+                const preEdit = this.pendingPreEdit;
+                this.pendingPreEdit = undefined;
+                this.data.beginEditSession(preEdit);
                 this.startEditting();
             } else {
                 this.finishEditting();
@@ -836,8 +848,13 @@ export class EditCanvas extends Canvas {
         
         // 保存初始值用于撤销记录（在编辑开始时记录整个单元格状态）
         const cellObj = this.data.getCellByName(cell);
-        if (cellObj && refresh && !this.data.isEditting) {  // 刷新单元格内容, 清空所有字符
-            cellObj.chars = [];
+        // refresh 的语义是「打字覆盖原内容」：清空 chars 让新输入的字符从空白开始。
+        // 【撤销基准必须在清空**之前**抓】：否则 beginEditSession 拍到的就是空壳，
+        // 撤销会把原文撤成空白（大表实测：改内容后撤销，内容不再显示）。
+        const willRefresh = !!cellObj && refresh && !this.data.isEditting;
+        this.pendingPreEdit = willRefresh ? (cellObj as Cell).clone() : undefined;
+        if (willRefresh) {
+            (cellObj as Cell).chars = [];
         }
         this.data.isEditting = true;
 

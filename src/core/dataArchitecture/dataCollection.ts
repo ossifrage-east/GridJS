@@ -501,6 +501,16 @@ export class DataCollection extends EventEmitter {
      */
     private _editSessionAnchor: UndoAnchor | null = null;
     /**
+     * 本次编辑会话编辑的是**哪一格**（在 {@link beginEditSession} 时记下）
+     *
+     * 与 {@link _editSessionAnchor} 同理：结束编辑时 `activedCell` 可能已经被
+     * 鼠标移走（点到别的格子才退出编辑），若拿那时的 `activedCell` 去推
+     * 「补丁目标格」，空白格的编辑会被记到**另一个格子**上 —— 撤掉的是别人的内容，
+     * 用户看到的是「输入后撤销毫无反应」（新格子恰好也空白时两侧等价，干脆不入栈）。
+     * 编辑会话只会改这一格，故在开始时记死。
+     */
+    private _editCellName: string | null = null;
+    /**
      * 编辑内撤销/重做后应恢复到的光标绝对索引。
      * 由 _undoEditStep/_redoEditStep 写入，供 editCanvas 在重测 lines、
      * 定位光标时读取（光标定位必须发生在 lines 刷新之后）。
@@ -1953,7 +1963,8 @@ export class DataCollection extends EventEmitter {
      * @private
      */
     private _applyEditCellState(snapshot: Cell | null): void {
-        const name = this.activedCell;
+        // 与 endEditSession 同源：编辑会话只改会话开始时那一格
+        const name = this._editCellName ?? this.activedCell;
         const index = this._values.findIndex(c => c.cell === name);
         if (snapshot === null) {
             if (index >= 0) this._values.splice(index, 1);
@@ -1974,17 +1985,35 @@ export class DataCollection extends EventEmitter {
      * 大表下不建立基准（栈为空）：编辑内逐字撤销对几十万格的表代价过高，
      * 且 `_undoEditStep` 会因栈深不足直接返回 false，行为一致。
      */
-    public beginEditSession(): void {
+    public beginEditSession(preEdit?: Cell | null): void {
         // 在编辑开始时捕获视图锚点：此刻 activedCell 与 selection 都指向被编辑的
         // 那一个单元格，二者一致；推迟到结束时再采会因鼠标已改动 activedCell 而错位
         // （见 _editSessionAnchor 字段注释）。
         this._editSessionAnchor = this._captureAnchor();
+        // 编辑会话的作用对象也在此刻记死（见 _editCellName 字段注释）
+        this._editCellName = this._activedCell || null;
         if (this._undoTrackingEnabled()) {
-            this._editUndoStack = [{ values: this.cloneValues(this._values), cursor: this.cursorAbsolutePosition }];
+            const values = this.cloneValues(this._values);
+            // 【refresh 覆盖输入的基准修正】调用方（editCanvas.startEditting）在
+            // refresh 模式下会先清空 chars 再置 isEditting —— 那样本函数拍到的
+            // 「编辑前」就已经是空壳，撤销会把原文撤成空白（大表实测）。
+            // 故它在清空之前先把原文快照传进来，这里把快照里那一格换回去。
+            if (preEdit !== undefined && this._editCellName !== null) {
+                const index = values.findIndex((c: Cell) => c.cell === this._editCellName);
+                if (preEdit === null) {
+                    if (index >= 0) values.splice(index, 1);
+                } else if (index >= 0) {
+                    values[index] = preEdit.clone();
+                } else {
+                    values.push(preEdit.clone());
+                }
+            }
+            this._editUndoStack = [{ values, cursor: this.cursorAbsolutePosition }];
         } else {
             // 大表：整表深拷贝关闭，改对活动单元格建立单格基准快照，
             // 编辑内撤销/重做依然可用（见 _editCellUndoStack）。
-            const active = this.getCellByName(this.activedCell);
+            // preEdit 显式给出时以它为准（同上：它才是清空前的原文）。
+            const active = preEdit !== undefined ? preEdit : this.getCellByName(this.activedCell);
             this._editCellUndoStack = [{
                 cell: active ? active.clone() : null,
                 cursor: this.cursorAbsolutePosition
@@ -2028,7 +2057,10 @@ export class DataCollection extends EventEmitter {
             // 表现为「大表里改完一个格，Ctrl+Z 毫无反应」（test_sample.xlsx 实测）。
             // 只涉及活动格一个格子，成本 O(1)，与整表大小无关。
             const first = this._editCellUndoStack[0];
-            const name = first.cell ? first.cell.cell : this._activedCell;
+            // 目标格必须取**会话开始时**那一格（_editCellName）：结束时 activedCell
+            // 可能已被鼠标点走，用它推目标会把补丁记到别的格子上 ——
+            // 空白格的编辑于是「撤销无反应」（见 _editCellName 字段注释）。
+            const name = this._editCellName ?? (first.cell ? first.cell.cell : this._activedCell);
             const current = this.getCellByName(name);
             const before = [{ cell: name, data: first.cell }];
             const after = [{ cell: name, data: current ? current.clone() : null }];
@@ -2046,6 +2078,7 @@ export class DataCollection extends EventEmitter {
         this._editCellRedoStack = [];
         // 会话结束即作废本会话锚点，避免被下一次编辑会话误用
         this._editSessionAnchor = null;
+        this._editCellName = null;
     }
 
     /**
