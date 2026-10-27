@@ -12,8 +12,10 @@ import { createDiv, createElement, createSpan } from '../../utils/dom';
 import { runPython, stopPython } from '../../utils/python/pythonClient';
 import {
     PY_NAMESPACE_SOURCE, buildSnapshot, applyWritesAll, buildOpenedJson, buildMetaJson,
-    buildScriptMeta, extractOpenGridPaths, listGridFiles, prepareOpenedSheets, OpenedSheet,
+    buildScriptMeta, extractOpenGridPaths, listGridFiles, prepareOpenedSheets, usesFilesBinding,
+    OpenedSheet, PRELOAD_MAX_CELLS,
 } from '../../utils/python/sheetNameSpace';
+import { OutputBuffer } from '../../utils/outputBuffer';
 import '../style/pyEditor.scss';
 
 /** Python 关键字（高亮为「关键字」色） */
@@ -117,6 +119,19 @@ export class PYEditor {
     /** 输出面板（stdout / stderr / 运行结果） */
     private readonly output: HTMLDivElement;
     /**
+     * 输出面板顶部的「已省略 N 行」提示
+     *
+     * 恒为 `output` 的首个子节点（行节点从索引 1 起），无省略时用 `hidden` 收起。
+     * 常驻而不动态插拔，是为了让「行节点 ↔ 缓冲区」的裁剪下标始终从 1 起，少一处特判。
+     */
+    private readonly outputNotice: HTMLDivElement;
+    /** 输出行缓冲（只保留最近 {@link PYEditor.OUTPUT_MAX_LINES} 行） */
+    private readonly outputBuffer = new OutputBuffer(PYEditor.OUTPUT_MAX_LINES);
+    /** 待渲染的输出批次（同一帧内到达的多条 stdout/stderr 合并成一次 DOM 操作） */
+    private outputQueue: { text: string; isError: boolean }[] = [];
+    /** 已排队的帧刷新句柄（null = 当前没有待处理批次） */
+    private outputFrame: number | null = null;
+    /**
      * 是否正在运行
      *
      * 兼作串行保护：Pyodide 的 stdout/stderr 绑定是「按当前请求 id」的，
@@ -150,6 +165,21 @@ export class PYEditor {
     private static readonly SAVE_DEBOUNCE_MS = 400;
     /** 一级缩进（4 空格，PEP 8） */
     private static readonly INDENT = '    ';
+    /**
+     * 输出面板最多保留的行数
+     *
+     * 脚本循环 `print` 十万行是常态，一行一个节点会直接把主线程撑爆（OOM）。
+     * 面板高度只有十几行可见，保留千行已足够回溯，更早的行折叠成「已省略 N 行」。
+     */
+    private static readonly OUTPUT_MAX_LINES = 1000;
+    /**
+     * 待渲染队列的强制刷新阈值
+     *
+     * 正常情况下每帧刷一次就够；但标签页被切到后台时 `requestAnimationFrame`
+     * 会被浏览器暂停，而 Worker 里的脚本照跑、stdout 照来 —— 队列只进不出，
+     * 百万行 `print` 又会把内存堆回去。超过这个条数就直接同步刷一次（不等帧）。
+     */
+    private static readonly OUTPUT_QUEUE_MAX = 200;
 
     /**
      * 旧版默认脚本模板（历史存档迁移用）
@@ -298,6 +328,9 @@ export class PYEditor {
             className: PY_EDITOR_CLASS_NAMES.OUTPUT,
             attributes: { tabindex: '-1' },
         });
+        this.outputNotice = createDiv({ className: PY_EDITOR_CLASS_NAMES.OUTPUT_NOTICE });
+        this.outputNotice.hidden = true;
+        this.output.appendChild(this.outputNotice);
         this.container.append(toolbar, body, this.output);
 
         this.bindEvents();
@@ -353,35 +386,58 @@ export class PYEditor {
         this.clearOutput();
         this.appendOutput('正在运行…（首次运行需先加载 Python 运行环境）', false);
 
-        const snapshot = buildSnapshot(this.data);
         const script = this.getValue();
         try {
             // open_grid("路径") 是同步调用，而读别的文件的存档只能异步 —— 只能先静态扫出
             // 全部字面量路径、主线程预加载，再把数据一起下发给 Worker（详见 extractOpenGridPaths）。
             const paths = extractOpenGridPaths(script);
             // 脚本用到 files（工作区文件清单）时，open_grid(files[i]) 这种**动态**参数才有表可查
-            // —— 只能把全部表格都预加载进来。代价是表多时这一次运行会慢，故仅在真的用到时触发。
-            const preloadAll = /\bfiles\b/.test(script);
+            // —— 只能把全部表格都预加载进来。代价是表多时这一次运行会慢，故仅在真的用时触发。
+            // 判定必须先剥注释：默认模板的 API 清单注释里就有 files，粗判会让「新建后直接运行」
+            // 也预加载整个工作区（大表直接 OOM，见 usesFilesBinding 的注释）。
+            const preloadAll = usesFilesBinding(script);
             const files = await listGridFiles(this.data);
-            let opened: { sheets: OpenedSheet[]; scratch: Map<string, DataCollection> } = { sheets: [], scratch: new Map() };
-            if (paths.length > 0 || preloadAll) {
-                opened = await prepareOpenedSheets(this.data, paths, { keys: files, preloadAll });
-            }
-            const { writesJson } = await runPython({
-                script,
-                sheetName: snapshot.sheetName,
-                snapshotJson: snapshot.json,
-                stylesJson: snapshot.stylesJson,
-                openedJson: buildOpenedJson(opened.sheets),
-                metaJson: buildMetaJson(buildScriptMeta(this.data, files, snapshot.display)),
-                rowCount: snapshot.rowCount,
-                colCount: snapshot.colCount,
-                namespaceSource: PY_NAMESPACE_SOURCE,
-                onStdout: (text: string) => this.appendOutput(text, false),
-                onStderr: (text: string) => this.appendOutput(text, true),
-            });
+            // P0-3（释放时机）：scratch（其它表的临时 DataCollection）写回阶段还要用，
+            // 必须活在整次运行里；而快照本体与 sheets 数组在 postMessage 发出后就再无用处
+            // —— 收进 IIFE 让它们随即出作用域。直接写在 handleRun 作用域的话，
+            // await 挂起期间（可能几十秒）闭包会一直按着整份快照不撒手。
+            const scratch = new Map<string, DataCollection>();
+            const runPromise = (async (): Promise<{ writesChunks: string[] }> => {
+                const snapshot = buildSnapshot(this.data);
+                let sheets: OpenedSheet[] = [];
+                let skipped: string[] = [];
+                if (paths.length > 0 || preloadAll) {
+                    const opened = await prepareOpenedSheets(this.data, paths, { keys: files, preloadAll });
+                    sheets = opened.sheets;
+                    skipped = opened.skipped;
+                    for (const [key, dc] of opened.scratch) scratch.set(key, dc);
+                }
+                // 预算降级如实告知：这些表这次没预加载，open_grid 到它们会报错
+                if (skipped.length > 0) {
+                    this.appendOutput(`提示：以下 ${skipped.length} 个表格过大，本次未预加载`
+                        + `（预算 ${PRELOAD_MAX_CELLS} 格）：${skipped.join('、')}。`
+                        + '脚本 open_grid 到它们会报错，可减少表格数量或按需打开。', true);
+                }
+                return runPython({
+                    script,
+                    sheetName: snapshot.sheetName,
+                    snapshotChunks: snapshot.jsonChunks,
+                    stylesChunks: snapshot.stylesChunks,
+                    openedJson: buildOpenedJson(sheets),
+                    metaJson: buildMetaJson(buildScriptMeta(this.data, files, snapshot.display)),
+                    rowCount: snapshot.rowCount,
+                    colCount: snapshot.colCount,
+                    namespaceSource: PY_NAMESPACE_SOURCE,
+                    onStdout: (text: string) => this.appendOutput(text, false),
+                    onStderr: (text: string) => this.appendOutput(text, true),
+                });
+            })();
+            const { writesChunks } = await runPromise;
             const { count, others } = await applyWritesAll(
-                this.data, writesJson, '运行 Python 脚本', opened.scratch);
+                this.data, writesChunks, '运行 Python 脚本', scratch);
+            // 写回已完成：临时装载的其它表（scratch 里的整份 DataCollection）立刻释放，
+            // 不等到 handleRun 出作用域
+            scratch.clear();
             const otherNote = others.length > 0 ? `，另写入 ${others.length} 个表格` : '';
             this.appendOutput(count > 0 ? `运行完成，已写入 ${count} 个单元格${otherNote}` : '运行完成', false);
         } catch (err) {
@@ -417,36 +473,116 @@ export class PYEditor {
         this.stopButton.disabled = !running;
     }
 
-    /** 清空输出面板（每次运行开始时调用） */
+    /**
+     * 清空输出面板（每次运行开始时调用）
+     *
+     * 只摘「行节点」，顶部的省略提示常驻首位（见 {@link outputNotice}）；
+     * 待渲染批次与帧句柄也要一起作废，否则上一次运行排队的输出会漏进新一次运行。
+     */
     private clearOutput(): void {
-        this.output.textContent = '';
+        if (this.outputFrame !== null) {
+            cancelAnimationFrame(this.outputFrame);
+            this.outputFrame = null;
+        }
+        this.outputQueue = [];
+        this.outputBuffer.clear();
+        while (this.output.childElementCount > 1) {
+            this.output.removeChild(this.output.lastElementChild as Element);
+        }
+        this.renderOutputNotice();
     }
 
     /**
      * 向输出面板追加文本（实时流式）
      *
-     * Pyodide 的 `batched` 回调按批给出文本（内含换行），故按行拆分后逐行建节点：
-     * 一行一个 div，空行也保留（`min-height` 维持行高），空行被折叠会破坏
-     * 脚本输出的可读性。末尾因「文本以换行结尾」多出的空段则丢弃，否则每次
-     * 追加都会凭空多出一行空白。
+     * 只把文本放进队列，真正的建节点与裁剪统一在下一帧由 {@link flushOutput} 做：
+     * Pyodide 的 `batched` 回调可能每秒触发成百上千次，逐次 append + 读 `scrollHeight`
+     * 会把主线程按在布局抖动里；合并成一帧一次后，长脚本的进度显示依然实时，
+     * 但 DOM 操作次数降到帧级。
      * @param text - 待追加的文本（可能含多行）
      * @param isError - 是否为错误输出（stderr / traceback），用红色区分
      * @private
      */
     private appendOutput(text: string, isError: boolean): void {
         if (!text) return;
-        const lines = text.split('\n');
-        if (lines[lines.length - 1] === '') lines.pop();
-        for (const line of lines) {
-            const el = createDiv({
-                className: PY_EDITOR_CLASS_NAMES.OUTPUT_LINE,
-                textContent: line,
-            });
-            if (isError) el.classList.add(PY_EDITOR_CLASS_NAMES.OUTPUT_ERROR);
-            this.output.appendChild(el);
+        this.outputQueue.push({ text, isError });
+        // 队列积压过多（多半是后台标签页 rAF 被暂停）：直接同步刷，别让批次在队列里堆着
+        if (this.outputQueue.length >= PYEditor.OUTPUT_QUEUE_MAX) {
+            if (this.outputFrame !== null) {
+                cancelAnimationFrame(this.outputFrame);
+                this.outputFrame = null;
+            }
+            this.flushOutput();
+            return;
         }
-        // 流式输出必须跟着滚动到底，否则运行中看不到最新一行
-        this.output.scrollTop = this.output.scrollHeight;
+        if (this.outputFrame !== null) return;
+        this.outputFrame = requestAnimationFrame(() => {
+            this.outputFrame = null;
+            this.flushOutput();
+        });
+    }
+
+    /**
+     * 渲染队列里的输出批次（每帧调用一次）
+     *
+     * 三件事必须一次做完：
+     * 1. 行数上限裁剪 —— 由 {@link OutputBuffer} 决定保留哪些行、裁掉多少行；
+     * 2. 与缓冲区同步摘掉面板头部的旧节点（DOM 行节点数恒等于缓冲区行数）；
+     * 3. 更新「已省略 N 行」提示并滚动到底。
+     *
+     * 滚动**只在追加前已贴着底部时**执行：用户运行中向上翻看历史输出时，
+     * 不该被新输出一次次拽回底部。
+     * @private
+     */
+    private flushOutput(): void {
+        const queue = this.outputQueue;
+        this.outputQueue = [];
+        if (queue.length === 0) return;
+
+        const stick = this.output.scrollTop + this.output.clientHeight >= this.output.scrollHeight - 4;
+        const fragment = document.createDocumentFragment();
+        let removed = 0;
+        for (let i = 0; i < queue.length; i++) {
+            const result = this.outputBuffer.push(queue[i].text, queue[i].isError);
+            removed += result.removed;
+            for (let j = 0; j < result.added.length; j++) {
+                const line = result.added[j];
+                const el = createDiv({
+                    className: PY_EDITOR_CLASS_NAMES.OUTPUT_LINE,
+                    textContent: line.text,
+                });
+                if (line.isError) el.classList.add(PY_EDITOR_CLASS_NAMES.OUTPUT_ERROR);
+                fragment.appendChild(el);
+            }
+        }
+        this.output.appendChild(fragment);
+
+        // 被裁掉的是最早的行 —— 它们正好是提示行之后的前 removed 个节点
+        for (let i = 0; i < removed; i++) {
+            const first = this.output.children[1];
+            if (first === undefined) break;
+            this.output.removeChild(first);
+        }
+        this.renderOutputNotice();
+        if (stick) this.output.scrollTop = this.output.scrollHeight;
+    }
+
+    /**
+     * 刷新「已省略 N 行」提示
+     *
+     * 没有省略时整体收起（`hidden` 由 `.py-editor-output-notice[hidden]` 保证真的不占位）。
+     * @private
+     */
+    private renderOutputNotice(): void {
+        const omitted = this.outputBuffer.omitted;
+        if (omitted <= 0) {
+            this.outputNotice.hidden = true;
+            this.outputNotice.textContent = '';
+            return;
+        }
+        this.outputNotice.hidden = false;
+        this.outputNotice.textContent =
+            `已省略更早的 ${omitted} 行输出（面板只保留最近 ${PYEditor.OUTPUT_MAX_LINES} 行）`;
     }
 
     /**

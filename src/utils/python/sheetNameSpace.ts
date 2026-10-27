@@ -937,9 +937,12 @@ def _compile(source, filename):
     return compile(tree, filename, "exec")
 
 
-def _load(snapshot_json, styles_json, opened_json, name, rows, cols, meta_json=""):
+def _load(snapshot, styles, opened_json, name, rows, cols, meta_json=""):
     """宿主在运行脚本前调用：注入当前表、open_grid() 出来的表格与元信息（内部接口）。
 
+    snapshot / styles 是**已解析**的字典：宿主把分片 JSON 逐片 loads 后 update
+    出来、片串随手释放 —— 这里若改收整条 JSON 串再解析，运行全程就得同时
+    驻留「原串 + 解析结果」两份，分片削峰就白做了。
     meta_json 带三样东西（都可缺省）：maxCol / maxRow（当前表有内容的最大行列号）、
     files（工作区里所有表格文件，根相对路径）。缺省时按空表 / 空清单处理。
     """
@@ -947,7 +950,7 @@ def _load(snapshot_json, styles_json, opened_json, name, rows, cols, meta_json="
     _OPENED = {}
     meta = _json.loads(meta_json) if meta_json else {}
     files = list(meta.get("files") or [])
-    current = _Sheet(name, name, rows, cols, _json.loads(snapshot_json), _json.loads(styles_json),
+    current = _Sheet(name, name, rows, cols, snapshot, styles,
                      meta.get("maxCol") or 0, meta.get("maxRow") or 0, meta.get("display"))
     sheet = current
     _register(name, current)
@@ -967,12 +970,8 @@ def _load(snapshot_json, styles_json, opened_json, name, rows, cols, meta_json="
     col_count = cols
 
 
-def _dump():
-    """宿主在运行脚本后调用：按表取出本次写入（内部接口）。
-
-    形态：{"__sheets__": {"<表键>": {"A1": {"value": "x", ...}}}}
-    只包含**确实写过**的表，空表不出现。
-    """
+def _dump_writes():
+    """按表收集本次写入（内部接口）：{"<表键>": {格子: 字段}}，空表不出现。"""
     out = {}
     seen = set()
     for obj in _OPENED.values():
@@ -981,14 +980,54 @@ def _dump():
         seen.add(id(obj))
         if obj.writes:
             out[obj.key] = obj.writes
-    return _json.dumps({"__sheets__": out})
+    return out
+
+
+def _dump():
+    """宿主在运行脚本后调用：按表取出本次写入（内部接口）。
+
+    形态：{"__sheets__": {"<表键>": {"A1": {"value": "x", ...}}}} 的 JSON 串。
+    只包含**确实写过**的表，空表不出现。
+    （单条大串版本，供测试与诊断；宿主运行时走 _dump_chunks 的分片形态。）
+    """
+    return _json.dumps({"__sheets__": _dump_writes()})
+
+
+def _dump_chunks(size=4000):
+    """宿主在运行脚本后调用：按表取出本次写入，按格分片（内部接口）。
+
+    每片独立成形 {"__sheets__": {表键: {格子: 字段}}} 的 JSON 串、单片 ≤ size 格；
+    宿主逐片 JSON.parse、按表合并后一次性落表（每张表仍只调一次落表，
+    撤销栈不会因为分片多出条目）。任何时刻 Python 堆里最多一条片级字符串
+    + 一条宿主刚收到的片，单条巨型 writesJson 的解析峰值消失。
+    """
+    out = _dump_writes()
+    chunks = []
+    buf = {}
+    count = 0
+    for key in out:
+        cells = out[key]
+        for cell in cells:
+            if count >= size:
+                chunks.append(_json.dumps({"__sheets__": buf}))
+                buf = {}
+                count = 0
+            if key not in buf:
+                buf[key] = {}
+            buf[key][cell] = cells[cell]
+            count += 1
+    if buf:
+        chunks.append(_json.dumps({"__sheets__": buf}))
+    return chunks
 `;
 
 /**
  * 当前工作表的可运行快照
  *
- * {@link json} 是发给 Python 的载荷（`{"A1": "文本", ...}`）；{@link cells} 与
- * {@link json} 内容等价，保留数组形式只是为了便于调试与统计。
+ * 三份数据各有唯一去处：{@link json} 是下发给 Python 的文本载荷
+ * （`{"A1": "文本", ...}`）、{@link stylesJson} 是样式载荷、{@link display}
+ * 进 `metaJson`（Python 侧 `print` 用）。**不要**再往这里加「便于调试」的
+ * 冗余形态：运行时内存峰值正比于快照副本数，大表上每一份都是压垮页面的一根稻草。
  */
 export interface SheetSnapshot {
     /** 当前工作表名 */
@@ -1001,21 +1040,16 @@ export interface SheetSnapshot {
     maxCol: number;
     /** 有内容的最大行号（1 起始；空表 0） */
     maxRow: number;
-    /** 非空格子（`[单元格名, 文本]`） */
-    cells: [string, string][];
-    /** 发给 Python 的文本载荷（`{"A1": "文本"}`） */
-    json: string;
-    /** 发给 Python 的样式载荷（`{"A1": {"fontColor": "#fff"}}`，只含有样式的格子） */
-    stylesJson: string;
+    /** 发给 Python 的文本载荷，按 {@link PYTHON_CHUNK_CELLS} 格/片切好的 JSON 片（`{"A1": "文本"}`） */
+    jsonChunks: string[];
+    /** 发给 Python 的样式载荷分片（`{"A1": {"fontColor": "#fff"}}`，只含有样式的格子） */
+    stylesChunks: string[];
     /**
      * 最终显示文本（按 numberFormat 格式化后），**只收与原文不同的格子**
      *
-     * 与 {@link displayJson} 内容相同，区别只是一个对象、一个字符串：
-     * 对象形态给 {@link buildScriptMeta} 塞进 metaJson，字符串形态供其它调用方直传。
+     * 对象形态给 {@link buildScriptMeta} 塞进 metaJson（Python 侧 `_load` 的第 7 个参数）。
      */
     display: Record<string, string>;
-    /** {@link display} 的 JSON 形态 */
-    displayJson: string;
 }
 
 /**
@@ -1056,6 +1090,35 @@ function collectCellStyle(cell: Cell): Record<string, unknown> | null {
     return out;
 }
 
+/** 单片载荷里的格子数上限（对齐存档 v4 的 4000 格/片方案） */
+export const PYTHON_CHUNK_CELLS = 4000;
+
+/** preloadAll 的格子预算：预加载累计超过它就不再装载后续表格（防止整个工作区挤爆内存） */
+export const PRELOAD_MAX_CELLS = 500000;
+
+/**
+ * 把「单元格名 → 值」的对象切成多片 JSON 字符串
+ *
+ * 单片 4000 格对齐存档 v4 的分片粒度。分片的目的是**削峰**：单条巨型 JSON
+ * 在主线程（stringify + structured clone）、worker、Python（loads 前后）各自
+ * 都要完整驻留；切成小片后每一环的峰值都只有单片大小，Python 侧逐片
+ * `update` 进结果字典后立即释放原串。
+ * @param obj - 待切分的对象（构建期临时对象，调用后即可释放）
+ * @param size - 每片格子数上限
+ * @returns {string[]} JSON 片数组；空对象返回空数组（Python 侧按空字典处理）
+ */
+export function chunkObjectJson(obj: Record<string, unknown>, size: number = PYTHON_CHUNK_CELLS): string[] {
+    const names = Object.keys(obj);
+    const chunks: string[] = [];
+    for (let i = 0; i < names.length; i += size) {
+        const end = Math.min(i + size, names.length);
+        const part: Record<string, unknown> = {};
+        for (let j = i; j < end; j++) part[names[j]] = obj[names[j]];
+        chunks.push(JSON.stringify(part));
+    }
+    return chunks;
+}
+
 /**
  * 导出当前工作表的快照（运行时送给 Python 的输入）
  *
@@ -1076,18 +1139,16 @@ export function buildSnapshot(data: DataCollection): SheetSnapshot {
         colCount: data.colHeaders.length,
         maxCol: bounds.maxCol,
         maxRow: bounds.maxRow,
-        cells: raw.cells,
-        json: JSON.stringify(raw.text),
-        stylesJson: JSON.stringify(raw.styles),
+        // 分片序列化：不再先拼一条整表 JSON 串（那本身就是一次全量驻留），
+        // collectSnapshot 的对象态在本函数返回后即可整体释放
+        jsonChunks: chunkObjectJson(raw.text),
+        stylesChunks: chunkObjectJson(raw.styles),
         display: raw.display,
-        displayJson: JSON.stringify(raw.display),
     };
 }
 
 /** 快照的「对象形态」（字符串形态见 {@link buildSnapshot}） */
 interface RawSnapshot {
-    /** 非空格子 `[名称, 文本]` */
-    cells: [string, string][];
     /** 单元格名 → 原始文本（chars 拼接，未格式化） */
     text: Record<string, string>;
     /** 单元格名 → **最终显示文本**（按 numberFormat 格式化；只收与原文不同的格子） */
@@ -1098,11 +1159,15 @@ interface RawSnapshot {
 
 /**
  * 把一张表的可读内容收集成内存对象（{@link buildSnapshot} 与多表预加载共用）
+ *
+ * 只产出**确实会下发**的三份数据。早期还额外攒了一份 `[名称, 文本]` 数组供「调试与
+ * 统计」，但它从未离开过主线程：大表上等于凭空多持有一份完整副本（每格一个二元组
+ * + 两个字符串引用），而运行时快照本身就要在内存里堆 6~8 份（见 OOM 诊断），
+ * 故直接删掉这条死支路。
  * @param data - 任意数据集合（当前表或一张临时装载的表）
  * @returns {RawSnapshot} 对象形态快照
  */
 function collectSnapshot(data: DataCollection): RawSnapshot {
-    const cells: [string, string][] = [];
     const text: Record<string, string> = {};
     const display: Record<string, string> = {};
     const styles: Record<string, Record<string, unknown>> = {};
@@ -1110,7 +1175,6 @@ function collectSnapshot(data: DataCollection): RawSnapshot {
         const name = cell.cell;
         const value = cell.getText();
         if (value !== '') {
-            cells.push([name, value]);
             text[name] = value;
             // 最终显示文本必须与画布完全一致，故**只**走渲染层这同一个函数
             // （日期 / 货币 / 百分比 / 科学计数都在里面）。无格式的格子它原样返回，
@@ -1121,7 +1185,7 @@ function collectSnapshot(data: DataCollection): RawSnapshot {
         const style = collectCellStyle(cell);
         if (style !== null) styles[name] = style;
     }
-    return { cells, text, display, styles };
+    return { text, display, styles };
 }
 
 /**
@@ -1170,33 +1234,54 @@ function normalizePayload(raw: Record<string, unknown>): Record<string, Record<s
  *
  * 为什么要分开：其它表格不在内存里（只是为这次运行临时装载的），写它等价于
  * 「改那个文件的存档」，既不能进当前表的撤销栈，也不该触碰当前表的数据。
+ *
+ * 写回载荷是**分片**的（Python 侧 `_dump_chunks`）：同一张表的格子可能散在多片里，
+ * 这里必须先按表合并再落表 —— 每张表恰好调一次 applyScriptWrites，撤销栈里
+ * 才只会多出一条记录（而不是每片一条）。
  * @param data - 当前工作表
- * @param writesJson - Worker 回传的写回 JSON
+ * @param writes - Worker 回传的写回载荷（分片数组；也兼容旧的单条 JSON 字符串）
  * @param label - 当前表撤销栈里的操作标签
  * @param scratch - 预加载的其它表格（键 = 存档键）；缺省时只处理当前表
  * @returns {Promise<{count: number, others: string[]}>} 写入格数 + 被改动的其它表格
  */
 export async function applyWritesAll(
     data: DataCollection,
-    writesJson: string,
+    writes: string | string[],
     label: string,
     scratch?: Map<string, DataCollection>
 ): Promise<{ count: number; others: string[] }> {
-    const parsed = JSON.parse(writesJson) as Record<string, unknown>;
-    const sheets = parsed.__sheets__ as Record<string, Record<string, unknown>> | undefined;
-    if (sheets === undefined) return { count: applyWrites(data, writesJson, label), others: [] };
+    const chunks = Array.isArray(writes) ? writes : [writes];
+    // 跨片合并：同一张表的载荷可能被切成多片，先并齐再一次性落表
+    let mine: Record<string, unknown> | null = null;        // 当前表（键 = activedSheetName）
+    const othersPayload = new Map<string, Record<string, unknown>>();
+    let plain: Record<string, unknown> | null = null;       // 不带 __sheets__ 的旧格式载荷
 
-    let count = 0;
-    const others: string[] = [];
-    for (const key of Object.keys(sheets)) {
-        const payload = normalizePayload(sheets[key]);
-        if (key === data.activedSheetName) {
-            count += data.applyScriptWrites(label, payload);
+    for (let i = 0; i < chunks.length; i++) {
+        const parsed = JSON.parse(chunks[i]) as Record<string, unknown>;
+        const sheets = parsed.__sheets__ as Record<string, Record<string, unknown>> | undefined;
+        if (sheets === undefined) {
+            // 旧格式（纯格子载荷）：一律视作当前表
+            if (plain === null) plain = {};
+            for (const name of Object.keys(parsed)) plain[name] = parsed[name];
             continue;
         }
+        for (const key of Object.keys(sheets)) {
+            const target = key === data.activedSheetName ? (mine ??= {}) :
+                (othersPayload.get(key) ?? (othersPayload.set(key, {}), othersPayload.get(key)!));
+            const cells = sheets[key];
+            for (const name of Object.keys(cells)) target[name] = cells[name];
+        }
+    }
+
+    let count = 0;
+    if (plain !== null) count += applyWrites(data, JSON.stringify(plain), label);
+    if (mine !== null) count += data.applyScriptWrites(label, normalizePayload(mine));
+
+    const others: string[] = [];
+    for (const [key, payload] of othersPayload) {
         const target = scratch?.get(key);
         if (target === undefined) continue;      // 没预加载到的表格（理论上不会出现）
-        count += target.applyScriptWrites(`运行 Python 脚本（${key}）`, payload);
+        count += target.applyScriptWrites(`运行 Python 脚本（${key}）`, normalizePayload(payload));
         await target.syncValuesToDB();
         others.push(key);
     }
@@ -1234,6 +1319,83 @@ export interface OpenedSheet {
     styles: Record<string, Record<string, unknown>>;
     /** 单元格名 → 最终显示文本（按 numberFormat 格式化；只收与原文不同的格子） */
     display: Record<string, string>;
+}
+
+/**
+ * 去掉 Python 源码里的注释（换行保留，字符串原样保留）
+ *
+ * 只做「注释掉」这一件事：`#` 到行尾替换为空格，长度与行结构不变（行号仍对得上）。
+ * 字符串内部的 `#` 不能当注释，故需要引号状态机；三引号块跨行，必须一起跟住。
+ * 未闭合的行串在换行处强制收尾（与 Python 的语法错误行为对齐，避免状态泄漏到后续行）。
+ * @param source - 脚本源码
+ * @returns {string} 去掉注释后的源码（与原文等长）
+ */
+function stripPythonComments(source: string): string {
+    const out: string[] = [];
+    let quote: string | null = null;
+    let i = 0;
+    while (i < source.length) {
+        const ch = source[i];
+        if (quote !== null) {
+            if (ch === '\\' && quote.length === 1) {
+                // 转义字符成对跳过（`\"` 不算字符串结束）；越界时只取当前字符
+                out.push(ch, source[i + 1] ?? '');
+                i += 2;
+                continue;
+            }
+            if (quote.length === 3) {
+                if (source.startsWith(quote, i)) {
+                    out.push(quote);
+                    i += 3;
+                    quote = null;
+                    continue;
+                }
+                out.push(ch);
+                i++;
+                continue;
+            }
+            if (ch === quote || ch === '\n') {
+                quote = null;
+            }
+            out.push(ch);
+            i++;
+            continue;
+        }
+        if (ch === '#') {
+            while (i < source.length && source[i] !== '\n') {
+                out.push(' ');
+                i++;
+            }
+            continue;
+        }
+        if (ch === '"' || ch === "'") {
+            quote = source.startsWith(ch.repeat(3), i) ? ch.repeat(3) : ch;
+            out.push(quote);
+            i += quote.length;
+            continue;
+        }
+        out.push(ch);
+        i++;
+    }
+    return out.join('');
+}
+
+/**
+ * 脚本里是否**真的**用到 `files`（工作区文件清单）
+ *
+ * 【为什么要剥注释】以前直接对整段源码做 `/\bfiles\b/` 粗判，而默认脚本模板的
+ * API 清单注释里就写着 `files` —— 于是「新建文件后直接点运行」也会触发
+ * `prepareOpenedSheets(preloadAll)`：把工作区**全部**表格读进内存、逐格快照化，
+ * 大表一多直接把主线程撑爆（见 MEMORY §9 与 OOM 诊断）。
+ * 注释不是代码，出现的 `files` 只是文档，不能作为预加载依据。
+ *
+ * 只剥注释、保留字符串内容：`open_grid("files.xlsx")` 这类字面量仍会被判为命中，
+ * 属于**宁可多预加载**的安全方向；f-string 里的 `{files[0]}` 也因此不会漏判。
+ * @param source - 用户脚本全文
+ * @returns {boolean} true = 需要预加载全部表格
+ */
+export function usesFilesBinding(source: string): boolean {
+    return /\bfiles\b/.test(stripPythonComments(source));
 }
 
 /** `open_grid("路径")` 的字面量形态（单参、纯字符串） */
@@ -1476,26 +1638,31 @@ export function buildMetaJson(meta: ScriptMeta): string {
 export async function prepareOpenedSheets(
     data: DataCollection,
     paths: string[],
-    options?: { keys?: readonly string[]; preloadAll?: boolean }
-): Promise<{ sheets: OpenedSheet[]; scratch: Map<string, DataCollection> }> {
+    options?: { keys?: readonly string[]; preloadAll?: boolean; maxCells?: number }
+): Promise<{ sheets: OpenedSheet[]; scratch: Map<string, DataCollection>; skipped: string[] }> {
     const sheets: OpenedSheet[] = [];
     const scratch = new Map<string, DataCollection>();
+    const skipped: string[] = [];
     const byKey = new Map<string, OpenedSheet>();
     const keys = options?.keys ?? await listArchiveKeys(data);
 
-    // 待装载清单：先按用户写的路径解析，再（脚本用到 files 时）把**所有**表格都排进来
-    const targets: { input: string; key: string }[] = [];
+    // 待装载清单：先按用户写的路径解析，再（脚本用到 files 时）把**所有**表格都排进来。
+    // explicit = 用户在 open_grid("字面量") 里点名的表 —— 不受预算约束，一定装载；
+    // 预加载的批量部分则受 PRELOAD_MAX_CELLS 预算约束（超了就跳过，见下载循环）。
+    const targets: { input: string; key: string; explicit: boolean }[] = [];
     if (options?.preloadAll) {
-        for (let i = 0; i < keys.length; i++) targets.push({ input: keys[i], key: keys[i] });
+        for (let i = 0; i < keys.length; i++) targets.push({ input: keys[i], key: keys[i], explicit: false });
     }
     for (let i = 0; i < paths.length; i++) {
         const key = resolveGridKey(keys, data.activedSheetName, paths[i]);
         if (key === null) continue;          // 解析不到 → 跳过（Python 侧 open_grid 会报错）
-        targets.push({ input: paths[i], key });
+        targets.push({ input: paths[i], key, explicit: true });
     }
 
+    // 预算可注入（单测用）；真实运行取 PRELOAD_MAX_CELLS
+    let budget = options?.maxCells ?? PRELOAD_MAX_CELLS;
     for (let i = 0; i < targets.length; i++) {
-        const { input, key } = targets[i];
+        const { input, key, explicit } = targets[i];
         const aliases = buildAliases(input, key);
 
         // 同一张表的不同写法（"明细.xlsx" 与 "./明细.xlsx"）：只装载一次，别名合并
@@ -1519,8 +1686,24 @@ export async function prepareOpenedSheets(
             sheets.push(sheet);
             continue;
         }
+        // 预算耗尽：不再装载后续的预加载目标（用户点名的 explicit 表除外）。
+        // 不装载的表进 skipped，由调用方在输出面板如实告知 —— open_grid 到它们时
+        // Python 侧会给出「打不开这张表格」的明确报错（清单里没有 = 打不开）。
+        if (!explicit && budget <= 0) {
+            skipped.push(key);
+            continue;
+        }
         const loaded = await DataCollection.loadScratch(key);
         if (loaded === null) continue;       // 该键没有存档（空表 / 读失败）→ 当它不存在
+        // 预算按「非空格子数」记账：先装载才知道大小，装完超限的当场丢弃
+        //（峰值 = 预算内各表 + 一张刚装载的表，不再随工作区表数线性增长）
+        if (!explicit) {
+            budget -= loaded.values.length;
+            if (budget < 0) {
+                skipped.push(key);
+                continue;
+            }
+        }
         const snap = collectSnapshot(loaded);
         const bounds = loaded.getContentBounds();
         scratch.set(key, loaded);
@@ -1532,7 +1715,7 @@ export async function prepareOpenedSheets(
         byKey.set(key, sheet);
         sheets.push(sheet);
     }
-    return { sheets, scratch };
+    return { sheets, scratch, skipped };
 }
 
 /**

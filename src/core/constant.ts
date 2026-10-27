@@ -185,6 +185,7 @@ export const PY_EDITOR_CLASS_NAMES = {   // 定义 Python 编辑器（「脚本�
     HIGHLIGHT: 'py-editor-highlight',
     INPUT: 'py-editor-input',
     OUTPUT: 'py-editor-output',
+    OUTPUT_NOTICE: 'py-editor-output-notice',
     OUTPUT_LINE: 'py-editor-output-line',
     OUTPUT_ERROR: 'py-editor-output-error',
 }

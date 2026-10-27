@@ -31,12 +31,16 @@
  * 反推会失败并抛 `Could not extract indexURL path from pyodide module location`。
  * 这里用 **Worker 脚本自身的 URL** 作为基准算绝对地址，因此部署在任意子路径下都成立。
  *
- * ## 数据传递一律用 JSON 字符串
- *
- * `pyodide.globals.set` 会把 JS 对象包成 `JsProxy`（需要 Python 侧 `.destroy()` 才不泄漏）。
- * 这里把「命名空间源码 + 用户脚本 + 快照」打包成一个 JSON 字符串一次性下发，
- * Python 侧 `json.loads` 展开即可 —— 既避开代理生命周期，也避开「把代码拼进
- * Python 字符串字面量」所需的层层转义。
+ * ## 数据逐字段注入（不整包 JSON）
+
+ * 早期版本把「命名空间源码 + 用户脚本 + 快照」`JSON.stringify` 成一整包
+ * `__ARGS__` 下发、Python 侧 `json.loads` 展开 —— 那会在 worker 的 JS 堆里
+ * 凭空多出一份几十 MB 的拼接串，且 Python 侧「原串 + 解析结果」长期同时驻留。
+ * 现在 {@link runScript} 逐字段 `globals.set`：Pyodide 会把 JS 原始类型
+ * （string / number）转换成对应的 Python 值（不产生 JsProxy），worker 侧零额外拷贝；
+ * Python 侧（见 {@link RUN_PROGRAM}）用完一个字段就 `del` 一个，巨型快照原串
+ * 不会陪你跑完整个脚本。仍以 JSON 字符串形态传递**格子载荷**（snapshotJson 等），
+ * 由命名空间 `_load` 自行解析 —— 避开「把代码拼进 Python 字符串字面量」的转义问题。
  *
  * ## 无法从内部打断
  *
@@ -120,22 +124,48 @@ function getRuntime(): Promise<PyodideAPI> {
 /**
  * 一次运行对应的 Python 程序（固定部分）
  *
- * 末尾把写入结果写进全局 `__RESULT__`，由 JS 侧 `globals.get('__RESULT__')` 取出。
- * 刻意用「赋值给全局再取」而不是「以表达式结尾靠返回值」：前者语义与
- * `runPython` 版本无关，更稳。
+ * 末尾把写入结果（`_dump_chunks` 的分片数组）写进全局 `__RESULT__`，
+ * 由 JS 侧 `globals.get('__RESULT__')` 取出。刻意用「赋值给全局再取」而不是
+ * 「以表达式结尾靠返回值」：前者语义与 `runPython` 版本无关，更稳。
  *
- * 注入的全局变量只有 `__ARGS__`（JSON 字符串），字段见 {@link RunArgs}。
+ * 注入的全局变量逐字段命名（见 {@link runScript}）：快照与样式是**分片**下发的
+ * （`__SNAP_N__` 计数 + `__SNAP_C0__…` 各片、`__STYLES_N__` / `__STYLES_C0__…`），
+ * 这里逐片 `json.loads` 并进结果字典后立刻 `del` 片串 —— 任何时刻堆里最多一片；
+ * 剩余字段用完即 `del`，且这些 `del` 都排在 `_user = dict(globals())` 之前 ——
+ * 否则用户脚本的 globals 快照会把巨型载荷一起抄走。
+ * 字段对应关系：`__NS_ARGS__`（命名空间源码，明文）→ `__SCRIPT__`（用户脚本，明文）→
+ * `__SNAP_*` / `__STYLES_*`（分片 JSON 载荷）→ `__OPENED_JSON__` / `__META_JSON__`
+ * （JSON 载荷，体量受 preloadAll 预算约束，保持单串）→ `__SHEET_NAME__` / `__ROWS__` / `__COLS__`（标量）。
  */
 const RUN_PROGRAM = [
     'import json, sys, types',
-    '_scan = json.loads(__ARGS__)',
+    // 0) 命名空间源码是明文（不经 JSON），取到即摘
+    '_ns_src = __NS_ARGS__',
+    'del __NS_ARGS__',
     // 1) 注册命名空间模块：exec 进一个独立模块字典，再挂到 sys.modules，
     //    用户脚本随后用 `from silkspaces import *` 就能取到 API
     '_mod = types.ModuleType("' + NAMESPACE_MODULE + '")',
-    'exec(compile(_scan["namespace"], "' + NAMESPACE_MODULE + '", "exec"), _mod.__dict__)',
+    'exec(compile(_ns_src, "' + NAMESPACE_MODULE + '", "exec"), _mod.__dict__)',
+    'del _ns_src',
     'sys.modules["' + NAMESPACE_MODULE + '"] = _mod',
-    // 2) 注入工作表快照与表信息（内部接口 _load 见 sheetNameSpace.PY_NAMESPACE_SOURCE）
-    '_mod._load(_scan["snapshotJson"], _scan["stylesJson"], _scan["openedJson"], _scan["sheet"], _scan["rows"], _scan["cols"], _scan["metaJson"])',
+    // 2) 逐片解析快照与样式：每片到手即 update 进结果字典、立刻 del 片串，
+    //    任何时刻堆里最多一片 —— 单条巨型 JSON 串的常驻峰值就此消失。
+    //    _load 直接收已解析的字典（见 sheetNameSpace.PY_NAMESPACE_SOURCE 的 _load）。
+    '_snapshot = {}',
+    '_styles = {}',
+    '_g = globals()',
+    'for _i in range(_g["__SNAP_N__"]):',
+    '    _snapshot.update(json.loads(_g["__SNAP_C%d__" % _i]))',
+    '    del _g["__SNAP_C%d__" % _i]',
+    'del _g["__SNAP_N__"]',
+    'for _i in range(_g["__STYLES_N__"]):',
+    '    _styles.update(json.loads(_g["__STYLES_C%d__" % _i]))',
+    '    del _g["__STYLES_C%d__" % _i]',
+    'del _g["__STYLES_N__"]',
+    'del _g',
+    '_mod._load(_snapshot, _styles, __OPENED_JSON__, __SHEET_NAME__, __ROWS__, __COLS__, __META_JSON__)',
+    //    _load 已把载荷装进命名空间 —— 字典与原串立刻释放，后面几十秒的脚本执行期间不留副本
+    'del _snapshot, _styles, __OPENED_JSON__, __META_JSON__, __SHEET_NAME__, __ROWS__, __COLS__',
     'from ' + NAMESPACE_MODULE + ' import *',
     // 3) 执行用户脚本：独立字典 + __name__='__main__'，使脚本末尾的
     //    `if __name__ == "__main__": main()` 能按预期触发。
@@ -144,59 +174,67 @@ const RUN_PROGRAM = [
     //    （函数体内的赋值本是 STORE_FAST，写进帧的局部数组，任何 globals 钩子
     //    都拦不到 —— 这也是原先只有模块级赋值生效的原因）。
     //    __cells__ 是模块内部名（下划线名不会被 `import *` 带出），故显式注入。
+    //    注意顺序：到这里巨型字段已全部 del，_user 抄不到它们。
     '_user = dict(globals())',
     '_user["__name__"] = "__main__"',
     '_user["__cells__"] = _mod.__cells__',
-    'exec(_mod._compile(_scan["script"], "<script>"), _user)',
-    // 4) 取回写入改动
-    '__RESULT__ = _mod._dump()',
+    'exec(_mod._compile(__SCRIPT__, "<script>"), _user)',
+    'del __SCRIPT__',
+    // 4) 取回写入改动：分片数组（每片 ≤ 4000 格），JSON 序列化成一条后由 JS 侧拆开
+    '__RESULT__ = json.dumps(_mod._dump_chunks())',
 ].join('\n');
 
-/** 注入给 {@link RUN_PROGRAM} 的 `__ARGS__` 字段 */
-interface RunArgs {
-    /** silkspaces 命名空间模块源码 */
-    namespace: string;
-    /** 用户脚本全文 */
-    script: string;
-    /** 工作表快照 JSON（`{"A1": "文本", ...}`） */
-    snapshotJson: string;
-    /** 工作表样式快照 JSON（`{"A1": {"fontColor": "#fff", ...}}`） */
-    stylesJson: string;
-    /** 脚本里 `open_grid()` 引用到的其它表格（JSON 数组，见 sheetNameSpace.buildOpenedJson） */
-    openedJson: string;
-    /** 当前表元信息（maxCol / maxRow / files，见 sheetNameSpace.buildMetaJson） */
-    metaJson: string;
-    /** 当前工作表名 */
-    sheet: string;
-    /** 表格行数 */
-    rows: number;
-    /** 表格列数 */
-    cols: number;
+/**
+ * 把分片载荷逐片注入为独立的全局变量
+ *
+ * 命名规则：`<prefix>N__` = 片数，`<prefix>C0__`、`<prefix>C1__`… = 各片 JSON 串。
+ * 刻意不传 JS 数组（那会包成 JsProxy，还得管 destroy 生命周期）：
+ * 纯字符串全局量与 RUN_PROGRAM 的「逐片 loads → update → del」契约直接对上，
+ * 也让整条链路可以用真实 CPython 做端到端测试。
+ * @param globals - Pyodide 全局命名空间
+ * @param prefix - 变量名前缀（如 `'__SNAP_'`）
+ * @param chunks - JSON 片数组（空数组 → N__ = 0，Python 侧按空字典处理）
+ */
+function setChunked(globals: PyodideAPI['globals'], prefix: string, chunks: string[]): void {
+    globals.set(prefix + 'N__', chunks.length);
+    for (let i = 0; i < chunks.length; i++) globals.set(prefix + 'C' + i + '__', chunks[i]);
 }
 
 /**
  * 执行一次用户脚本
  * @param pyodide - 已就绪的运行时
  * @param request - 主线程下发的运行请求
- * @returns {Promise<string>} 写回改动的 JSON 字符串
+ * @returns {Promise<string>} `_dump_chunks()` 分片数组的 JSON 序列化
  */
 async function runScript(pyodide: PyodideAPI, request: PythonRunRequest): Promise<string> {
     // 输出绑定按当前请求 id 分流：流式回传的多条消息据此归到正确的运行
     pyodide.setStdout({ batched: (text: string) => ctx.postMessage({ id: request.id, type: 'stdout', text }) });
     pyodide.setStderr({ batched: (text: string) => ctx.postMessage({ id: request.id, type: 'stderr', text }) });
 
-    const args: RunArgs = {
-        namespace: request.namespaceSource,
-        script: request.script,
-        snapshotJson: request.snapshotJson,
-        stylesJson: request.stylesJson,
-        openedJson: request.openedJson,
-        metaJson: request.metaJson,
-        sheet: request.sheetName,
-        rows: request.rowCount,
-        cols: request.colCount,
-    };
-    pyodide.globals.set('__ARGS__', JSON.stringify(args));
+    // 逐字段注入（字段对应关系见 RUN_PROGRAM）：Pyodide 把 JS 的 string / number
+    // 原生转换成 Python 值，不产生 JsProxy；对比旧的「整包 JSON.stringify 成 __ARGS__」，
+    // worker 的 JS 堆里不再多拼一份几十 MB 的串。
+    const g = pyodide.globals;
+    g.set('__NS_ARGS__', request.namespaceSource);
+    g.set('__SCRIPT__', request.script);
+    setChunked(g, '__SNAP_', request.snapshotChunks);
+    setChunked(g, '__STYLES_', request.stylesChunks);
+    g.set('__OPENED_JSON__', request.openedJson);
+    g.set('__META_JSON__', request.metaJson);
+    g.set('__SHEET_NAME__', request.sheetName);
+    g.set('__ROWS__', request.rowCount);
+    g.set('__COLS__', request.colCount);
+
+    // 注入完成后消息体就没用了（后面只读 request.id）：立刻摘掉巨型字段。
+    // 不摘的话，postMessage 时 structured clone 出来的这份载荷会以「事件数据」
+    // 的身份在 worker 堆里常驻到整次运行结束。
+    const mutable = request as unknown as Record<string, unknown>;
+    mutable.namespaceSource = undefined;
+    mutable.script = undefined;
+    mutable.snapshotChunks = undefined;
+    mutable.stylesChunks = undefined;
+    mutable.openedJson = undefined;
+    mutable.metaJson = undefined;
 
     await pyodide.runPythonAsync(RUN_PROGRAM);
     return String(pyodide.globals.get('__RESULT__'));
@@ -207,11 +245,19 @@ async function runScript(pyodide: PyodideAPI, request: PythonRunRequest): Promis
  *
  * Python 异常（`PythonError`）的 `message` 里已经带有完整 traceback，
  * 直接原样交给输出面板即可；其余情况退化为 `String(err)`。
+ * 例外：MemoryError 对用户是黑话 —— traceback 满屏看不出重点，
+ * 单独给一句「表格过大 / 分批处理」的人话提示。
  * @param err - 抛出的异常
  * @returns {string} 错误文本
  */
 function errorText(err: unknown): string {
-    if (err instanceof Error && err.message) return err.message;
+    if (err instanceof Error && err.message) {
+        if (err.message.indexOf('MemoryError') >= 0) {
+            return err.message + '\n（Python 运行内存不足：脚本一次操作的表格太大。'
+                + '可改为按行/按块分批处理，或减少本次打开的表格数量后重试。）';
+        }
+        return err.message;
+    }
     return String(err);
 }
 
@@ -221,8 +267,11 @@ ctx.onmessage = (event: MessageEvent<PythonRunRequest>) => {
     void (async () => {
         try {
             const pyodide = await getRuntime();
-            const writesJson = await runScript(pyodide, request);
-            ctx.postMessage({ id: request.id, type: 'result', writesJson });
+            // __RESULT__ 是 _dump_chunks() 分片数组的 JSON 序列化 —— 这里拆成真正的
+            // 片数组再 postMessage：主线程与 worker 都不再出现单条巨型 writesJson
+            const resultJson = await runScript(pyodide, request);
+            const writesChunks = JSON.parse(resultJson) as string[];
+            ctx.postMessage({ id: request.id, type: 'result', writesChunks });
         } catch (err) {
             ctx.postMessage({ id: request.id, type: 'error', message: errorText(err) });
         }

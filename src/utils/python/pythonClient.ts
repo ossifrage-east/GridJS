@@ -50,10 +50,10 @@ export interface PythonRunRequest {
     script: string;
     /** 当前工作表名（注入 Python 命名空间的 `sheet_name`） */
     sheetName: string;
-    /** 当前工作表快照（`{"A1": "文本", ...}` 的 JSON 字符串） */
-    snapshotJson: string;
-    /** 当前工作表样式快照（`{"A1": {"fontColor": "#fff", ...}}`，只含有样式的格子） */
-    stylesJson: string;
+    /** 当前工作表快照（`{"A1": "文本", ...}` 按 4000 格/片切好的 JSON 片数组） */
+    snapshotChunks: string[];
+    /** 当前工作表样式快照（`{"A1": {...}}` 分片，只含有样式的格子） */
+    stylesChunks: string[];
     /** 脚本里 `open_grid()` 引用到的其它表格（JSON 数组） */
     openedJson: string;
     /** 当前表元信息（maxCol / maxRow / files） */
@@ -76,7 +76,7 @@ export interface PythonRunRequest {
 export type PythonWorkerMessage =
     | { id: number; type: 'stdout'; text: string }
     | { id: number; type: 'stderr'; text: string }
-    | { id: number; type: 'result'; writesJson: string }
+    | { id: number; type: 'result'; writesChunks: string[] }
     | { id: number; type: 'error'; message: string };
 
 /**
@@ -112,7 +112,7 @@ let nextRequestId = 1;
 
 /** 在途请求（含本次运行的流式回调） */
 const pending = new Map<number, {
-    resolve: (writesJson: string) => void;
+    resolve: (result: { writesChunks: string[] }) => void;
     reject: (error: Error) => void;
     onStdout?: (text: string) => void;
     onStderr?: (text: string) => void;
@@ -128,10 +128,10 @@ export interface PythonRunOptions {
     script: string;
     /** 当前工作表名 */
     sheetName: string;
-    /** 当前工作表快照 JSON（见 sheetNameSpace.buildSnapshot） */
-    snapshotJson: string;
-    /** 当前工作表样式快照 JSON（见 sheetNameSpace.buildSnapshot 的 stylesJson） */
-    stylesJson: string;
+    /** 当前工作表快照 JSON 分片（见 sheetNameSpace.buildSnapshot 的 jsonChunks） */
+    snapshotChunks: string[];
+    /** 当前工作表样式快照 JSON 分片（见 sheetNameSpace.buildSnapshot 的 stylesChunks） */
+    stylesChunks: string[];
     /** `open_grid()` 引用的其它表格（见 sheetNameSpace.buildOpenedJson） */
     openedJson: string;
     /** 当前表元信息（见 sheetNameSpace.buildMetaJson） */
@@ -154,8 +154,11 @@ export interface PythonRunOptions {
  * 提供这些常量与方法集中在此，避免超时值与诊断文案散落。
  */
 export const PythonClient = {
-    /** 单次运行的超时上限（毫秒）：超过即终止 Worker，避免死循环永久占住资源 */
-    TIMEOUT_MS: 30000,
+    /**
+     * 单次运行的超时上限（毫秒）：超过即终止 Worker，避免死循环永久占住资源。
+     * 大表上「全表逐格读一遍」这类正当脚本就要几十秒，30 秒会误杀 —— 放宽到 2 分钟。
+     */
+    TIMEOUT_MS: 120000,
 } as const;
 
 /**
@@ -226,7 +229,7 @@ function getWorker(): Worker | null {
                 case 'result':
                     pending.delete(message.id);
                     clearTimeout(entry.timer);
-                    entry.resolve(message.writesJson);
+                    entry.resolve({ writesChunks: message.writesChunks });
                     return;
                 case 'error':
                     pending.delete(message.id);
@@ -281,12 +284,12 @@ export function stopPython(): void {
  * 在 Worker 中执行一段 Python 脚本
  *
  * @param options - 运行参数（脚本文本、工作表快照、流式回调等）
- * @returns 本次运行写回工作表的改动（`{"A1": "新值", ...}` 的 JSON 字符串）
+ * @returns 本次运行写回工作表的改动（`{"__sheets__": {...}}` 按 4000 格/片切好的 JSON 片数组）
  * @throws {PythonWorkerUnavailableError} Worker 基础设施不可用（调用方应提示用户检查部署方式）
  * @example
- * const { writesJson } = await runPython({ script, sheetName, snapshotJson, rowCount, colCount, namespaceSource });
+ * const { writesChunks } = await runPython({ script, sheetName, snapshotChunks, rowCount, colCount, namespaceSource });
  */
-export function runPython(options: PythonRunOptions): Promise<{ writesJson: string }> {
+export function runPython(options: PythonRunOptions): Promise<{ writesChunks: string[] }> {
     const w = getWorker();
     if (!w) {
         const reason = unavailableReason || 'Pyodide Worker 不可用';
@@ -301,8 +304,8 @@ export function runPython(options: PythonRunOptions): Promise<{ writesJson: stri
         id,
         script: options.script,
         sheetName: options.sheetName,
-        snapshotJson: options.snapshotJson,
-        stylesJson: options.stylesJson,
+        snapshotChunks: options.snapshotChunks,
+        stylesChunks: options.stylesChunks,
         openedJson: options.openedJson,
         metaJson: options.metaJson,
         rowCount: options.rowCount,
@@ -310,7 +313,7 @@ export function runPython(options: PythonRunOptions): Promise<{ writesJson: stri
         namespaceSource: options.namespaceSource,
     };
 
-    return new Promise<{ writesJson: string }>((resolve, reject) => {
+    return new Promise<{ writesChunks: string[] }>((resolve, reject) => {
         const timer = setTimeout(() => {
             // 超时：与「停止」同路（丢弃 Worker），并给出区别于用户主动停止的文案
             pending.delete(id);
@@ -319,7 +322,7 @@ export function runPython(options: PythonRunOptions): Promise<{ writesJson: stri
         }, PythonClient.TIMEOUT_MS);
 
         pending.set(id, {
-            resolve: (writesJson: string) => resolve({ writesJson }),
+            resolve: (result: { writesChunks: string[] }) => resolve(result),
             reject,
             onStdout: options.onStdout,
             onStderr: options.onStderr,
