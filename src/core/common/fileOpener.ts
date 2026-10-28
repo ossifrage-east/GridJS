@@ -11,7 +11,7 @@ import { Cell } from "../dataArchitecture/cell";
 import { Char } from "../dataArchitecture/char";
 import { ColHeader, RowHeader } from "../dataArchitecture/header";
 import { DataCollection } from "../dataArchitecture/dataCollection";
-import { DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH } from "../constant";
+import { DataEvents, DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH } from "../constant";
 import { toArchiveKey, toNativeFileName } from "../../utils/fileName";
 import { parseWorkbook } from "../../utils/parser/parserClient";
 import type { ExtractedImage } from "../../utils/parser/sheetParser";
@@ -310,6 +310,11 @@ export class FileOpener {
         // 但「打开文件」是会话中途的装载：必须显式补发一次，
         // 否则主页面仍显示上一个文件的内容（画布不会重绘）
         this.data.notifyValuesChanged();
+        // 打开磁盘文件 = 换了一份新文档，脚本不是文件里的内容：既不能沿用上一个活动表
+        // 的脚本（否则编辑器显示别人的文案，一输入还会把它写进这个新文件的存档），
+        // 也不该带着旧表的脚本自动保存。清空并广播，编辑器据此显示以本文件名命名的默认模板。
+        this.data.pyScript = null;
+        this.data.emit(DataEvents.SHEET_SCRIPT_CHANGED, null);
     }
 
     /**

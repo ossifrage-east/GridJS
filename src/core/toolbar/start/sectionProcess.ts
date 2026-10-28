@@ -14,18 +14,33 @@ import { DataCollection } from "../../dataArchitecture/dataCollection";
 import { openFindReplace } from "./searchDialog";
 
 /**
+ * 「计算」菜单项的 todo → 即时计算项名
+ *
+ * 菜单点选后由宿主把对应项名交给选区即时计算模块，使其只在活动格内显示该项。
+ */
+const CALC_ITEM_LABELS: Record<string, string> = {
+    'sum': '求和',
+    'average': '平均',
+    'count': '计数',
+    'max': '最大',
+    'min': '最小',
+};
+
+/**
  * SectionProcess 构造选项接口
  * @interface
  * @property {HTMLElement} [parentElement] - 父元素容器
  * @property {DataCollection} data - 数据集合实例
  * @property {Menu} menu - 菜单实例
  * @property {string} [title] - 工具栏标题
+ * @property {(label: string) => void} [onCalculate] - 点选求和/平均/计数/最大/最小后的回调
  */
 export interface sectionProcessOptions {
     parentElement?: HTMLElement;
     data: DataCollection;
     menu: Menu;
     title?: string;
+    onCalculate?: (label: string) => void;
 }
 
 /**
@@ -42,6 +57,8 @@ export class SectionProcess {
     private menu: Menu;
     /** @type {Record<string, BtnBase | undefined>} 工具栏按钮集合 */
     private toolbars: Record<string, BtnBase | undefined> = {};
+    /** 点选求和/平均/计数/最大/最小后的回调 */
+    private readonly onCalculate?: (label: string) => void;
 
     /**
      * 创建 SectionProcess 实例
@@ -57,6 +74,7 @@ export class SectionProcess {
         }
         this.data = options.data;
         this.menu = options.menu;
+        this.onCalculate = options.onCalculate;
         const line = createDiv({
             className: TOOLBAR_CLASS_NAME.SECTION_LINE, 
         });
@@ -98,7 +116,9 @@ export class SectionProcess {
                     this.menu.openMenu(calculateBtn.getElements().container);
                     this.menu.addMenuElement(calculateBtn.getElements().menuContainer);
                 } else {
-                    
+                    // 点选某一项 → 只在活动格内显示该项的统计结果（底部栏仍显示全部即时值）
+                    const label = CALC_ITEM_LABELS[todo];
+                    if (label) this.onCalculate?.(label);
                 }
             }
         });

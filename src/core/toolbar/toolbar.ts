@@ -26,6 +26,13 @@ export interface ToolbarOptions {
     data: DataCollection;
     menu: Menu;
     onTabContentShow?: (width: number, height: number) => void;
+    /**
+     * 「计算」菜单（求和 / 平均 / 计数 / 最大 / 最小）点选回调
+     *
+     * 由宿主转发给选区即时计算模块，使其只在活动格内显示所点的那一项。
+     * 工具栏构造先于即时计算模块，因此这里用回调而不是实例。
+     */
+    onCalculate?: (label: string) => void;
 }
 
 /** 分区描述：元素 + 菜单里显示的名字（紧凑模式下作为「一级菜单」的标签） */
@@ -79,12 +86,15 @@ export class Toolbar extends EventEmitter {
     private rootCompact: boolean = false;
     /** 分类清单浮层是否展开 */
     private rootOpen: boolean = false;
+    /** 「计算」菜单点选回调（转给数据处理分区） */
+    private readonly onCalculate?: (label: string) => void;
 
     constructor(options: ToolbarOptions) {
         super();
         if (options.onTabContentShow) {
             this.on('tabContentShow', options.onTabContentShow);
         }
+        this.onCalculate = options.onCalculate;
         this.container = createDiv({className: TOOLBAR_CLASS_NAME.CONTAINER});
         options.parentElement.appendChild(this.container);
 
@@ -126,7 +136,8 @@ export class Toolbar extends EventEmitter {
         const sectionProcess = new SectionProcess({  // 数据处理分区
             data: this.data,
             menu: this.menu,
-            title: '数据处理'
+            title: '数据处理',
+            onCalculate: this.onCalculate,
         });
         
         const sectionAlign = new SectionAlign({  // 对齐方式分区

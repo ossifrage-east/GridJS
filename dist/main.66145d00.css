@@ -2293,6 +2293,54 @@ div {
   position: absolute;
   z-index: 4;
   bottom: 0;
+  /* 选区即时计算栏（求和 / 平均 / 计数 / 最大 / 最小），挂在左侧分栏内部 */
+}
+.sheets #bottomTools .selection-calc {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  gap: 14px;
+  height: 100%;
+  padding: 0 8px;
+  box-sizing: border-box;
+  font-size: 13px; /* 比默认栏内文字大 2px（原 11px） */
+  color: #444;
+  white-space: nowrap;
+  overflow: hidden;
+  -webkit-user-select: none;
+      -ms-user-select: none;
+          user-select: none;
+  /* 单项 = 项名 + 值：项名只作标识（不可点、不参与复制） */
+}
+.sheets #bottomTools .selection-calc__item {
+  display: -webkit-inline-box;
+  display: -webkit-inline-flex;
+  display: -ms-inline-flexbox;
+  display: inline-flex;
+  -webkit-box-align: baseline;
+  -webkit-align-items: baseline;
+      -ms-flex-align: baseline;
+          align-items: baseline;
+  gap: 4px;
+}
+.sheets #bottomTools .selection-calc__label {
+  color: #444;
+}
+.sheets #bottomTools .selection-calc {
+  /* 值：只有鼠标移到值上才变色，也只有值可点击复制 */
+}
+.sheets #bottomTools .selection-calc__value {
+  cursor: pointer;
+  -webkit-transition: color 0.12s;
+  transition: color 0.12s;
+}
+.sheets #bottomTools .selection-calc__value:hover {
+  color: #1a73e8;
 }
 .sheets #rightTools {
   width: 26px;

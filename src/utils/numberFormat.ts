@@ -274,11 +274,12 @@ export function isDateTimeCode(code: string): boolean {
  * 3. 中文格式 '2026年10月10日' / '2026年10月10日 14:30'（正则提取 y/m/d/h/m/s）
  * 4. 均失败 → 返回 null
  *
+ * 选区即时计算复用本方法：日期 / 时间单元格按其底层序列号参与聚合。
+ *
  * @param rawText - 单元格原始文本
  * @returns 解析后的 Date，或 null（解析失败）
- * @private
  */
-function parseDateValue(rawText: string): Date | null {
+export function parseDateValue(rawText: string): Date | null {
     const trimmed = rawText.trim();
 
     // 纯数字 → Excel 序列号

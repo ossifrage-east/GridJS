@@ -326,6 +326,8 @@ enum SheetProperty {
      *  供依赖 ACTIVED_CELL_CHANGED 等差量事件刷新外观的分区（工具栏按钮等）
      *  在回写未触发差量事件（如活动单元格未变化）时也能同步状态 */
     SNAPSHOT_RESTORED = 'sheet:snapshot:restored',
+    /** 工作表装载后广播其 Python 脚本内容（无脚本时为 null），Python 编辑器据此切换显示 */
+    SHEET_SCRIPT_CHANGED = 'sheet:script:changed',
 }
 
 enum VisibleViewProperty {

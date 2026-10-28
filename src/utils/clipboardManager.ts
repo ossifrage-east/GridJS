@@ -88,6 +88,17 @@ export class ClipboardManager {
     }
 
     /**
+     * 只更新内部剪贴板，不写系统剪贴板
+     *
+     * 供「点击即时值复制」这类已经自行写入系统剪贴板的场景使用：内部剪贴板一并
+     * 更新后，表格自己的 Ctrl+V / 菜单粘贴才能落到格子里。
+     * @param {ClipboardData} data - 剪贴板数据
+     */
+    public setInternalClipboard(data: ClipboardData): void {
+        this.clipboard = data;
+    }
+
+    /**
      * 检查剪贴板是否有数据
      * @returns {boolean} 是否有数据
      */

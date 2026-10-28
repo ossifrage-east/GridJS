@@ -5,7 +5,7 @@
     # CSDN: https://blog.csdn.net/os373
 */
 
-import { CELL_PADDING, DEFAULT_ANCHOR_SELECTED_BORDER_COLOR, DEFAULT_CELL_BG_COLOR, DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, DEFAULT_FONT_FAMILY,
+import { CELL_PADDING, DEFAULT_ANCHOR_SELECTED_BORDER_COLOR, DEFAULT_CELL_BG_COLOR, DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH,
     DEFAULT_FONT_SIZE, DEFAULT_SELECTED_BG_COLOR, DEFAULT_SELECTED_BORDER_COLOR, DEFAULT_SELECTED_BORDER_WIDTH, GRID_LINE_COLOR,
     HEADER_BG_COLOR, TEXT_COLOR, DataEvents,
     SHEETS_NAME,
@@ -882,6 +882,15 @@ export class SheetCanvas extends Canvas {
         const { offsetX, offsetY } = e;
         const { location, col, row } = this.data.getSheetCell(offsetX, offsetY);
         this.data.startLocation = location;
+        // Shift + 左键：活动格保持为锚点，选区从活动格延伸到点击处
+        // （活动格 B2 时 Shift 点 G10 → 选区 B2:G10，活动格仍是 B2）。
+        // 走 setSelection 复用「以活动格为起点 + 合并区域扩张」的既有语义；
+        // 不设 activedCell，后续拖拽也仍以原活动格为起点。
+        if (e.shiftKey && location === MouseLocation.IN_CELL) {
+            this.data.setSelection(MouseLocation.IN_CELL, col, row);
+            this.scrollCellIntoView(col, row);
+            return;
+        }
         if (this.data.startLocation === MouseLocation.IN_ANCHOR) {
             this.data.anchorSelection = this.data.selection;
             this.drawAnchorSelcetedRect();

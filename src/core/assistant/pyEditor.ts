@@ -142,10 +142,6 @@ export class PYEditor {
     private readonly db: IndexDB;
     /** 当前行号栏渲染的行数（行数未变时跳过重排） */
     private gutterLineCount = 0;
-    /** 防抖保存定时器 */
-    private saveTimer: ReturnType<typeof setTimeout> | null = null;
-    /** 用户是否已产生输入（restore 异步返回时不覆盖用户新输入） */
-    private dirty = false;
     /**
      * 文本宽度测量上下文（鼠标坐标换算为文本偏移时用）
      *
@@ -159,10 +155,13 @@ export class PYEditor {
     /** 按下后是否发生过拖动（拖则自实现选区延伸，未拖则收拢为点击处光标） */
     private isDragSelecting = false;
 
-    /** 脚本内容在 IndexedDB 设置表中的键前缀（完整键 = 前缀 + 工作表名） */
-    private static readonly STORAGE_KEY_PREFIX = 'py-editor:script:';
-    /** 内容变化后写入 IndexedDB 的防抖窗口（毫秒） */
-    private static readonly SAVE_DEBOUNCE_MS = 400;
+    /**
+     * 旧版脚本在 settings 表中的键前缀（完整键 = 前缀 + 工作表名）
+     *
+     * 仅用于把历史存档搬进表格的 Value 记录（{@link migrateLegacySettings}），
+     * 新版脚本一律存进表格存档，不再使用这个前缀。
+     */
+    private static readonly LEGACY_SETTINGS_PREFIX = 'py-editor:script:';
     /** 一级缩进（4 空格，PEP 8） */
     private static readonly INDENT = '    ';
     /**
@@ -199,21 +198,13 @@ export class PYEditor {
     ].join('\n');
 
     /**
-     * 旧默认存档迁移的共享 Promise（null = 尚未开始 / 上次迁移失败可重试）
-     *
-     * 构造与切换工作表各会触发一次 {@link restore}，两处都必须在读取存档前等迁移
-     * 完成，用同一个 Promise 保证全库只扫一次、且后发者能等到先发者的结果。
-     */
-    private static legacyMigration: Promise<void> | null = null;
-
-    /**
      * 生成「该文件尚无存档」时的默认脚本内容
      *
      * 首行注释带上这个文件的名字，使用户一眼看清「这段脚本属于哪个文件」：
      * 每个文件各有自己的脚本，若默认模板对所有文件都是同一句固定标题，
      * 无存档的新文件之间就无法区分。名字取
-     * {@link DataCollection.activedSheetName}（它同时是该文件脚本的存储键，
-     * 故注释与存档键天然一致）。
+     * {@link DataCollection.activedSheetName}（脚本就存在该表的 Value 记录里，
+     * 故注释与归属天然一致）。
      *
      * 注释里同时列出读写当前工作表可用的 API：脚本页签里没有别的文档入口，
      * 把 API 清单放在「新建文件时第一眼看到的地方」是唯一不增加界面的做法。
@@ -334,13 +325,14 @@ export class PYEditor {
         this.container.append(toolbar, body, this.output);
 
         this.bindEvents();
-        this.setValue(PYEditor.defaultScript(this.data.activedSheetName));
-        // 异步恢复当前工作表上次的脚本；期间若用户已开始输入，以用户内容为准（见 restore）
-        void this.restore();
-        // 工作表切换：先落盘旧表脚本，再载入新表脚本（事件参数为 (旧名, 新名)，见 updateProperty）
-        this.data.on(DataEvents.ACTIVED_SHEET_NAME_CHANGED, (oldName: string, newName: string) => {
-            this.handleSheetChanged(oldName, newName);
+        // 当前表可能已经装载完毕：直接取其脚本；装载尚未完成时随后由 SHEET_SCRIPT_CHANGED 补上
+        this.setValue(this.data.pyScript ?? PYEditor.defaultScript(this.data.activedSheetName));
+        // 脚本随表格存档装载（切换 / 打开 / 清空文件）后广播，编辑器据此切换到该表的脚本
+        this.data.on(DataEvents.SHEET_SCRIPT_CHANGED, (script: string | null) => {
+            this.handleScriptLoaded(script);
         });
+        // 旧版把脚本存在 settings（键含表名）：一次性搬进对应表格的存档
+        void this.migrateLegacySettings();
     }
 
     /**
@@ -604,9 +596,8 @@ export class PYEditor {
             }
         });
         this.textarea.addEventListener('input', () => {
-            this.dirty = true;
             this.refresh();
-            this.persistDebounced();
+            this.persist();
         });
         // textarea 是唯一滚动容器：高亮层与行号栏跟随其滚动位置
         this.textarea.addEventListener('scroll', () => this.syncScroll());
@@ -892,7 +883,7 @@ export class PYEditor {
             ta.selectionStart = ta.selectionEnd = selectionStart - removedBeforeCursor;
         }
         this.refresh();
-        this.persistDebounced();
+        this.persist();
     }
 
     /**
@@ -929,110 +920,78 @@ export class PYEditor {
             ta.selectionStart = ta.selectionEnd = start + text.length;
         }
         this.refresh();
-        this.persistDebounced();
+        this.persist();
     }
 
     /**
-     * 当前工作表对应的存储键；未打开文件（无名表）时返回 null，不持久化
-     * @param sheetName - 工作表名，默认取当前活动表
-     * @returns 完整存储键，或 null
-     * @private
-     */
-    private storageKey(sheetName: string = this.data.activedSheetName): string | null {
-        return sheetName ? `${PYEditor.STORAGE_KEY_PREFIX}${sheetName}` : null;
-    }
-
-    /**
-     * 工作表切换：先把当前脚本立即写入旧表的键（清掉挂起的防抖），再载入新表的脚本
+     * 把编辑器内容写进「当前表格」的存档字段
      *
-     * 挂起的防抖若不清掉，会在 400ms 后把「新表的初始内容」写进「新表的键」之前，
-     * 先把「旧表的内容」错误地写进「新表的键」（防抖触发时 activedSheetName 已是新表）。
-     * @param oldName - 切换前的工作表名
-     * @param newName - 切换后的工作表名（新表尚无存档时的默认脚本要以它命名首行）
+     * 脚本属于文件内容：写进 {@link DataCollection.pyScript}，随后由数据层
+     * 的自动保存一并落到该表的 Value 记录（`py-editor:script` 字段）。
+     * 未打开文件时没有归属，不写 —— 否则会把这段内容带进随后打开的文件。
      * @private
      */
-    private handleSheetChanged(oldName: string, newName: string): void {
-        if (this.saveTimer !== null) { clearTimeout(this.saveTimer); this.saveTimer = null; }
-        const oldKey = this.storageKey(oldName);
-        if (oldKey) {
-            this.db.setSetting(oldKey, this.textarea.value, 'py-editor').catch(() => {});
-        }
-        this.dirty = false;
-        // 新表无存档时展示它自己的默认模板（首行为新表名）；有存档则由 restore 覆盖
-        this.setValue(PYEditor.defaultScript(newName));
-        void this.restore();
+    private persist(): void {
+        if (!this.data.activedSheetName) return;
+        this.data.pyScript = this.textarea.value;
     }
 
     /**
-     * 内容变化后防抖写入 IndexedDB
-     * @private
-     */
-    private persistDebounced(): void {
-        const key = this.storageKey();
-        if (!key) return;
-        if (this.saveTimer !== null) clearTimeout(this.saveTimer);
-        this.saveTimer = setTimeout(() => {
-            this.saveTimer = null;
-            this.db.setSetting(key, this.textarea.value, 'py-editor').catch(() => {
-                // 持久化失败不影响编辑（下次变化会再次尝试）
-            });
-        }, PYEditor.SAVE_DEBOUNCE_MS);
-    }
-
-    /**
-     * 迁移「内容与旧版默认模板完全一致」的历史脚本存档（全库只扫一次）
+     * 表格装载完成：显示该表存档里的脚本
      *
-     * 需求改为「首行标题取文件名」后，从未编辑过的历史存档首行仍是固定标题
-     * `# SilkSpaces Python 脚本`，会被「已有存档优先」的 {@link restore} 原样载入，
-     * 使文件名对应的新标题体现不出来。这里把这些存档的首行重写为
-     * `# <文件名> Python 脚本`；判定用**逐字符相等**，用户真实编写过的内容不会被误改。
-     * @returns 迁移完成的 Promise（共享，见 {@link PYEditor.legacyMigration}）
+     * 无脚本（新文件 / 从未编辑）时显示以该表名命名的默认模板。
+     * @param script - 存档里的脚本；null 表示该表还没有脚本
      * @private
      */
-    private migrateLegacyDefaults(): Promise<void> {
-        if (!PYEditor.legacyMigration) {
-            PYEditor.legacyMigration = this.runLegacyMigration().catch(() => {
-                // 迁移失败不阻断编辑；置回 null，下次 restore 时再试
-                PYEditor.legacyMigration = null;
-            });
-        }
-        return PYEditor.legacyMigration;
+    private handleScriptLoaded(script: string | null): void {
+        this.setValue(script ?? PYEditor.defaultScript(this.data.activedSheetName));
     }
 
     /**
-     * 实际执行历史存档迁移：扫描 settings 中所有 `py-editor:script:*` 键
-     * @private
-     */
-    private async runLegacyMigration(): Promise<void> {
-        const all = await this.db.getAllSettings();
-        for (const [key, value] of Object.entries(all)) {
-            if (!key.startsWith(PYEditor.STORAGE_KEY_PREFIX)) continue;
-            if (value !== PYEditor.LEGACY_DEFAULT_SCRIPT) continue;
-            const name = key.slice(PYEditor.STORAGE_KEY_PREFIX.length);
-            await this.db.setSetting(key, PYEditor.defaultScript(name), 'py-editor');
-        }
-    }
-
-    /**
-     * 从 IndexedDB 恢复上次的脚本内容
+     * 把旧版存在 settings 里的脚本一次性搬进对应表格的 Value 记录（全库只扫一次）
      *
-     * 恢复是异步的：等待期间用户可能已经开始输入（`dirty` 置位），
-     * 此时以用户内容为准，不再用存档覆盖。
+     * 旧版以 `py-editor:script:<表名>` 为键写进 settings；新版脚本属于表格存档
+     * （见 {@link SheetSnapshotV4} 的 `py-editor:script`）。这里按表名找到对应
+     * 的 Value 记录、补上脚本字段并删除旧键，升级后脚本不丢、settings 里也
+     * 不再残留脚本数据。
+     *
+     * 只处理 v4 存档：v3 存档是一根字符串，无法就地加字段（这类表极少，
+     * 且旧键保留可避免内容被误删）。旧版同一份固定标题模板在此顺带改写为
+     * 「<表名> Python 脚本」，与新建文件时的默认模板保持一致。
      * @private
      */
-    private async restore(): Promise<void> {
-        const key = this.storageKey();
-        if (!key) return;
+    private async migrateLegacySettings(): Promise<void> {
         try {
-            // 先迁移历史默认存档：否则旧模板会盖住文件名对应的新标题
-            await this.migrateLegacyDefaults();
-            const saved = await this.db.getSetting(key);
-            if (this.dirty) return;
-            if (typeof saved === 'string' && saved !== '') {
-                this.setValue(saved);
+            const all = await this.db.getAllSettings();
+            for (const [key, saved] of Object.entries(all)) {
+                if (!key.startsWith(PYEditor.LEGACY_SETTINGS_PREFIX)) continue;
+                if (typeof saved !== 'string' || saved === '') {
+                    await this.db.deleteSetting(key);
+                    continue;
+                }
+                const name = key.slice(PYEditor.LEGACY_SETTINGS_PREFIX.length);
+                const script = saved === PYEditor.LEGACY_DEFAULT_SCRIPT
+                    ? PYEditor.defaultScript(name) : saved;
+                const record = await this.db.getValue(name);
+                // 没有该文件的存档（文件已删除）时旧键直接清掉
+                if (record === undefined || record === null || record === '{}') {
+                    await this.db.deleteSetting(key);
+                    continue;
+                }
+                if (!DataCollection.isV4Snapshot(record)) continue;
+                // 新存档里已有脚本时以新存档为准，只清旧键
+                if (typeof record['py-editor:script'] !== 'string') {
+                    record['py-editor:script'] = script;
+                    await this.db.setValue(name, record);
+                    if (name === this.data.activedSheetName && this.data.pyScript === null) {
+                        // 当前表：同步进内存，编辑器立刻显示搬过来的脚本
+                        this.data.pyScript = script;
+                    }
+                }
+                await this.db.deleteSetting(key);
             }
         } catch {
-            // IndexedDB 不可用时保留默认示例脚本
+            // 迁移失败不影响编辑：旧键还在，下次启动会再试
         }
     }
 }

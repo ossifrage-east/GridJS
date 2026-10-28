@@ -180,6 +180,14 @@ export interface SheetSnapshotV4 {
     chunks: string[];
     /** 样式表（`CellStyleTable.entries`） */
     styles: Array<Record<string, unknown>>;
+    /**
+     * 本表的 Python 编辑器脚本
+     *
+     * 键名沿用编辑器侧的约定（`py-editor:script`）：脚本属于**文件内容**，
+     * 存在本表的 Value 记录里而不是 settings —— 重命名 / 复制 / 删除文件时
+     * 跟着文件走，也不必再拼「表名」当键。未编写过脚本时缺省（不落库）。
+     */
+    'py-editor:script'?: string;
 }
 
 /**
@@ -207,6 +215,13 @@ export class DataCollection extends EventEmitter {
     rowHeaders: RowHeaders;
     /** 当前工作表sheet，所有有内容的JSON字符串（内部后备字段，统一通过 values getter/setter 访问） */
     private _values: Cell[] = [];
+    /**
+     * 本表 Python 编辑器脚本（未编写过为 null）
+     *
+     * 与其它元信息一样随快照落库（见 {@link SheetSnapshotV4} 的 `py-editor:script`），
+     * 不单独写 settings。
+     */
+    private _pyScript: string | null = null;
     /**
      * 稀疏单元格索引：单元格名 → Cell。
      *
@@ -707,7 +722,10 @@ export class DataCollection extends EventEmitter {
         this.zoom = data.zoom;
         // 打印设置统一入口随文档恢复（未保存过时保持接口默认值）
         this._printSetting = data.printSetting || {};
+        this._pyScript = data.pyScript;
         this.values = data.values;
+        // 脚本随文档装载：编辑器在初始化之后才创建，靠事件让它显示新表的脚本
+        this.emit(DataEvents.SHEET_SCRIPT_CHANGED, this._pyScript);
     }
 
     /**
@@ -989,8 +1007,11 @@ export class DataCollection extends EventEmitter {
         // 读出 undefined（Cannot read properties of undefined (reading 'isHidden')）
         this.rowHeaders.offsetHeight = 0;
         this.colHeaders.offsetWidth = 0;
+        // 切换/新建文件时脚本跟着文件走：旧文件的脚本文本不能留在新文件里
+        this._pyScript = null;
         // values setter 会广播 VALUES_CHANGED → 主页面重绘为空表
         this.values = [];
+        this.emit(DataEvents.SHEET_SCRIPT_CHANGED, null);
     }
     
     /**
@@ -1048,6 +1069,28 @@ export class DataCollection extends EventEmitter {
      */
     set activedSheetName(value: string) {
         this.updateProperty(DataEvents.ACTIVED_SHEET_NAME_CHANGED, '_activedSheetName', value);
+    }
+
+    /**
+     * 获取当前工作表的 Python 脚本（没有编写过时为 null）
+     * @returns {string | null} 脚本文本
+     */
+    get pyScript(): string | null {
+        return this._pyScript;
+    }
+
+    /**
+     * 设置当前工作表的 Python 脚本
+     *
+     * 脚本属于存档内容：赋值即标记脏，随后由自动保存写进本表的 Value 记录。
+     * 与单元格改动一样，未打开文件（无存档键）时只留在内存，不会凭空造出存档。
+     * @param {string | null} value - 脚本文本
+     */
+    set pyScript(value: string | null) {
+        const next = value ?? null;
+        if (next === this._pyScript) return;
+        this._pyScript = next;
+        this._markDirty();
     }
 
     /**
@@ -7688,6 +7731,8 @@ export class DataCollection extends EventEmitter {
             offsetHeight: this.rowHeaders.offsetHeight,
             cols: encodeColAxis(this.colHeaders.colHeaders),
             rows: encodeRowAxis(this.rowHeaders.rowHeaders),
+            // 未编写过脚本时不落字段：空白存档不必多背一个空串
+            ...(this._pyScript !== null ? { 'py-editor:script': this._pyScript } : {}),
         };
     }
 
@@ -7769,6 +7814,8 @@ export class DataCollection extends EventEmitter {
         snapshot.chunks = [];
         // 内容清空后样式表随之作废（留着只会让每个空白存档多背一份无用数据）
         snapshot.styles = [];
+        // 空白存档对应「新文件」：不能把当前表的脚本带进去
+        delete snapshot['py-editor:script'];
         return snapshot;
     }
 
@@ -7837,6 +7884,7 @@ export class DataCollection extends EventEmitter {
             offsetHeight: raw.offsetHeight,
             showGridLines: raw.showGridLines,
             zoom: raw.zoom,
+            'py-editor:script': raw['py-editor:script'],
         }, values);
     }
 
@@ -7861,7 +7909,8 @@ export class DataCollection extends EventEmitter {
         allRowHeight: number,
         showGridLines: boolean,
         zoom: number,
-        values: Cell[]} {
+        values: Cell[],
+        pyScript: string | null} {
         const parsed = JSON.parse(json);
         const rawValues: any[] = parsed.values || [];
         const values: Cell[] = new Array(rawValues.length);
@@ -7894,7 +7943,8 @@ export class DataCollection extends EventEmitter {
         allRowHeight: number,
         showGridLines: boolean,
         zoom: number,
-        values: Cell[]}> {
+        values: Cell[],
+        pyScript: string | null}> {
         const parsed = JSON.parse(json);
         const rawValues: any[] = parsed.values || [];
         const values: Cell[] = new Array(rawValues.length);
@@ -7961,7 +8011,8 @@ export class DataCollection extends EventEmitter {
         allRowHeight: number,
         showGridLines: boolean,
         zoom: number,
-        values: Cell[]} {
+        values: Cell[],
+        pyScript: string | null} {
         return {
             activedCell: parsed.activedCell || 'A1',
             selection: parsed.selection || `${parsed.activedCell || 'A1'}:${parsed.activedCell || 'A1'}`,
@@ -7974,7 +8025,9 @@ export class DataCollection extends EventEmitter {
             allRowHeight: parsed.allRowHeight || 0,
             showGridLines: parsed.showGridLines || true,
             zoom: parsed.zoom || 1,
-            values
+            values,
+            // 脚本字段名由编辑器侧约定，缺失 / 类型不对一律按「没有脚本」处理
+            pyScript: typeof parsed['py-editor:script'] === 'string' ? parsed['py-editor:script'] : null,
         }
     }
 

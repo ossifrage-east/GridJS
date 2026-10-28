@@ -313,8 +313,16 @@ export class FileTree {
     private readonly options: FileTreeOptions;
     /** 根节点视图集合 */
     private rootViews: TreeNodeView[] = [];
-    /** 当前选中节点 */
+    /** 当前选中节点（Shift 连选时为主操作对象，即最后点击的那个） */
     private selected: TreeNodeView | null = null;
+    /**
+     * Shift 连选的锚点（上一次**单击**选中的节点）
+     *
+     * 连选期间保持不变，因此连续 Shift 点击可反复调整选区另一端（与桌面文件管理器一致）。
+     */
+    private selectionAnchor: TreeNodeView | null = null;
+    /** 当前所有高亮行：单选 1 个，Shift 连选为区间内的全部可见行 */
+    private readonly highlighted = new Set<TreeNodeView>();
     /** 当前搜索关键字（小写，空串表示未搜索） */
     private keyword = '';
     /** 定位闪烁定时器 */
@@ -610,7 +618,7 @@ export class FileTree {
         // 否则搜索过滤、展开收起与名称去重都会漏掉该节点
         if (parent) parent.children.push(view);
 
-        row.addEventListener('click', () => this.handleRowClick(view));
+        row.addEventListener('click', (e: MouseEvent) => this.handleRowClick(e, view));
         // 双击文件节点：由外部把该文件内容装载到主页面（传**路径**，即存档键的来源）
         // （文件夹不处理：展开 / 收起已由单击负责，双击会连点两次反而相互抵消）
         row.addEventListener('dblclick', () => {
@@ -817,10 +825,19 @@ export class FileTree {
 
     /**
      * 行点击：选中节点；文件夹同时切换展开 / 收起
+     *
+     * Shift + 左键为**连选**：从上次单击的节点（锚点）到本次点击的节点，
+     * 区间内所有**可见**行一并高亮（用于表示多个文件被选中），
+     * 且不改变展开状态 —— Shift 点文件夹只是把它并入选区，不应顺带收起。
      * @private
+     * @param {MouseEvent} e - 点击事件（取 shiftKey）
      * @param {TreeNodeView} view - 被点击的节点
      */
-    private handleRowClick(view: TreeNodeView): void {
+    private handleRowClick(e: MouseEvent, view: TreeNodeView): void {
+        if (e.shiftKey && this.selectionAnchor && this.highlighted.size > 0) {
+            this.selectRange(this.selectionAnchor, view);
+            return;
+        }
         this.select(view);
         if (view.isFolder) {
             this.setOpen(view, !view.isOpen);
@@ -1484,6 +1501,10 @@ export class FileTree {
             this.collectFilePaths(view, paths);
             if (siblings) siblings.splice(index, 1);
             if (this.selected === view) this.selected = null;
+            // 连选锚点 / 高亮集合也要同步摘除：节点已销毁，留着会在下次 Shift 点击时
+            // 用 indexOf 找不到锚点（正确退化），高亮集合里则是永久泄漏的死引用
+            if (this.selectionAnchor === view) this.selectionAnchor = null;
+            this.highlighted.delete(view);
             if (this.renaming?.view === view) this.renaming = null;
             view.el.remove();
             removed = true;
@@ -1508,19 +1529,79 @@ export class FileTree {
     }
 
     /**
-     * 选中节点
+     * 选中节点（单选：清掉此前的范围选区）
      * @private
      * @param {TreeNodeView | null} view - 目标节点
      */
     private select(view: TreeNodeView | null): void {
-        if (this.selected === view) return;
-        if (this.selected) {
-            this.selected.row.classList.remove(TREE.SELECTED);
-        }
+        if (this.selected === view && this.highlighted.size === (view ? 1 : 0)) return;
+        this.clearHighlight();
         this.selected = view;
+        this.selectionAnchor = view;
         if (view) {
             view.row.classList.add(TREE.SELECTED);
+            this.highlighted.add(view);
         }
+    }
+
+    /**
+     * Shift 连选：把锚点到目标节点之间**全部可见行**标记为选中
+     *
+     * 只取可见行（搜索过滤掉的行、折叠文件夹内部的行都不参与），
+     * 因为「背景色变化」表达的正是「用户当前看得见的这些文件被选中」。
+     * 锚点保持不变，主操作对象（{@link selected}）更新为本次点击的节点，
+     * 与桌面文件管理器的连选语义一致。
+     * @private
+     * @param {TreeNodeView} from - 锚点节点（上次单击处）
+     * @param {TreeNodeView} to - 本次点击的节点
+     */
+    private selectRange(from: TreeNodeView, to: TreeNodeView): void {
+        const rows = this.visibleRows();
+        const startIndex = rows.indexOf(from);
+        const endIndex = rows.indexOf(to);
+        // 锚点已不可见（被过滤 / 折叠 / 删除）时退化为单选，避免选中一片看不见的节点
+        if (startIndex < 0 || endIndex < 0) {
+            this.select(to);
+            return;
+        }
+        this.clearHighlight();
+        const first = Math.min(startIndex, endIndex);
+        const last = Math.max(startIndex, endIndex);
+        for (let i = first; i <= last; i++) {
+            rows[i].row.classList.add(TREE.SELECTED);
+            this.highlighted.add(rows[i]);
+        }
+        // 锚点保持不动；主操作对象改为被点节点
+        this.selected = to;
+    }
+
+    /**
+     * 清空所有行的高亮（不动锚点）
+     * @private
+     */
+    private clearHighlight(): void {
+        this.highlighted.forEach((view) => view.row.classList.remove(TREE.SELECTED));
+        this.highlighted.clear();
+        this.selected = null;
+    }
+
+    /**
+     * 按先序收集当前**可见**的行
+     *
+     * 可见性判定用 `offsetParent`：搜索过滤（`hidden` 属性）与折叠文件夹
+     * （`childrenBox.hidden`）都会让行脱离布局，无需为两条路径各写一遍判断。
+     * @private
+     * @returns {TreeNodeView[]} 可见行（文档顺序）
+     */
+    private visibleRows(): TreeNodeView[] {
+        const rows: TreeNodeView[] = [];
+        const walk = (view: TreeNodeView): void => {
+            if (view.el.hidden || view.row.offsetParent === null) return;
+            rows.push(view);
+            view.children.forEach(walk);
+        };
+        this.rootViews.forEach(walk);
+        return rows;
     }
 
     /**
@@ -2006,6 +2087,8 @@ export class FileTree {
             window.clearTimeout(this.flashTimer);
             this.flashTimer = null;
         }
+        this.highlighted.clear();
+        this.selectionAnchor = null;
         this.selected = null;
         this.rootViews = [];
         this.container.remove();

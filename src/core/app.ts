@@ -33,6 +33,7 @@ import { FileTree, FileNode, FileMovePlan } from "./common/fileTree";
 import { FileOpener } from "./common/fileOpener";
 import { PYEditor } from "./assistant/pyEditor";
 import { Sheets } from "./sheets/sheets";
+import { SelectionCalc } from "./sheets/selectionCalc";
 import { DataCollection } from "./dataArchitecture/dataCollection";
 import { IndexDB } from "./dataArchitecture/indexDB";
 import { Scroller } from "./common/scroller";
@@ -102,6 +103,13 @@ export class App {
     private fileTree!: FileTree;
     private fileOpener!: FileOpener;
     private pyEditor!: PYEditor;
+    /**
+     * 选区即时计算模块（底部栏即时值 + 活动格内统计）
+     *
+     * 工具栏先于本模块创建，因此 {@link initToolbar} 用 `onCalculate` 回调
+     * 延迟取用这个实例（点击菜单时才真正访问）。
+     */
+    private selectionCalc: SelectionCalc | null = null;
 
     /**
      * 打开历史（文件**路径**，越靠前越近）
@@ -141,6 +149,7 @@ export class App {
         this.initToolbar();
         this.initSheets();
         this.initbottomToolsSplit();
+        this.initSelectionCalc();   // 依赖 bottomToolsSplit 的 split-pre，必须在其之后
         this.initRightToolsSplit();
         this.initScroller();
         this.setupDataListeners();
@@ -183,7 +192,9 @@ export class App {
                 const rect = this.sheets.getElements().sheets.parentElement.getBoundingClientRect();
                 // this.sheets.getElements().sheets.style.width = `${rect.width - width}px`;
                 this.sheets.getElements().sheets.style.height = `${rect.height - height}px`;
-            }
+            },
+            // 计算菜单点选 → 把该项结果写入空白的活动单元格（实例稍后创建，回调按需取用）
+            onCalculate: (label: string) => this.selectionCalc?.applyToActivedCell(label),
         });
         const quickAccess = new QuickAccess({  // 快速访问分区
             parentElement: this.toolbar.getElements().tabs,
@@ -884,6 +895,22 @@ export class App {
             id: TOOLS_CLASS_NAMES.BOTTOM_TOOLS, 
             storageKey: TOOLS_CLASS_NAMES.BOTTOM_TOOLS
         });
+    }
+
+    /**
+     * 初始化选区即时计算（求和 / 平均 / 计数 / 最大 / 最小）
+     *
+     * 只要存在选区就显示即时值（底部工具条 split-pre 内部）；
+     * 点击工具栏「计算」菜单的某一项时，才把该项结果写入空白的活动单元格。
+     * 由 {@link SelectionCalc} 自行监听选区 / 内容变化并防抖重算。
+     */
+    private initSelectionCalc() {
+        const selectionCalc = new SelectionCalc({
+            data: this.data,
+            parentElement: this.bottomToolsSplit.getElements().splitPrev,
+        });
+        this.selectionCalc = selectionCalc;   // 供工具栏「计算」菜单点选时使用
+        selectionCalc.refresh();   // 首屏选区可能早于监听建立，主动补算一次
     }
 
     /**
