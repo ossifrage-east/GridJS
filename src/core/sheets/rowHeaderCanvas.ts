@@ -18,6 +18,17 @@ export class RowHeaderCanvas extends Canvas {
     private _lastAppliedHeight: number | null = null;
     /** 拖拽行高：手势开始时的基准快照（小表全量/大表 headers 补丁档，mouseup 时提交撤销） */
     private _resizeUndoBefore: ContinuousUndoSnapshot | null = null;
+    /** 拖拽行高：本次手势是否真正改变过高度（用于把「纯单击」与「拖拽后回到原高」区分开） */
+    private _splitMoved = false;
+    /** 拖拽行高：手势对应的行号（分界线上方那一行，按下时记录，不依赖随后可能被重置的共享状态） */
+    private _splitRow = 0;
+    /**
+     * 拖拽行高时要批量调整的行范围（null = 沿用原来的「选中该行并拖拽」语义）
+     *
+     * 仅在「当前选区跨多行且所点分界线属于选中行」时安排：此时按下分界线
+     * 不改变选区，拖拽则对选中的全部行设成同一高度（双击自动调高同样作用于该范围）。
+     */
+    private _splitResizeRange: { startRow: number, endRow: number } | null = null;
     /** 隐藏行悬停指示按钮（上下双三角）：鼠标悬停到「分割线且下方紧邻隐藏行」时显示 */
     private hiddenIndicator: Hidden;
     /** 行号宽度测量缓存键（`字体串\0行号文本`），未变化时跳过 measureText */
@@ -287,6 +298,16 @@ export class RowHeaderCanvas extends Canvas {
             // 开始连续撤销捕获：整个拖拽手势折叠为一条撤销记录
             this._resizeUndoBefore = this.data.beginContinuousUndo();
             this._lastAppliedHeight = this.data.startHeight;
+            this._splitMoved = false;
+            this._splitRow = row;
+            // 选中多行后点其中一行的分界线：选区保持不变（不重选该行、不挪活动格），
+            // 拖拽时对选中的全部行设成同一高度（见 _applyRowHeight）。
+            // 条件：选区跨多行，且所点分界线属于选中行（分界线的 row 是上方那一行）。
+            const { startRow: selStartRow, endRow: selEndRow } = this.getSelectedColsAndRows();
+            this._splitResizeRange = selEndRow > selStartRow && row >= selStartRow && row <= selEndRow
+                ? { startRow: selStartRow, endRow: selEndRow }
+                : null;
+            if (this._splitResizeRange) return;
         }
         // 活动格**跳过合并单元格**：行头点击恒取第 1 列，而首列最常被纵向合并
         // （如 A5:A8）；活动格落进合并区后，选中框上挖的透明洞会变成整个合并块
@@ -413,16 +434,34 @@ export class RowHeaderCanvas extends Canvas {
         if (this._resizeRafId !== null) return;
         this._resizeRafId = requestAnimationFrame(() => {
             this._resizeRafId = null;
-            if (this._pendingHeight === null) return;
-            this._lastAppliedHeight = this._pendingHeight;
-            this.data.adjustRowHeight(this.data.startRow, this._pendingHeight);
+            const pending = this._pendingHeight;
+            if (pending === null) return;
+            this._lastAppliedHeight = pending;
+            this._splitMoved = true;
+            this._applyRowHeight(pending);
             this._pendingHeight = null;
         });
     }
 
     /**
-     * 结束行高拖拽：取消未执行的 rAF、同步应用最终高度并提交连续撤销
+     * 应用一次行高：多行选区时把选中的全部行设为同一高度，否则只调整被拖的那一行
+     * @param {number} height - 目标行高
+     */
+    private _applyRowHeight(height: number): void {
+        const range = this._splitResizeRange;
+        if (range) {
+            this.data.adjustRowHeights(range.startRow, range.endRow, height);
+        } else {
+            this.data.adjustRowHeight(this._splitRow, height);
+        }
+    }
+
+    /**
+     * 结束行高拖拽：取消未执行的 rAF、同步应用最终高度、补齐下方行并提交连续撤销
      * 由 handleMouseUp 调用；不依赖 isMouseDown（sheetCanvas 可能已先重置共享状态）。
+     *
+     * **单击分界线不改变行高**（自动调高只由左键双击触发，见 {@link handleDoubleClick}），
+     * 因此这里不再区分「单击」与「拖拽」。
      */
     private _finishRowSplitDrag(): void {
         if (this._resizeRafId !== null) {
@@ -431,13 +470,21 @@ export class RowHeaderCanvas extends Canvas {
         }
         const pending = this._pendingHeight;
         this._pendingHeight = null;
-        if (pending !== null && pending !== this._lastAppliedHeight) {
+        const pendingApplied = pending !== null && pending !== this._lastAppliedHeight;
+        if (pendingApplied) {
             this._lastAppliedHeight = pending;
-            this.data.adjustRowHeight(this.data.startRow, pending);  // 同步应用最终高度，保证落点精确
+            this._applyRowHeight(pending);  // 同步应用最终高度，保证落点精确
         }
+        const range = this._splitResizeRange;
+        this._splitResizeRange = null;
         if (this._resizeUndoBefore !== null) {
             this.data.endContinuousUndo(this._resizeUndoBefore, '调整行高');
             this._resizeUndoBefore = null;
+        }
+        // 下方补行：行高调小后下边会露白，补齐/裁剪到恰好填满视口（本次调整的行不参与裁剪）
+        if (pendingApplied || this._splitMoved) {
+            if (range) this.data.fillRowsToViewport(range.startRow, range.endRow);
+            else if (this._splitRow > 0) this.data.fillRowsToViewport(this._splitRow, this._splitRow);
         }
     }
 
@@ -464,31 +511,49 @@ export class RowHeaderCanvas extends Canvas {
     public handleDoubleClick(e: MouseEvent) {
         const { offsetY: rowHeaderY } = e;
         const { location, col, row } = this.data.rowHeaders.getRowHeaderCell(Math.round(rowHeaderY / this.data.zoom));
+        // 只有**左键双击**才自动调高（单击、右键、按住拖动都不触发）
         if (e.button !== 0 || e.detail !== 2
             || e.target !== this.canvas
             || location !== MouseLocation.IN_ROW_HEADER_SPLIT
         ) return;
-        
-        this.autoAdjustRowHeight(row);
+        // 多行选区且双击的分界线属于选中行 → 对选中的全部行自动调高
+        const { startRow, endRow } = this.getSelectedColsAndRows();
+        const inMultiSelection = endRow > startRow && row >= startRow && row <= endRow;
+        const fitStart = inMultiSelection ? startRow : row;
+        const fitEnd = inMultiSelection ? endRow : row;
+        for (let r = fitStart; r <= fitEnd; r++) {
+            this.autoAdjustRowHeight(r);
+        }
+        // 行高变化后补齐下方行，保证网格填满视口
+        this.data.fillRowsToViewport(fitStart, fitEnd);
     }
 
     /**
      * 自动调整行高以适应内容高度
+     *
+     * **空行不做任何操作**：没有任何非空文本的行若也按 padding 高度收窄，
+     * 双击一下整行就被压到最小高度，属于破坏性操作。
+     *
+     * **合并单元格不参与测量**：合并块（如 B22:D24）的文本高度是整块共用的，
+     * 若按整段文本给单行算高，会把 22、23、24 行同时撑到整块高度。
      * @param row 行索引
      */
     private autoAdjustRowHeight(row: number): void {
         if (row < 1 || row > this.data.rowHeaders.length) return;
         
-        // 获取该行所有单元格内容
+        // 获取该行所有**有文本且不在合并区域内**的单元格
         const cellsInRow = this.data.values.filter(v => {
-            const { row: cellRow } = this.data.getCellColAndRow(v.cell);
-            return cellRow === row && v.cell !== '';
+            const { col: cellCol, row: cellRow } = this.data.getCellColAndRow(v.cell);
+            if (cellRow !== row) return false;
+            if (this.data.findMergeRect(cellCol, cellRow) !== null) return false;
+            return (this.data.getCellByName(v.cell)?.getText() ?? '') !== '';
         });
+        if (cellsInRow.length === 0) return;  // 空行不调整
         
         // 计算最大文本高度
         let minHeight = 20;
         for (const cell of cellsInRow) {
-             const { charsHeight } = this.measureCellText(cell.cell);
+            const { charsHeight } = this.measureCellText(cell.cell);
             minHeight = Math.max(minHeight, charsHeight);
         }
         

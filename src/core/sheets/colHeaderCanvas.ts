@@ -18,6 +18,17 @@ export class ColHeaderCanvas extends Canvas {
     private _lastAppliedWidth: number | null = null;
     /** 拖拽列宽：手势开始时的基准快照（小表全量/大表 headers 补丁档，mouseup 时提交撤销） */
     private _resizeUndoBefore: ContinuousUndoSnapshot | null = null;
+    /** 拖拽列宽：本次手势是否真正改变过宽度（用于把「纯单击」与「拖拽后回到原宽」区分开） */
+    private _splitMoved = false;
+    /** 拖拽列宽：手势对应的列号（分界线左侧那一列，按下时记录，不依赖随后可能被重置的共享状态） */
+    private _splitCol = 0;
+    /**
+     * 拖拽列宽时要批量调整的列范围（null = 沿用原来的「选中该列并拖拽」语义）
+     *
+     * 仅在「当前选区跨多列且所点分界线属于选中列」时安排：此时按下分界线
+     * 不改变选区，拖拽则对选中的全部列设成同一宽度（双击自动调宽同样作用于该范围）。
+     */
+    private _splitResizeRange: { startCol: number, endCol: number } | null = null;
     /** 隐藏列悬停指示按钮（左右双三角）：鼠标悬停到「分割线且右侧紧邻隐藏列」时显示 */
     private hiddenIndicator: Hidden;
 
@@ -53,12 +64,18 @@ export class ColHeaderCanvas extends Canvas {
      * 列头画布的 Y 坐标恒落在列头高度内（正值），无法触发 getSheetCell 的
      * y<0 列头分支，因此强制传入 y=-1：命中 IN_COL_HEADER，
      * 列号仍由 x 经正常匹配推导（含跳过隐藏列逻辑）。
+     *
+     * **必须传 `rawGeometry`（纯几何）**：否则 getSheetCell 会把列号吸附到合并锚点。
+     * 列头上解析出的行恒为第 1 行，而首行最常被横向合并（如 `A1:D1` 标题横幅），
+     * 于是点 B / C / D 列头都会被解析成 `B1` / `C1` / `D1` 再吸附到锚点 `A1`
+     * —— 右键任何列都只选中 A 列（实测 test_sample.xls）。点某列列头就该选中该列，
+     * 与左键的 getColHeaderCell（本就不做合并吸附）语义一致。
      * @param {number} x - 相对当前画布的X坐标
      * @param {number} _y - 相对当前画布的Y坐标（忽略）
      * @returns {{ location: MouseLocation, col: number, row: number }} 列头区域信息
      */
     protected resolveContextMenuCell(x: number, _y: number): { location: MouseLocation, col: number, row: number } {
-        return this.data.getSheetCell(x, -1);
+        return this.data.getSheetCell(x, -1, { rawGeometry: true });
     }
 
     /**
@@ -234,6 +251,16 @@ export class ColHeaderCanvas extends Canvas {
             // 开始连续撤销捕获：整个拖拽手势折叠为一条撤销记录
             this._resizeUndoBefore = this.data.beginContinuousUndo();
             this._lastAppliedWidth = this.data.startWidth;
+            this._splitMoved = false;
+            this._splitCol = col;
+            // 选中多列后点其中一列的分界线：选区保持不变（不重选该列、不挪活动格），
+            // 拖拽时对选中的全部列设成同一宽度（见 _applyColWidth）。
+            // 条件：选区跨多列，且所点分界线属于选中列（分界线的 col 是左侧那一列）。
+            const { startCol: selStartCol, endCol: selEndCol } = this.getSelectedColsAndRows();
+            this._splitResizeRange = selEndCol > selStartCol && col >= selStartCol && col <= selEndCol
+                ? { startCol: selStartCol, endCol: selEndCol }
+                : null;
+            if (this._splitResizeRange) return;
         }
         // 活动格**跳过合并单元格**：列头点击恒取第 1 行，而首行最常被横向合并
         // （如表头横幅 A1:D1）；活动格落进合并区后，选中框上挖的透明洞会变成整个
@@ -354,16 +381,34 @@ export class ColHeaderCanvas extends Canvas {
         if (this._resizeRafId !== null) return;
         this._resizeRafId = requestAnimationFrame(() => {
             this._resizeRafId = null;
-            if (this._pendingWidth === null) return;
-            this._lastAppliedWidth = this._pendingWidth;
-            this.data.adjustColumnWidth(this.data.startCol, this._pendingWidth);
+            const pending = this._pendingWidth;
+            if (pending === null) return;
+            this._lastAppliedWidth = pending;
+            this._splitMoved = true;
+            this._applyColWidth(pending);
             this._pendingWidth = null;
         });
     }
 
     /**
-     * 结束列宽拖拽：取消未执行的 rAF、同步应用最终宽度并提交连续撤销
+     * 应用一次列宽：多列选区时把选中的全部列设为同一宽度，否则只调整被拖的那一列
+     * @param {number} width - 目标列宽
+     */
+    private _applyColWidth(width: number): void {
+        const range = this._splitResizeRange;
+        if (range) {
+            this.data.adjustColumnWidths(range.startCol, range.endCol, width);
+        } else {
+            this.data.adjustColumnWidth(this._splitCol, width);
+        }
+    }
+
+    /**
+     * 结束列宽拖拽：取消未执行的 rAF、同步应用最终宽度、补齐右侧列并提交连续撤销
      * 由 handleMouseUp 调用；不依赖 isMouseDown（sheetCanvas 可能已先重置共享状态）。
+     *
+     * **单击分界线不改变列宽**（自动调宽只由左键双击触发，见 {@link handleDoubleClick}），
+     * 因此这里不再区分「单击」与「拖拽」。
      */
     private _finishColSplitDrag(): void {
         if (this._resizeRafId !== null) {
@@ -372,13 +417,21 @@ export class ColHeaderCanvas extends Canvas {
         }
         const pending = this._pendingWidth;
         this._pendingWidth = null;
-        if (pending !== null && pending !== this._lastAppliedWidth) {
+        const pendingApplied = pending !== null && pending !== this._lastAppliedWidth;
+        if (pendingApplied) {
             this._lastAppliedWidth = pending;
-            this.data.adjustColumnWidth(this.data.startCol, pending);  // 同步应用最终宽度，保证落点精确
+            this._applyColWidth(pending);  // 同步应用最终宽度，保证落点精确
         }
+        const range = this._splitResizeRange;
+        this._splitResizeRange = null;
         if (this._resizeUndoBefore !== null) {
             this.data.endContinuousUndo(this._resizeUndoBefore, '调整列宽');
             this._resizeUndoBefore = null;
+        }
+        // 右侧补列：列宽调小后右边会露白，补齐/裁剪到恰好填满视口（本次调整的列不参与裁剪）
+        if (pendingApplied || this._splitMoved) {
+            if (range) this.data.fillColsToViewport(range.startCol, range.endCol);
+            else if (this._splitCol > 0) this.data.fillColsToViewport(this._splitCol, this._splitCol);
         }
     }
 
@@ -404,26 +457,45 @@ export class ColHeaderCanvas extends Canvas {
     public handleDoubleClick(e: MouseEvent) {
         const { offsetX: colHeaderX } = e;
         const { location, col, row } = this.data.colHeaders.getColHeaderCell(Math.round(colHeaderX / this.data.zoom));
+        // 只有**左键双击**才自动调宽（单击、右键、按住拖动都不触发）
         if (e.button !== 0 || e.detail !== 2
             || e.target !== this.canvas
             || location !== MouseLocation.IN_COL_HEADER_SPLIT
         ) return;
-        
-        this.autoAdjustColumnWidth(col);
+        // 多列选区且双击的分界线属于选中列 → 对选中的全部列自动调宽
+        const { startCol, endCol } = this.getSelectedColsAndRows();
+        const inMultiSelection = endCol > startCol && col >= startCol && col <= endCol;
+        const fitStart = inMultiSelection ? startCol : col;
+        const fitEnd = inMultiSelection ? endCol : col;
+        for (let c = fitStart; c <= fitEnd; c++) {
+            this.autoAdjustColumnWidth(c);
+        }
+        // 列宽变化后补齐右侧列，保证网格填满视口
+        this.data.fillColsToViewport(fitStart, fitEnd);
     }
 
     /**
      * 自动调整列宽以适应内容宽度
+     *
+     * **空列不做任何操作**：没有任何非空文本的列若也按 padding 宽度收窄，
+     * 双击一下整列就被压到最小宽度，属于破坏性操作。
+     *
+     * **合并单元格不参与测量**：合并块（如 B22:D24）的文本宽度是整块共用的，
+     * 若按整段文本给单列算宽，会把 B、C、D 同时撑到整块宽度（Excel 的自动调宽
+     * 同样忽略合并单元格）。
      * @param col 列索引
      */
     private autoAdjustColumnWidth(col: number): void {
         if (col < 1 || col > this.data.colHeaders.length) return;
         
-        // 获取该列所有单元格内容
+        // 获取该列所有**有文本且不在合并区域内**的单元格
         const cellsInColumn = this.data.values.filter(v => {
-            const { col: cellCol } = this.data.getCellColAndRow(v.cell);
-            return cellCol === col && v.cell !== '';
+            const { col: cellCol, row: cellRow } = this.data.getCellColAndRow(v.cell);
+            if (cellCol !== col) return false;
+            if (this.data.findMergeRect(cellCol, cellRow) !== null) return false;
+            return (this.data.getCellByName(v.cell)?.getText() ?? '') !== '';
         });
+        if (cellsInColumn.length === 0) return;  // 空列不调整
         // 计算最大文本宽度
         let minWidth = 20;
         for (const cell of cellsInColumn) {

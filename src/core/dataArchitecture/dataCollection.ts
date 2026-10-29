@@ -5388,51 +5388,108 @@ export class DataCollection extends EventEmitter {
     }
 
     /**
-     * 调整列宽以适应内容宽度
-     * @param col 列索引
+     * 调整单列列宽（宽度下限 24）
+     * @param col 列索引（1-based）
+     * @param newWidth 新列宽
      */
     public adjustColumnWidth(col: number, newWidth: number): void {
-        if (col < 1 || col > this.colHeaders.length) return;
-        const cols = this.colHeaders.length;
-        const minWidth = 24;
-        newWidth = Math.max(minWidth, newWidth);
-        const colHeader = this.colHeaders.getAt(col - 1); // 获取列头部
-        if (!colHeader) return;
-        colHeader.width = newWidth;
+        this.adjustColumnWidths(col, col, newWidth);
+    }
 
-        for (let i = col; i < cols; i++) {
-            const currentColHeader = this.colHeaders.getAt(i - 1); // 获取当前列头部
-            const nextColHeader = this.colHeaders.getAt(i); // 获取下一个列头部
-            // 紧凑排列：隐藏列不占位（前进量为 0），保持隐藏块与其后可见列共享同一分割位置，
-            // 避免拖拽/双击调整列宽时把隐藏列的宽度累加回去而重新显露
-            nextColHeader.left = currentColHeader.left
-                + (currentColHeader.isHidden ? 0 : currentColHeader.width);
+    /**
+     * 批量调整列宽：把 [startCol, endCol] 内的列都设为同一宽度
+     *
+     * 供「选中多列后拖拽其中一列的分界线」使用——所有被选中的列按同一宽度设置。
+     * 统一走 {@link ColHeaders.recalcColPositions}：一遍重算左缘位置与可见总宽
+     * （`allColWidth`），后者是右侧补列与滚动条范围的依据；旧的逐列手写 left
+     * 只挪位置、漏更新总宽，列宽缩小后无法判断是否需要补列。
+     * @param {number} startCol - 起始列号（1-based，含）
+     * @param {number} endCol - 结束列号（1-based，含）
+     * @param {number} newWidth - 新列宽（自动钳到下限）
+     */
+    public adjustColumnWidths(startCol: number, endCol: number, newWidth: number): void {
+        if (startCol < 1 || startCol > this.colHeaders.length) return;
+        const width = Math.max(24, newWidth);
+        const last = Math.min(endCol, this.colHeaders.length);
+        for (let c = startCol; c <= last; c++) {
+            const colHeader = this.colHeaders.getAt(c - 1);
+            if (colHeader) colHeader.width = width;
         }
+        this.colHeaders.recalcColPositions();
         this.emit(DataEvents.COLUMNS_CHANGED);
     }
 
     /**
-     * 调整行高以适应内容高度
-     * @param row 行索引
+     * 调整单行行高（高度下限 24）
+     * @param row 行索引（1-based）
+     * @param newHeight 新行高
      */
     public adjustRowHeight(row: number, newHeight: number): void {
-        if (row < 1 || row > this.rowHeaders.length) return;
-        const rows = this.rowHeaders.length;
-        const minHeight = 24;
-        newHeight = Math.max(minHeight, newHeight);
-        const rowHeader = this.rowHeaders.getAt(row - 1); // 获取行头部
-        if (!rowHeader) return;
-        rowHeader.height = newHeight;
+        this.adjustRowHeights(row, row, newHeight);
+    }
 
-        for (let i = row; i < rows; i++) {
-            const currentRowHeader = this.rowHeaders.getAt(i - 1); // 获取当前行头部
-            const nextRowHeader = this.rowHeaders.getAt(i); // 获取下一个行头部
-            // 紧凑排列：隐藏行不占位（前进量为 0），保持隐藏块与其后可见行共享同一分割位置，
-            // 避免拖拽/双击调整行高时把隐藏行的高度累加回去而重新显露
-            nextRowHeader.top = currentRowHeader.top
-                + (currentRowHeader.isHidden ? 0 : currentRowHeader.height);
+    /**
+     * 批量调整行高：把 [startRow, endRow] 内的行都设为同一高度
+     *
+     * 供「选中多行后拖拽其中一行的分界线」使用，语义与
+     * {@link adjustColumnWidths} 一致（统一 recalc，同步可见总高）。
+     * @param {number} startRow - 起始行号（1-based，含）
+     * @param {number} endRow - 结束行号（1-based，含）
+     * @param {number} newHeight - 新行高（自动钳到下限）
+     */
+    public adjustRowHeights(startRow: number, endRow: number, newHeight: number): void {
+        if (startRow < 1 || startRow > this.rowHeaders.length) return;
+        const height = Math.max(24, newHeight);
+        const last = Math.min(endRow, this.rowHeaders.length);
+        for (let r = startRow; r <= last; r++) {
+            const rowHeader = this.rowHeaders.getAt(r - 1);
+            if (rowHeader) rowHeader.height = height;
+        }
+        this.rowHeaders.recalcRowPositions();
+        this.emit(DataEvents.ROWS_CHANGED);
+    }
+
+    /**
+     * 补齐/裁剪尾部行，使可见行总高与视口匹配
+     *
+     * 行高调整后调用：行高变小时下方会露白（补足空白行）；
+     * 行高变大时尾部会多出整屏空行（裁剪掉，避免反复调整把行数越堆越多）。
+     * @param {number} [protectedStart=0] - 本次操作涉及的行段起点（1-based，不参与尾部裁剪；0 表示无）
+     * @param {number} [protectedEnd=0] - 本次操作涉及的行段终点（1-based，含；0 表示无）
+     */
+    public fillRowsToViewport(protectedStart: number = 0, protectedEnd: number = 0): void {
+        const viewportHeight = this.visibleView.sheetHeight / this.zoom;
+        if (viewportHeight <= 0) return;
+        const protectedRows = new Set<number>();
+        for (let r = protectedStart; r <= protectedEnd; r++) protectedRows.add(r);
+        this.trimRowsToViewport(viewportHeight, protectedRows);
+        const deficit = viewportHeight - this.rowHeaders.allRowHeight;
+        if (deficit > 0) {
+            const need = Math.ceil(deficit / DEFAULT_CELL_HEIGHT) + 1;
+            this.rowHeaders.addRow(this.rowHeaders.length, this.rowHeaders.length + need);
+            this.rowHeaders.recalcRowPositions();
         }
         this.emit(DataEvents.ROWS_CHANGED);
+    }
+
+    /**
+     * 补齐/裁剪尾部列，使可见列总宽与视口匹配（与 {@link fillRowsToViewport} 同构）
+     * @param {number} [protectedStart=0] - 本次操作涉及的列段起点（1-based，不参与尾部裁剪；0 表示无）
+     * @param {number} [protectedEnd=0] - 本次操作涉及的列段终点（1-based，含；0 表示无）
+     */
+    public fillColsToViewport(protectedStart: number = 0, protectedEnd: number = 0): void {
+        const viewportWidth = this.visibleView.sheetWidth / this.zoom;
+        if (viewportWidth <= 0) return;
+        const protectedCols = new Set<number>();
+        for (let c = protectedStart; c <= protectedEnd; c++) protectedCols.add(c);
+        this.trimColsToViewport(viewportWidth, protectedCols);
+        const deficit = viewportWidth - this.colHeaders.allColWidth;
+        if (deficit > 0) {
+            const need = Math.ceil(deficit / DEFAULT_CELL_WIDTH) + 1;
+            this.colHeaders.addCol(this.colHeaders.length, this.colHeaders.length + need);
+            this.colHeaders.recalcColPositions();
+        }
+        this.emit(DataEvents.COLUMNS_CHANGED);
     }
     
     /**
