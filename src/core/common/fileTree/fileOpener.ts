@@ -6,20 +6,20 @@
     # CSDN: https://blog.csdn.net/os373
 */
 
-import { createDiv, createInput } from "../../utils/dom";
-import { Cell } from "../dataArchitecture/cell";
-import { Char } from "../dataArchitecture/char";
-import { ColHeader, RowHeader } from "../dataArchitecture/header";
-import { DataCollection } from "../dataArchitecture/dataCollection";
-import { DataEvents, DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH } from "../constant";
-import { stripExtension, toArchiveKey, toNativeFileName } from "../../utils/fileName";
-import { parseWorkbook } from "../../utils/parser/parserClient";
-import type { ExtractedImage } from "../../utils/parser/sheetParser";
-import { DocumentParser } from "../../utils/parser/documentParser";
-import { createBlankSnapshot, type DocSnapshot } from "../document/blockTree";
-import { docxToSnapshot } from "../document/converter/docxCodec";
-import { textToBlocks } from "../document/converter/textCodec";
-import '../style/fileOpener.scss';
+import { createDiv, createInput } from "../../../utils/dom";
+import { Cell } from "../../dataArchitecture/cell";
+import { Char } from "../../dataArchitecture/char";
+import { ColHeader, RowHeader } from "../../dataArchitecture/header";
+import { DataCollection } from "../../dataArchitecture/dataCollection";
+import { DataEvents, DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH } from "../../constant";
+import { stripExtension, toArchiveKey, toNativeFileName } from "../../../utils/fileName";
+import { parseWorkbook } from "../../../utils/parser/parserClient";
+import type { ExtractedImage } from "../../../utils/parser/sheetParser";
+import { DocumentParser } from "../../../utils/parser/documentParser";
+import { createBlankSnapshot, type DocSnapshot } from "../../document/blockTree";
+import { docxToSnapshot } from "../../document/converter/docxCodec";
+import { textToBlocks } from "../../document/converter/textCodec";
+import '../../style/fileOpener.scss';
 
 /**
  * 支持打开的文件扩展名（**仅这 6 种**）

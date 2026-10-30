@@ -31,7 +31,7 @@ import { SectionDocView } from "./pages/sectionDocView";
 import { SectionDocPage, DocPageKey, DocPageSetupView } from "./pages/sectionDocPage";
 import { CommandBus } from "../contract/commandBus";
 import { EDIT_STATE_CHANGED, WorkspaceKind } from "../contract/editHost";
-import { Printer } from "../../utils/printer";
+import { Printer } from "../sheets/sheetPrinter";
 import { buildProfiles, ToolbarProfile, ToolbarSections } from "./profile";
 
 

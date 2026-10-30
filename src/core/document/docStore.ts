@@ -17,8 +17,8 @@
 import { EventEmitter } from '../../utils/eventEmitter';
 import { UndoManager } from '../../utils/undoManager';
 import { IndexDB } from '../dataArchitecture/indexDB';
+import { DOC_SAVE_DEBOUNCE, DOC_SNAPSHOT_VERSION, DOC_TYPING_BURST } from '../constant';
 import {
-    DOC_SNAPSHOT_VERSION,
     DocBlock,
     DocMeta,
     DocSnapshot,
@@ -45,11 +45,7 @@ export const DOC_CHANGED = 'doc:changed';
 /** 视图被整体替换（撤销 / 重做 / 切换文档 / 导入），视图需要重置光标 */
 export const DOC_RESET = 'doc:reset';
 
-/** 落库防抖时长（毫秒）：与表格的自动保存同量级，避免每次按键都写库 */
-const SAVE_DEBOUNCE = 500;
-
-/** 连续输入合并成一次撤销记录的静默间隔（毫秒） */
-const TYPING_BURST = 700;
+/* 落库防抖与「连续输入合并」的时长统一见 `core/constant.ts`（DOC_SAVE_DEBOUNCE / DOC_TYPING_BURST） */
 
 /**
  * 更新来源
@@ -384,7 +380,7 @@ export class DocStore extends EventEmitter {
         this.burstTimer = window.setTimeout(() => {
             this.burstTimer = null;
             this.flushBurst();
-        }, TYPING_BURST);
+        }, DOC_TYPING_BURST);
     }
 
     // ─────────────────────────── 持久化 ───────────────────────────
@@ -405,7 +401,7 @@ export class DocStore extends EventEmitter {
         this.saveTimer = window.setTimeout(() => {
             this.saveTimer = null;
             void this.flush();
-        }, SAVE_DEBOUNCE);
+        }, DOC_SAVE_DEBOUNCE);
     }
 
     /**

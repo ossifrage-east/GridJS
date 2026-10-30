@@ -21,10 +21,8 @@
 
 import { Slider } from '../common/slider';
 import { buildPrintPreviewShellHtml, PREVIEW_ZOOM_MAX, PREVIEW_ZOOM_MIN } from '../../utils/printPreviewShell';
-import { DOC_PAPER_SIZES, DocPageSetup } from './blockTree';
-
-/** 预览区四周留白（外壳 .gs-print-scroll 的 padding 是 1.5rem = 24px） */
-const SCROLL_PADDING = 48;
+import { DOC_PAPER_SIZES, DOC_PRINT_SCROLL_PADDING } from '../constant';
+import { DocPageSetup } from './blockTree';
 
 /** 预览文档时来自工作区的四个回调 */
 export interface DocPrinterOptions {
@@ -411,8 +409,8 @@ export class DocPrinter {
         const scroll = this.overlay?.querySelector<HTMLElement>('.gs-print-scroll');
         const el = this.pageEls[this.currentPage];
         if (!scroll || !el) return 1;
-        const availH = scroll.clientHeight - SCROLL_PADDING;
-        const availW = scroll.clientWidth - SCROLL_PADDING;
+        const availH = scroll.clientHeight - DOC_PRINT_SCROLL_PADDING;
+        const availW = scroll.clientWidth - DOC_PRINT_SCROLL_PADDING;
         const width = el.offsetWidth || 0;
         const height = el.offsetHeight || 0;
         if (availH <= 0 || availW <= 0 || width <= 0 || height <= 0) return 1;

@@ -355,6 +355,103 @@ enum VisibleViewProperty {
 export const DataEvents = Object.assign({}, SheetProperty, CellProperty, ValueProperty, VisibleViewProperty);
 export type DataEvents = SheetProperty | CellProperty | ValueProperty | VisibleViewProperty;
 
+/* ════════════════════════════════════════════════════════════
+ *  文档（Word）实现常量
+ *
+ *  文档工作区（`core/document/*`）里的尺子、归档、渲染、滚动条与转换器共用这些值。
+ *  集中在此而不是散落在各文件顶部，是为了让「调一次缩放步长 / 存档版本 / 纸张尺寸」
+ *  只改一处：这些值彼此约束（例如存档版本与装载校验、缩放步长与滑块档位），
+ *  分散后极易改一处忘另一处。
+ * ════════════════════════════════════════════════════════════ */
+
+/** 文档存档版本（结构不兼容时递增，装载侧据此决定迁移或丢弃） */
+export const DOC_SNAPSHOT_VERSION = 1;
+
+/** 文档默认字体族（与表格默认值同源，避免两种载体之间视觉割裂） */
+export const DEFAULT_DOC_FONT_FAMILY = 'HarmonyOS Sans SC Regular';
+
+/** 文档默认字号（CSS 像素；对应 12pt） */
+export const DEFAULT_DOC_FONT_SIZE = 16;
+
+/**
+ * 每级缩进的像素步长
+ *
+ * 渲染（还原 `indent`）与命令（写回 DOM）**必须共用同一个常量**：
+ * 两处各写一个 24，改一处忘另一处就会出现「点了有缩进、重渲染后跳一格」。
+ */
+export const DOC_INDENT_STEP_PX = 24;
+
+/**
+ * 纸张尺寸（CSS 像素，96dpi）
+ *
+ * 只用 A4 / A5 / A3 / Letter / Legal 五档 —— 与 `DocPageSetup.paperSize` 的取值一一对应。
+ * 纵向为「宽 × 高」，横向时两者互换。
+ */
+export const DOC_PAPER_SIZES: Record<'A4' | 'A5' | 'A3' | 'Letter' | 'Legal', { width: number; height: number }> = {
+    A4: { width: 794, height: 1123 },
+    A5: { width: 559, height: 794 },
+    A3: { width: 1123, height: 1587 },
+    Letter: { width: 816, height: 1056 },
+    Legal: { width: 816, height: 1344 },
+};
+
+/**
+ * 页边距预设（CSS 像素，四边同值）
+ *
+ * 常规 96px ≈ 1 英寸（25.4mm），与导出 docx 时 `sectPr` 的页边距同一口径。
+ */
+export const DOC_MARGIN_PRESETS: Record<'normal' | 'wide' | 'narrow', number> = {
+    normal: 96,
+    wide: 120,
+    narrow: 56,
+};
+
+/** 缩放百分比下限（与缩放滑块的档位同一口径） */
+export const DOC_ZOOM_PERCENT_MIN = 50;
+/** 缩放百分比上限 */
+export const DOC_ZOOM_PERCENT_MAX = 400;
+/** Ctrl + 滚轮的每格缩放增量（比例，不是百分比） */
+export const DOC_ZOOM_WHEEL_STEP = 0.1;
+
+/** 文档落库防抖（毫秒） */
+export const DOC_SAVE_DEBOUNCE = 500;
+/** 连续键入的「一阵」窗口（毫秒）：窗口内只按一次归档，避免每个键都写库 */
+export const DOC_TYPING_BURST = 700;
+
+/** 文档滚动条单次点击的滚动距离（像素） */
+export const DOC_SCROLL_STEP_PX = 60;
+/** 长按滚动按钮后开始连续滚动的延迟（毫秒） */
+export const DOC_SCROLL_STEP_DELAY = 300;
+/** 长按期间每次连滚的间隔（毫秒） */
+export const DOC_SCROLL_STEP_INTERVAL = 50;
+/** 滚动条滑块的最小尺寸（像素） */
+export const DOC_SCROLL_THUMB_MIN_SIZE = 30;
+/** 打印预览可用区四周的留白（像素） */
+export const DOC_PRINT_SCROLL_PADDING = 48;
+
+/** 分页留白块的属性名（同步回块树时据此跳过它） */
+export const DOC_PAGE_GAP_ATTR = 'data-page-gap';
+/**
+ * 逐块排页的块数上限
+ *
+ * 超过它就退化成「只算页数、不插留白」：分页是显示层的东西，不该把输入延迟拖下水。
+ */
+export const DOC_MAX_PAGINATE_BLOCKS = 1200;
+
+/** Markdown 源码编辑回写模型的防抖（毫秒） */
+export const DOC_MARKDOWN_APPLY_DEBOUNCE = 260;
+
+/** 毫米与 CSS 像素的换算比（96dpi：1 英寸 = 25.4mm = 96px） */
+export const DOC_MM_PER_PX = 25.4 / 96;
+/** CSS 像素与毫米的换算比（{@link DOC_MM_PER_PX} 的倒数） */
+export const DOC_PX_PER_MM = 96 / 25.4;
+/** 标尺最小刻度间隔（毫米） */
+export const DOC_RULER_MINOR_STEP_MM = 5;
+/** 标尺主刻度间隔（毫米，刻度线加长） */
+export const DOC_RULER_MAJOR_STEP_MM = 10;
+/** 标尺数字标签间隔（毫米） */
+export const DOC_RULER_LABEL_STEP_MM = 20;
+
 /**
  * 鼠标位置枚举
  */

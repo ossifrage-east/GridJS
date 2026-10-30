@@ -15,26 +15,21 @@
 */
 
 import { createDiv } from '../../utils/dom';
+import {
+    DOC_MM_PER_PX,
+    DOC_PX_PER_MM,
+    DOC_RULER_LABEL_STEP_MM,
+    DOC_RULER_MAJOR_STEP_MM,
+    DOC_RULER_MINOR_STEP_MM,
+} from '../constant';
 
-/**
- * 1 毫米对应的 CSS 像素（96dpi）
- *
- * 与 `blockTree.DOC_PAPER_SIZES` 同一口径（A4 = 794×1123px 即 210×297mm），
- * 纸张尺寸与标尺刻度必须共用这个除数，否则「标尺上的 10cm」和「纸上的 10cm」会错开。
+/*
+ * 毫米与像素的换算比、三级刻度间距统一见 `core/constant.ts`
+ *（DOC_MM_PER_PX / DOC_PX_PER_MM / DOC_RULER_MINOR_STEP_MM / DOC_RULER_MAJOR_STEP_MM /
+ * DOC_RULER_LABEL_STEP_MM）：
+ * 与 `DOC_PAPER_SIZES` 同一口径（A4 = 794×1123px 即 210×297mm），纸张尺寸与标尺刻度
+ * 必须共用这个除数，否则「标尺上的 10cm」和「纸上的 10cm」会错开。
  */
-export const MM_PER_PX = 25.4 / 96;
-
-/** 1 毫米 = 多少 CSS 像素 */
-export const PX_PER_MM = 96 / 25.4;
-
-/** 次刻度间距（毫米）：5mm 一格，与 Word 标尺的最小格一致 */
-const MINOR_STEP_MM = 5;
-
-/** 主刻度间距（毫米）：10mm 一格（每 1cm 一条长线） */
-const MAJOR_STEP_MM = 10;
-
-/** 数字标签间距（毫米）：每 2cm 标一个数，密到 1cm 会糊成一片 */
-const LABEL_STEP_MM = 20;
 
 /**
  * 画一把标尺
@@ -57,7 +52,7 @@ const LABEL_STEP_MM = 20;
 export function buildRuler(el: HTMLElement, lengthPx: number, zoom: number, horizontal: boolean): number {
     // 先清空：缩放 / 纸张变化都会重画，追加会留下一堆旧刻度
     while (el.firstChild) el.removeChild(el.firstChild);
-    const lengthMm = lengthPx * MM_PER_PX;
+    const lengthMm = lengthPx * DOC_MM_PER_PX;
     const total = lengthPx * zoom;
     // 另一维必须显式清空：切方向复用同一个元素时，旧的定长会残留在内联样式上
     if (horizontal) {
@@ -69,17 +64,17 @@ export function buildRuler(el: HTMLElement, lengthPx: number, zoom: number, hori
     }
     if (!isFinite(lengthMm) || lengthMm <= 0) return 0;
 
-    const count = Math.floor(lengthMm / MINOR_STEP_MM);
+    const count = Math.floor(lengthMm / DOC_RULER_MINOR_STEP_MM);
     for (let i = 0; i <= count; i++) {
-        const mm = i * MINOR_STEP_MM;
-        const pos = mm * PX_PER_MM * zoom;
-        const major = mm % MAJOR_STEP_MM === 0;
+        const mm = i * DOC_RULER_MINOR_STEP_MM;
+        const pos = mm * DOC_PX_PER_MM * zoom;
+        const major = mm % DOC_RULER_MAJOR_STEP_MM === 0;
         const tick = createDiv({ className: `doc-ruler-tick${major ? ' doc-ruler-major' : ''}` });
         if (horizontal) tick.style.left = `${pos}px`;
         else tick.style.top = `${pos}px`;
         el.appendChild(tick);
         // 两个方向都标数字（标签用厘米：标尺上的数字是「第几厘米」）
-        if (mm > 0 && mm % LABEL_STEP_MM === 0) {
+        if (mm > 0 && mm % DOC_RULER_LABEL_STEP_MM === 0) {
             const label = createDiv({
                 className: 'doc-ruler-label',
                 textContent: String(mm / 10),

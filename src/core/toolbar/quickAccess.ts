@@ -19,7 +19,7 @@ import { BtnBase } from "../common/button";
 import { Menu } from "../common/menu";
 import { CommandBus } from "../contract/commandBus";
 import { EDIT_STATE_CHANGED } from "../contract/editHost";
-import { Printer } from "../../utils/printer";
+import { Printer } from "../sheets/sheetPrinter";
 import favicon from "../../assets/images/favicon.png";
 import '../style/brand.scss'
 

@@ -24,8 +24,14 @@ import { debounce } from '../../utils/debounce';
 import { CommandBus } from '../contract/commandBus';
 import { Slider } from '../common/slider';
 import { Split } from '../common/split';
+import {
+    DOC_PAPER_SIZES,
+    DOC_ZOOM_PERCENT_MAX,
+    DOC_ZOOM_PERCENT_MIN,
+    DOC_ZOOM_WHEEL_STEP,
+} from '../constant';
 import { DOC_CHANGED, DOC_RESET } from './docStore';
-import { DOC_PAPER_SIZES, DocPageSetup, blockText } from './blockTree';
+import { DocPageSetup, blockText } from './blockTree';
 import { snapshotToDocx } from './converter/docxCodec';
 import { blocksToMarkdown } from './converter/markdownCodec';
 import { DocEditHost } from './docEditHost';
@@ -35,17 +41,12 @@ import { DocStore } from './docStore';
 import { DocView } from './docView';
 import { MarkdownView } from './markdownView';
 
-/**
- * 缩放滑块的下限 / 上限（百分比）
- *
- * 与 {@link DocView.setZoom} 的 0.5–4 区间同源：写死两处就会出现
+/*
+ * 缩放滑块的下限 / 上限与滚轮步长统一见 `core/constant.ts`
+ *（DOC_ZOOM_PERCENT_MIN / DOC_ZOOM_PERCENT_MAX / DOC_ZOOM_WHEEL_STEP）：
+ * 与 `DocView.setZoom` 的 0.5–4 区间同源，写死两处会出现
  * 「滑块能拖到 400% 但视图只吃到 200%」这种各说各话的情形。
  */
-const ZOOM_PERCENT_MIN = 50;
-const ZOOM_PERCENT_MAX = 400;
-
-/** Ctrl+滚轮每格改多少缩放（与表格滚动条的手感对齐：一格 10%） */
-const ZOOM_WHEEL_STEP = 0.1;
 
 /**
  * 文档工作区
@@ -580,8 +581,8 @@ export class DocWorkspace {
             parentElement,
             vertical: true,      // 垂直方向：最小值在下端，数值框在轨道下方
             thin: true,          // 细线样式：2px 轨道 + 小圆点手柄
-            min: ZOOM_PERCENT_MIN,
-            max: ZOOM_PERCENT_MAX,
+            min: DOC_ZOOM_PERCENT_MIN,
+            max: DOC_ZOOM_PERCENT_MAX,
             step: 1,             // 与表格右侧的缩放滑块一致：每格 1%
             value: this.zoomPercent(),
             showInput: true,     // 数值框：手工填写缩放百分比（无单位文本，纯数字）
@@ -595,7 +596,7 @@ export class DocWorkspace {
             if (!event.ctrlKey && !event.metaKey) return;
             // 必须拦下：不拦会变成浏览器自身的页面缩放（整个应用一起放大）
             event.preventDefault();
-            const step = event.deltaY < 0 ? ZOOM_WHEEL_STEP : -ZOOM_WHEEL_STEP;
+            const step = event.deltaY < 0 ? DOC_ZOOM_WHEEL_STEP : -DOC_ZOOM_WHEEL_STEP;
             this.setZoom(this.view.zoom + step);
         }, { passive: false });
     }
@@ -701,12 +702,12 @@ export class DocWorkspace {
             // 放在 `mode !== 'rich'` 判断**之前**：源码视图同样需要放大看。
             if (key === '=' || key === '+') {
                 event.preventDefault();
-                this.setZoom(this.view.zoom + ZOOM_WHEEL_STEP);
+                this.setZoom(this.view.zoom + DOC_ZOOM_WHEEL_STEP);
                 return;
             }
             if (key === '-' || key === '_') {
                 event.preventDefault();
-                this.setZoom(this.view.zoom - ZOOM_WHEEL_STEP);
+                this.setZoom(this.view.zoom - DOC_ZOOM_WHEEL_STEP);
                 return;
             }
             if (key === '0') {

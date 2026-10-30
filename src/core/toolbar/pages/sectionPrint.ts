@@ -18,7 +18,7 @@ import { TOOLBAR_CLASS_NAME, MENU_CLASS_NAMES } from "../../constant";
 import { Menu } from "../../common/menu";
 import { BtnBase } from "../../common/button";
 import { CommandBus } from "../../contract/commandBus";
-import { Printer, MarginPreset, PaperOrientation, PaperSize, ScaleMode } from "../../../utils/printer";
+import { Printer, MarginPreset, PaperOrientation, PaperSize, ScaleMode } from "../../sheets/sheetPrinter";
 import { hideFindReplace } from "../start/searchDialog";
 
 /**

@@ -16,6 +16,7 @@
 */
 
 import { Char } from '../dataArchitecture/char';
+import { DOC_SNAPSHOT_VERSION } from '../constant';
 
 /**
  * 块类型
@@ -197,47 +198,12 @@ export interface DocSnapshot {
     blocks: DocBlock[];
 }
 
-/** 当前存档版本 */
-export const DOC_SNAPSHOT_VERSION = 1;
-
-/** 默认字体族（与表格默认值同源，避免两种载体之间视觉割裂） */
-export const DEFAULT_DOC_FONT_FAMILY = 'HarmonyOS Sans SC Regular';
-
-/** 默认字号（CSS 像素；对应 12pt） */
-export const DEFAULT_DOC_FONT_SIZE = 16;
-
 /**
- * 每级缩进的像素步长
+ * 默认字体族 / 字号 / 缩进步长 / 纸张与页边距 / 存档版本
  *
- * 渲染（`renderBlock` 还原 `indent`）与命令（`indentBy` 写回 DOM）**必须共用同一个常量**：
- * 两处各写一个 24，改一处忘另一处就会出现「点了有缩进、重渲染后跳一格」。
+ * 定义统一在 `core/constant.ts` 的「文档（Word）实现常量」段（本文件只在这里使用版本号）。
+ * 渲染、命令、打印、导出都从同一处取值，避免「点了有缩进、重渲染后跳一格」这类分裂。
  */
-export const DOC_INDENT_STEP_PX = 24;
-
-/**
- * 纸张尺寸（CSS 像素，96dpi）
- *
- * 只用 A4 / A5 / A3 / Letter / Legal 五档 —— 与 {@link DocPageSetup.paperSize} 的取值一一对应。
- * 纵向为「宽 × 高」，横向时两者互换（见 `docView.applyPageSetup`）。
- */
-export const DOC_PAPER_SIZES: Record<'A4' | 'A5' | 'A3' | 'Letter' | 'Legal', { width: number; height: number }> = {
-    A4: { width: 794, height: 1123 },
-    A5: { width: 559, height: 794 },
-    A3: { width: 1123, height: 1587 },
-    Letter: { width: 816, height: 1056 },
-    Legal: { width: 816, height: 1344 },
-};
-
-/**
- * 页边距预设（CSS 像素，四边同值）
- *
- * 常规 96px ≈ 1 英寸（25.4mm），与导出 docx 时 `sectPr` 的页边距同一口径。
- */
-export const DOC_MARGIN_PRESETS: Record<'normal' | 'wide' | 'narrow', number> = {
-    normal: 96,
-    wide: 120,
-    narrow: 56,
-};
 
 /**
  * 块 id 发号器

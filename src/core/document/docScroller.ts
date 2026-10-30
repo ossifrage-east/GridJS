@@ -21,7 +21,13 @@
 */
 
 import { createDiv } from '../../utils/dom';
-import { SCROLLER_CLASS_NAMES } from '../constant';
+import {
+    DOC_SCROLL_STEP_DELAY,
+    DOC_SCROLL_STEP_INTERVAL,
+    DOC_SCROLL_STEP_PX,
+    DOC_SCROLL_THUMB_MIN_SIZE,
+    SCROLLER_CLASS_NAMES,
+} from '../constant';
 import '../style/scroller.scss';
 
 /** 滚动条配置 */
@@ -34,13 +40,9 @@ export interface DocScrollbarOptions {
     direction: 'horizontal' | 'vertical';
 }
 
-/** 单端点箭头点一下滚多少像素 */
-const STEP_PX = 60;
-/** 按住箭头后，连续滚动的起始延时与间隔（与表格滚动条同一手感） */
-const STEP_DELAY = 300;
-const STEP_INTERVAL = 50;
-/** 滑块最小尺寸（内容超长时不至于缩成一点，拖不动） */
-const THUMB_MIN_SIZE = 30;
+/* 单步滚动距离、连滚延时/间隔与滑块最小尺寸统一见 `core/constant.ts`
+ *（DOC_SCROLL_STEP_PX / DOC_SCROLL_STEP_DELAY / DOC_SCROLL_STEP_INTERVAL / DOC_SCROLL_THUMB_MIN_SIZE），
+ * 与表格滚动条保持同一手感。 */
 
 /**
  * 文档滚动条
@@ -163,7 +165,7 @@ export class DocScrollbar {
         }
 
         const ratio = visible / total;
-        const size = Math.max(THUMB_MIN_SIZE, trackSize * ratio);
+        const size = Math.max(DOC_SCROLL_THUMB_MIN_SIZE, trackSize * ratio);
         const scrollableTrack = Math.max(0, trackSize - size);
         const offset = horizontal ? target.scrollLeft : target.scrollTop;
         const pos = Math.max(0, Math.min(scrollableTrack, (offset / scrollableContent) * scrollableTrack));
@@ -278,8 +280,8 @@ export class DocScrollbar {
         this.stepBy(direction);
         this.stopStep();
         this.stepHoldTimer = window.setTimeout(() => {
-            this.stepTimer = window.setInterval(() => this.stepBy(direction), STEP_INTERVAL);
-        }, STEP_DELAY);
+            this.stepTimer = window.setInterval(() => this.stepBy(direction), DOC_SCROLL_STEP_INTERVAL);
+        }, DOC_SCROLL_STEP_DELAY);
     }
 
     /** 结束端点箭头的连发 */
@@ -298,8 +300,8 @@ export class DocScrollbar {
     /** 端点箭头滚一格 */
     private stepBy(direction: number): void {
         const target = this.options.target;
-        if (this.options.direction === 'horizontal') target.scrollLeft += direction * STEP_PX;
-        else target.scrollTop += direction * STEP_PX;
+        if (this.options.direction === 'horizontal') target.scrollLeft += direction * DOC_SCROLL_STEP_PX;
+        else target.scrollTop += direction * DOC_SCROLL_STEP_PX;
     }
 
     /**

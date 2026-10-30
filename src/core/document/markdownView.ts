@@ -15,12 +15,12 @@
 */
 
 import { createDiv } from '../../utils/dom';
+import { DOC_MARKDOWN_APPLY_DEBOUNCE } from '../constant';
 import { blocksToMarkdown, markdownToBlocks } from './converter/markdownCodec';
 import { DocStore } from './docStore';
 import '../style/document.scss';
 
-/** 源码改动到模型落库的防抖（毫秒） */
-const APPLY_DEBOUNCE = 260;
+/* 源码改动到模型落库的防抖统一见 `core/constant.ts`（DOC_MARKDOWN_APPLY_DEBOUNCE） */
 
 /**
  * Markdown 源码视图
@@ -151,7 +151,7 @@ export class MarkdownView {
             } finally {
                 this.applying = false;
             }
-        }, APPLY_DEBOUNCE);
+        }, DOC_MARKDOWN_APPLY_DEBOUNCE);
     }
 
     /**

@@ -24,12 +24,18 @@
 import { createDiv } from '../../utils/dom';
 import { Char } from '../dataArchitecture/char';
 import {
-    CharStylePatch,
     DEFAULT_DOC_FONT_FAMILY,
     DEFAULT_DOC_FONT_SIZE,
     DOC_INDENT_STEP_PX,
     DOC_MARGIN_PRESETS,
+    DOC_MAX_PAGINATE_BLOCKS,
+    DOC_PAGE_GAP_ATTR,
     DOC_PAPER_SIZES,
+    DOC_ZOOM_PERCENT_MAX,
+    DOC_ZOOM_PERCENT_MIN,
+} from '../constant';
+import {
+    CharStylePatch,
     DocAlign,
     DocBlock,
     DocListStyle,
@@ -67,16 +73,10 @@ export interface DocCaret {
     offset: number;
 }
 
-/** 分页标记的属性名（`sync` 据此跳过它，见 {@link DocView.sync}） */
-const PAGE_GAP_ATTR = 'data-page-gap';
-
-/**
- * 逐块排页的块数上限
- *
- * 超过它就退化成「只算页数、不插留白」（见 {@link DocView.paginate}）：
- * 分页是**显示**层的东西，不该把输入延迟拖下水。
- */
-const MAX_PAGINATE_BLOCKS = 1200;
+/* 分页标记属性名与逐块排页上限统一见 `core/constant.ts`
+ *（DOC_PAGE_GAP_ATTR / DOC_MAX_PAGINATE_BLOCKS）：
+ * 超过上限就退化成「只算页数、不插留白」（见 {@link DocView.paginate}）——
+ * 分页是显示层的东西，不该把输入延迟拖下水。 */
 
 /** 纸张几何信息（分页 / 打印预览共用，避免两处各算一遍纸高） */
 export interface DocPageGeometry {
@@ -262,7 +262,7 @@ export class DocView {
      * 否则「看不清放大一点」会变成一次不可逆的内容修改。
      */
     public setZoom(value: number): void {
-        const next = Math.max(0.5, Math.min(4, value));
+        const next = Math.max(DOC_ZOOM_PERCENT_MIN / 100, Math.min(DOC_ZOOM_PERCENT_MAX / 100, value));
         if (next === this.zoomValue) return;
         this.zoomValue = next;
         // 缩放改的是同一张纸的视觉大小：纸张 / 页边距设置必须跟着重算，
@@ -536,7 +536,7 @@ export class DocView {
         const children = Array.prototype.slice.call(this.blocksEl.children) as HTMLElement[];
         // ① 摘掉上一轮的分页留白
         for (let i = children.length - 1; i >= 0; i--) {
-            if (children[i].hasAttribute(PAGE_GAP_ATTR)) children[i].remove();
+            if (children[i].hasAttribute(DOC_PAGE_GAP_ATTR)) children[i].remove();
         }
         const blocks = Array.prototype.slice.call(this.blocksEl.children) as HTMLElement[];
         if (blocks.length === 0) {
@@ -548,7 +548,7 @@ export class DocView {
         // 【超大文档退化处理】逐块量一次是一个 O(块数) 的强制重排，几千块时打字会明显发涩。
         // 这时只回答「一共几页」（量最后一块的底部即可），不做逐块插留白 ——
         // 屏幕上少几条分页线不影响编辑，页数与打印仍然正确。
-        if (blocks.length > MAX_PAGINATE_BLOCKS) {
+        if (blocks.length > DOC_MAX_PAGINATE_BLOCKS) {
             const last = blocks[blocks.length - 1].getBoundingClientRect();
             const total = (last.bottom - top0) / z;
             const pages = Math.max(1, Math.floor((total + margin) / height) + 1);
@@ -582,7 +582,7 @@ export class DocView {
             const gap = target * height - (tops[i] + shift);
             if (gap > 0) {
                 const spacer = createDiv({ className: 'doc-page-gap' });
-                spacer.setAttribute(PAGE_GAP_ATTR, String(target));
+                spacer.setAttribute(DOC_PAGE_GAP_ATTR, String(target));
                 spacer.setAttribute('contenteditable', 'false');
                 spacer.style.height = `${gap}px`;
                 // 分页线画在**上一页纸的底边**上（留白的顶端再往上 margin 处），
@@ -1003,7 +1003,7 @@ export class DocView {
             const el = children[i] as HTMLElement;
             if (!el || !el.getAttribute) continue;
             // 分页留白不是内容：读进模型会变成一段空段落（表现为「每存一次多一行」）
-            if (el.hasAttribute(PAGE_GAP_ATTR)) continue;
+            if (el.hasAttribute(DOC_PAGE_GAP_ATTR)) continue;
             const block = this.readBlock(el);
             if (block) blocks.push(block);
         }
@@ -1505,7 +1505,7 @@ export class DocView {
         const children = this.blocksEl.children;
         for (let i = 0; i < children.length; i++) {
             const el = children[i] as HTMLElement;
-            if (el.hasAttribute(PAGE_GAP_ATTR)) continue;
+            if (el.hasAttribute(DOC_PAGE_GAP_ATTR)) continue;
             if (selection.isCollapsed) {
                 if (this.closestBlock(range.startContainer) === el) result.push(el);
             } else if (range.intersectsNode(el)) {

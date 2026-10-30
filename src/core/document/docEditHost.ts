@@ -31,7 +31,8 @@ import {
     TextAlignValue,
     WorkspaceKind,
 } from '../contract/editHost';
-import { CharStylePatch, DEFAULT_DOC_FONT_SIZE, DocBlock } from './blockTree';
+import { DEFAULT_DOC_FONT_SIZE } from '../constant';
+import { CharStylePatch, DocBlock } from './blockTree';
 import { DocStore } from './docStore';
 import { DocView } from './docView';
 

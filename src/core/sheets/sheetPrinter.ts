@@ -5,14 +5,14 @@
     # CSDN: https://blog.csdn.net/os373
 */
 
-import type { Cell } from "../core/dataArchitecture/cell";
-import type { DataCollection } from "../core/dataArchitecture/dataCollection";
-import { Slider, SliderChangeSource } from "../core/common/slider";
-import { getRegisteredFontFaceCss } from "./fontsLoader";
+import type { Cell } from "../dataArchitecture/cell";
+import type { DataCollection } from "../dataArchitecture/dataCollection";
+import { Slider, SliderChangeSource } from "../common/slider";
+import { getRegisteredFontFaceCss } from "../../utils/fontsLoader";
 // 预览外壳（遮罩 / 标题 / 左右分栏 / 页脚翻页与缩放）与文档预览共用同一份
-import { buildPrintPreviewShellHtml } from "./printPreviewShell";
+import { buildPrintPreviewShellHtml } from "../../utils/printPreviewShell";
 // 默认字体与主页面 canvas 保持一致（单一数据源），保证预览/打印与主页面的字体观感相同
-import { DEFAULT_FONT_FAMILY } from "../core/constant";
+import { DEFAULT_FONT_FAMILY } from "../constant";
 
 /**
  * 打印组件配置选项接口

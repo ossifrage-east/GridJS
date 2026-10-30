@@ -7,9 +7,9 @@
  *
  * ## 六条设计约定
  *
- * 1. **数据操作全在 DataCollection**：范围解析、命中扫描、字符级替换、跳转滚动都走
- *    `data.resolveSearchRect / findAllInRect / replaceInRect / gotoSearchHit`，
- *    本文件只做「取值 + 展示 + 按钮编排」，不碰单元格字符。
+ * 1. **数据操作全在查找目标（`SearchTarget`）**：范围解析、命中扫描、字符级替换、跳转滚动
+ *    都走 `target.resolveSearchRect / findAllInRect / replaceInRect / gotoSearchHit`，
+ *    本文件只做「取值 + 展示 + 按钮编排」，不碰单元格字符，也**不 import 表格数据层**。
  *
  * 2. **只在选定区域内进行**：范围是对话框里的一等公民（可直接输入，也可在主表格上拖选），
  *    打开时取当前选区；此后你把活动单元格挪到哪儿都不会改变查询范围 ——
@@ -40,15 +40,15 @@ import { createDiv, createInput, createSpan } from "../../../utils/dom";
 import { Dialog, DialogButtonOptions } from "../../common/dialog";
 import { Navigator } from "../../common/navigator";
 import { DataEvents } from "../../constant";
-import { DataCollection, SearchHit, SearchMatchOptions, SheetRect } from "../../dataArchitecture/dataCollection";
+import { SearchHit, SearchMatchOptions, SearchRect, SearchTarget } from "../../contract/search";
 
 /** 查找 / 替换的目标页签 */
 export type SearchDialogMode = 'find' | 'replace';
 
 /** SearchDialog 构造选项 */
 export interface SearchDialogOptions {
-    /** 数据集合实例 */
-    data: DataCollection;
+    /** 查找目标（契约层窄接口；表格侧由 `DataCollection` 结构化满足） */
+    target: SearchTarget;
 }
 
 /** 「查找」页签文本 */
@@ -77,11 +77,11 @@ const STYLE_ELEMENT_ID = 'gs-search-dialog-styles';
  *
  * @example
  * // 打开并定位到「替换」页签
- * new SearchDialog({ data }).open('replace');
+ * new SearchDialog({ target: data }).open('replace');
  */
 export class SearchDialog {
-    /** 数据集合实例 */
-    private data: DataCollection;
+    /** 查找目标（只认识契约层接口，不认识表格数据集合） */
+    private target: SearchTarget;
     /** 对话框实例（创建后长期持有，隐藏不销毁） */
     private dialog: Dialog | null = null;
     /** 页签导航组件 */
@@ -144,7 +144,7 @@ export class SearchDialog {
     private readonly handleSelectionChanged = (): void => {
         if (this.suppressRangeSync) return;
         if (!this.isVisible()) return;
-        const selection = this.data.selection;
+        const selection = this.target.selection;
         // 选区被清空（如刚切换文件）：保留既有范围，不拿「有内容区域」去暗中替换它
         if (!selection) return;
         this.applySelectionRange(selection);
@@ -154,7 +154,7 @@ export class SearchDialog {
      * @param {SearchDialogOptions} options - 构造选项
      */
     constructor(options: SearchDialogOptions) {
-        this.data = options.data;
+        this.target = options.target;
     }
 
     /**
@@ -166,11 +166,11 @@ export class SearchDialog {
     }
 
     /**
-     * 绑定的数据集合
-     * @returns {DataCollection} 数据集合实例
+     * 绑定的查找目标
+     * @returns {SearchTarget} 查找目标
      */
-    public getData(): DataCollection {
-        return this.data;
+    public getTarget(): SearchTarget {
+        return this.target;
     }
 
     /**
@@ -202,12 +202,12 @@ export class SearchDialog {
         dialog.setRangePickMode(true);
 
         // 重复注册会叠加回调，先 off 再 on 保证只有一个订阅
-        this.data.off(DataEvents.SELECTION_CHANGED, this.handleSelectionChanged);
-        this.data.on(DataEvents.SELECTION_CHANGED, this.handleSelectionChanged);
+        this.target.off(DataEvents.SELECTION_CHANGED, this.handleSelectionChanged);
+        this.target.on(DataEvents.SELECTION_CHANGED, this.handleSelectionChanged);
 
         // 每次打开都以「当前选区」为默认范围（设计约定 2 的默认语义；
         // 单格选区会被解释成「整表 + 起点」，见设计约定 3）
-        this.applySelectionRange(this.data.selection);
+        this.applySelectionRange(this.target.selection);
 
         this.switchTab(mode ?? this.activeTab);
         this.focusFind();
@@ -223,20 +223,20 @@ export class SearchDialog {
      * @param {string | null | undefined} selection - 主表格当前选区（如 `'A1:C9'` / `'B2:B2'`）
      */
     private applySelectionRange(selection: string | null | undefined): void {
-        const rect = selection ? this.data.resolveSearchRect(selection) : this.data.resolveSearchRect();
+        const rect = selection ? this.target.resolveSearchRect(selection) : this.target.resolveSearchRect();
         if (!rect) {
             this.anchor = null;
             this.setStatus('没有可查询的范围（请先在表格里选中区域，或直接填写如 A1:C20）');
             return;
         }
-        const expanded = this.data.expandSingleCellRect(rect);
+        const expanded = this.target.expandSingleCellRect(rect);
         const effective = expanded ? expanded.rect : rect;
-        const text = this.data.formatRect(effective);
+        const text = this.target.formatRect(effective);
         this.anchor = expanded ? expanded.anchor : null;
         this.setRangeValue(text);
         this.dirty = true;
         if (expanded) {
-            const anchorName = this.data.getCellName(expanded.anchor.col, expanded.anchor.row);
+            const anchorName = this.target.getCellName(expanded.anchor.col, expanded.anchor.row);
             this.setStatus(`选中的是单个单元格 ${anchorName}，已扩为整表 ${text} 查找（从 ${anchorName} 往下）`);
         } else {
             this.setStatus(`范围 = ${text}；可直接在主表格上拖选区域`);
@@ -247,7 +247,7 @@ export class SearchDialog {
      * 隐藏对话框（不销毁，保留全部输入与命中状态）
      */
     public hide(): void {
-        this.data.off(DataEvents.SELECTION_CHANGED, this.handleSelectionChanged);
+        this.target.off(DataEvents.SELECTION_CHANGED, this.handleSelectionChanged);
         this.dialog?.hide();
     }
 
@@ -255,7 +255,7 @@ export class SearchDialog {
      * 销毁对话框与页签导航（仅在数据集合更换 / 页面卸载时使用）
      */
     public destroy(): void {
-        this.data.off(DataEvents.SELECTION_CHANGED, this.handleSelectionChanged);
+        this.target.off(DataEvents.SELECTION_CHANGED, this.handleSelectionChanged);
         this.hits = [];
         this.cursor = -1;
         this.truncated = false;
@@ -577,10 +577,10 @@ export class SearchDialog {
 
     /**
      * 解析范围输入框；非法时给出提示
-     * @returns {SheetRect | null} 合法范围
+     * @returns {SearchRect | null} 合法范围
      */
-    private currentRect(): SheetRect | null {
-        const rect = this.data.resolveSearchRect(this.rangeInputs[0]?.value ?? '');
+    private currentRect(): SearchRect | null {
+        const rect = this.target.resolveSearchRect(this.rangeInputs[0]?.value ?? '');
         if (!rect) {
             this.setStatus('没有可查询的范围（请先在表格里选中区域，或直接填写如 A1:C20）');
             return null;
@@ -601,16 +601,16 @@ export class SearchDialog {
      *
      * 结果被 {@link SEARCH_HIT_LIMIT} 截断时置 {@link truncated}：列表仍可正常导航，
      * 只是条目不全，提示语会说明（不谎报总数）。
-     * @param {SheetRect} rect - 查询范围
+     * @param {SearchRect} rect - 查询范围
      * @param {string} keyword - 关键字
      * @param {{ col: number; row: number } | null} [resumeFrom] - 起点（见 {@link cursorBefore}）
      */
     private refreshHits(
-        rect: SheetRect,
+        rect: SearchRect,
         keyword: string,
         resumeFrom: { col: number; row: number } | null = null
     ): void {
-        this.hits = this.data.findAllInRect(rect, keyword, this.currentOptions(), SEARCH_HIT_LIMIT);
+        this.hits = this.target.findAllInRect(rect, keyword, this.currentOptions(), SEARCH_HIT_LIMIT);
         this.truncated = this.hits.length >= SEARCH_HIT_LIMIT;
         this.cursor = this.cursorBefore(rect, resumeFrom);
         this.dirty = false;
@@ -627,11 +627,11 @@ export class SearchDialog {
      * 两处调用：
      * - 单格选区扩成整表时传 `anchor`（「从这个单元格往下找」）；
      * - 「替换」之后传刚改过的那一格（它已从列表里消失，于是下一个命中就是原后继）。
-     * @param {SheetRect} rect - 查询范围
+     * @param {SearchRect} rect - 查询范围
      * @param {{ col: number; row: number } | null} position - 起点；null 表示从头开始
      * @returns {number} 游标位置（-1 表示从头开始）
      */
-    private cursorBefore(rect: SheetRect, position: { col: number; row: number } | null): number {
+    private cursorBefore(rect: SearchRect, position: { col: number; row: number } | null): number {
         if (!position) return -1;
         const width = rect.endCol - rect.startCol + 1;
         const target = searchKey(rect, position.row, position.col, width);
@@ -712,7 +712,7 @@ export class SearchDialog {
     private gotoHit(hit: SearchHit): void {
         this.suppressRangeSync = true;
         try {
-            this.data.gotoSearchHit(hit);
+            this.target.gotoSearchHit(hit);
         } finally {
             this.suppressRangeSync = false;
         }
@@ -740,7 +740,7 @@ export class SearchDialog {
         }
         const hit = this.hits[this.cursor];
         // 只替换这一格：把命中项作为 targets 传入，范围内其它命中保持原样
-        const count = this.data.replaceInRect(
+        const count = this.target.replaceInRect(
             rect, keyword, this.replaceInputs[0]?.value ?? '', this.currentOptions(), [hit], '替换'
         );
         // 【只就地更新这一条，**不重扫**整个范围】
@@ -749,7 +749,7 @@ export class SearchDialog {
         // 一个字都没变，列表里的 `text` 快照仍然有效。
         // 替换后是否仍命中用 cellMatches 现算一次（关键字 'a' → 替换成 'aa' 的情形
         // 仍然命中，那就把它留在列表里，下次「查找下一个」走过它、再下一轮回到它）。
-        const rebuilt = this.data.cellMatches(hit.cell, keyword, this.currentOptions());
+        const rebuilt = this.target.cellMatches(hit.cell, keyword, this.currentOptions());
         if (rebuilt) {
             this.hits[this.cursor] = rebuilt;
         } else {
@@ -778,7 +778,7 @@ export class SearchDialog {
         }
         // 不传 targets = 替换范围内全部命中（数据层一次稀疏扫描 + 一次稀疏补丁，
         // 不经命中列表，因此不受 SEARCH_HIT_LIMIT 影响）
-        const count = this.data.replaceInRect(
+        const count = this.target.replaceInRect(
             rect, keyword, this.replaceInputs[0]?.value ?? '', this.currentOptions(), null, '全部替换'
         );
         this.dirty = true;
@@ -813,19 +813,19 @@ export class SearchDialog {
      * 页签、关键字、匹配选项与命中位置都还在（设计约定 4）。
      */
     private onDialogHide(): void {
-        this.data.off(DataEvents.SELECTION_CHANGED, this.handleSelectionChanged);
+        this.target.off(DataEvents.SELECTION_CHANGED, this.handleSelectionChanged);
     }
 }
 
 /**
  * 单元格在查询范围内的**行优先序号**（与 DataCollection 内部的键同构）
- * @param {SheetRect} rect - 查询范围
+ * @param {SearchRect} rect - 查询范围
  * @param {number} row - 行号（1-based）
  * @param {number} col - 列号（1-based）
  * @param {number} width - 范围宽度（列数）
  * @returns {number} 行优先序号
  */
-function searchKey(rect: SheetRect, row: number, col: number, width: number): number {
+function searchKey(rect: SearchRect, row: number, col: number, width: number): number {
     return (row - rect.startRow) * width + (col - rect.startCol);
 }
 
@@ -869,7 +869,7 @@ function linkCheckboxes(inputs: HTMLInputElement[]): void {
  * 工具栏菜单与 Ctrl+F / Ctrl+H 快捷键都要打开**同一个**对话框，因此需要共享实例：
  * 各自 `new` 一个会出现两个互不感知的对话框（快捷键打开时菜单那个不隐藏、
  * 也不会被 {@link Dialog} 的互斥显隐覆盖到，因为它同样处于打开状态）。
- * 由 `openFindReplace` / `hideFindReplace` 统一管理；数据集合更换时自动重建。
+ * 由 `openFindReplace` / `hideFindReplace` 统一管理；查找目标更换时自动重建。
  */
 let sharedSearchDialog: SearchDialog | null = null;
 
@@ -878,15 +878,15 @@ let sharedSearchDialog: SearchDialog | null = null;
  *
  * 已打开时**只切换页签并聚焦**（不重置范围）—— 快捷键连按不该把用户
  * 辛苦拖出来的范围冲掉；需要收起请按 ESC 或点「关闭」。
- * @param {DataCollection} data - 数据集合
+ * @param {SearchTarget} target - 查找目标（表格侧传 `DataCollection`，结构兼容）
  * @param {SearchDialogMode} [mode] - 目标页签，省略时沿用当前页签
  */
-export function openFindReplace(data: DataCollection, mode?: SearchDialogMode): void {
-    if (sharedSearchDialog && sharedSearchDialog.getData() !== data) {
+export function openFindReplace(target: SearchTarget, mode?: SearchDialogMode): void {
+    if (sharedSearchDialog && sharedSearchDialog.getTarget() !== target) {
         sharedSearchDialog.destroy();
         sharedSearchDialog = null;
     }
-    if (!sharedSearchDialog) sharedSearchDialog = new SearchDialog({ data });
+    if (!sharedSearchDialog) sharedSearchDialog = new SearchDialog({ target });
     if (sharedSearchDialog.isVisible()) {
         sharedSearchDialog.refocus(mode);
         return;
