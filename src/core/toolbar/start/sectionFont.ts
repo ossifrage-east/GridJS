@@ -1,31 +1,40 @@
 /*  # web 表格顶部工具栏字体工具集合 TS 文件
+    # 项目名称: silkspaces（藕丝空间）
+    # 项目描述: 基于 HTML5 Canvas 的 Web 电子表格组件，无需服务端支持即可在浏览器中创建、读取、写入 Excel 文件。
+    # 项目目标: 工具栏的「字体样式」分区 —— 字体、字号、粗体、斜体、下划线、删除线、边框、油漆桶、文字色。
+    # 本文件职责: 只负责**外观与交互**：建按钮、开菜单、按状态高亮；
+    #             真正「改什么」一律通过 {@link CommandBus} 派发，改完再按快照回读状态。
+    # 依赖方向: contract/commandBus + common/*，**不再 import dataArchitecture**。
+    #           改造前本文件有 7 处 `this.data.isEditting ? setSelectedCharsFont : setSelectedCellsFont`
+    #           的同构分支，现已全部收敛到宿主的 applyCharStyle 一处。
     # author: 东方鹗
     # B站: https://space.bilibili.com/194359739
     # 知乎: https://www.zhihu.com/people/eastossifrage
     # CSDN: https://blog.csdn.net/os373
+    # 项目许可证: MIT 许可证
 */
 
 import { createDiv } from "../../../utils/dom";
-import { FONT_FAMILY_LIST, TOOLBAR_CLASS_NAME, DataEvents, DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE } from "../../constant";
+import { FONT_FAMILY_LIST, TOOLBAR_CLASS_NAME, DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE } from "../../constant";
 import { BtnBase } from "../../common/button";
 import { ColorPicker } from "../../common/colorPicker";
 import { Menu } from "../../common/menu";
 import { Select } from "../../common/select";
-import { DataCollection } from "../../dataArchitecture/dataCollection";
-import { CellBorderStyle } from "../../dataArchitecture/cellContent";
+import { CommandBus } from "../../contract/commandBus";
+import { EDIT_STATE_CHANGED } from "../../contract/editHost";
 
 
 /**
  * SectionFont 构造选项接口
  * @interface
  * @property {HTMLElement} [parentElement] - 父元素容器
- * @property {DataCollection} data - 数据集合实例
+ * @property {CommandBus} bus - 命令总线（编辑宿主的状态与命令入口）
  * @property {Menu} menu - 菜单实例
  * @property {string} [title] - 工具栏标题
  */
 export interface sectionFontOptions {
     parentElement?: HTMLElement;
-    data: DataCollection; 
+    bus: CommandBus;
     menu: Menu;
     title?: string;
 }
@@ -42,8 +51,8 @@ export class SectionFont {
     private top: HTMLDivElement;
     /** @type {HTMLDivElement} 字体样式按钮容器 */
     private bottom: HTMLDivElement;
-    /** @type {DataCollection} 数据集合实例 */
-    private data: DataCollection;
+    /** @type {CommandBus} 命令总线（外壳与宿主之间唯一的接触面） */
+    private bus: CommandBus;
     /** @type {Menu} 菜单实例 */
     private menu: Menu;
     /** @type {Record<string, (Select | BtnBase) | undefined>} 工具栏按钮集合 */
@@ -62,7 +71,7 @@ export class SectionFont {
         if (options.parentElement) {
             options.parentElement.append(this.sectionFont);
         }
-        this.data  = options.data;
+        this.bus  = options.bus;
         this.menu = options.menu;
         
         const __div = createDiv({
@@ -146,11 +155,7 @@ export class SectionFont {
                     })
                 }
                 if (!todo.includes('Menu')) {  // 点击菜单时，只要不是下拉菜单打开事项，则改变显示内容
-                    if (this.data.isEditting) {
-                        this.data.setSelectedCharsFont({ fontFamily: todo }); 
-                    } else {
-                        this.data.setSelectedCellsFont({ fontFamily: todo });
-                    }
+                    this.bus.dispatch('setFontFamily', { value: todo });
                     fontSelect.setText(todo);
                 }
             }
@@ -188,12 +193,10 @@ export class SectionFont {
                     this.menu.addMenuElement(fontSizeSelect.getElements().menuContainer);
                 }
                 if (!todo.includes('Menu')) {  // 点击菜单时，只要不是下拉菜单打开事项，则改变显示内容
+                    // 菜单里是磅值，宿主存的是像素（乘 devicePixelRatio）；换算留在外壳，
+                    // 因为它是「菜单项怎么写」的问题，不是「编辑怎么改」的问题
                     const fontSize = Math.floor(parseInt(todo) * window.devicePixelRatio);
-                    if (this.data.isEditting) {
-                        this.data.setSelectedCharsFont({ fontSize: fontSize }); 
-                    } else {
-                        this.data.setSelectedCellsFont({ fontSize: fontSize });
-                    }                    
+                    this.bus.dispatch('setFontSize', { value: fontSize });
                     fontSizeSelect.setText(todo);
                 }
             }
@@ -201,7 +204,7 @@ export class SectionFont {
 
         const boldBtn = new BtnBase({
             parentElement: this.bottom,
-            data: this.data,
+            stateSource: this.bus,
             isDisabledOnEditting: false,
             menu: this.menu,
             toDo: 'bold',
@@ -211,19 +214,18 @@ export class SectionFont {
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
+                // 【先算再派发】宿主执行完会同步广播状态变化，setToolbarsState 会按真实值
+                // 把按钮刷一遍；若在派发之后再读 isActived，读到的是「已刷新后的值」，
+                // 再取反就把按钮翻回去了（表现为点一次亮、下一次点不灭）
                 const bool = !boldBtn.isActived;
                 boldBtn.setActived(bool);
-                if (this.data.isEditting) {
-                    this.data.setSelectedCharsFont({ fontWeight: bool });
-                } else {
-                    this.data.setSelectedCellsFont({ fontWeight: bool });
-                }
+                this.bus.dispatch('toggleBold', { toggle: bool });
             }
         });
         
         const italicBtn = new BtnBase({
             parentElement: this.bottom,
-            data: this.data,
+            stateSource: this.bus,
             isDisabledOnEditting: false,
             menu: this.menu,
             toDo: 'italic',
@@ -235,17 +237,13 @@ export class SectionFont {
             onClick: (todo) => {
                 const bool = !italicBtn.isActived;
                 italicBtn.setActived(bool);
-                if (this.data.isEditting) {
-                    this.data.setSelectedCharsFont({ fontStyle: bool });
-                } else {
-                    this.data.setSelectedCellsFont({ fontStyle: bool });
-                }
+                this.bus.dispatch('toggleItalic', { toggle: bool });
             }
         });
         
         const underlineBtn = new BtnBase({
             parentElement: this.bottom,
-            data: this.data,
+            stateSource: this.bus,
             isDisabledOnEditting: false,
             menu: this.menu,
             toDo: 'underline',
@@ -257,17 +255,13 @@ export class SectionFont {
             onClick: (todo) => {
                 const bool = !underlineBtn.isActived;
                 underlineBtn.setActived(bool);
-                if (this.data.isEditting) {
-                    this.data.setSelectedCharsFont({ underline: bool });
-                } else {
-                    this.data.setSelectedCellsFont({ underline: bool });
-                }
+                this.bus.dispatch('toggleUnderline', { toggle: bool });
             }
         });
 
         const strikethroughBtn = new BtnBase({
             parentElement: this.bottom,
-            data: this.data,
+            stateSource: this.bus,
             isDisabledOnEditting: false,
             menu: this.menu,
             toDo: 'strikethrough',
@@ -279,17 +273,13 @@ export class SectionFont {
             onClick: (todo) => {
                 const bool = !strikethroughBtn.isActived;
                 strikethroughBtn.setActived(bool);
-                if (this.data.isEditting) {
-                    this.data.setSelectedCharsFont({ strikethrough: bool });
-                } else {
-                    this.data.setSelectedCellsFont({ strikethrough: bool });
-                }
+                this.bus.dispatch('toggleStrike', { toggle: bool });
             }
         });
 
         const borderBtn = new BtnBase({
             parentElement: this.bottom,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'border',
             icon: 'icon-border-none font15',
@@ -327,23 +317,25 @@ export class SectionFont {
                         clickBtn = true;
                     }
 
+                    // 八种线型映射成同一个命令：菜单点选优先，其次看按钮当前图标
                     const icon = borderBtn.getIcon();
-                    if ((clickMenuItem && todo === 'border-none') || (clickBtn && icon.includes('icon-border-none'))) {
-                        this.data.setSelectedCellsBorder('border-none' as CellBorderStyle);   
-                    } else if ((clickMenuItem && todo === 'border-all') || (clickBtn && icon.includes('icon-border-all'))) {
-                        this.data.setSelectedCellsBorder('border-all' as CellBorderStyle);
-                    } else if ((clickMenuItem && todo === 'border-outer') || (clickBtn && icon.includes('icon-border-outer'))) {
-                        this.data.setSelectedCellsBorder('border-outer' as CellBorderStyle);
-                    } else if ((clickMenuItem && todo === 'border-wide-outer') || (clickBtn && icon.includes('icon-border-wide-outer'))) {
-                        this.data.setSelectedCellsBorder('border-wide-outer' as CellBorderStyle);
-                    } else if ((clickMenuItem && todo === 'border-bottom') || (clickBtn && icon.includes('icon-border-bottom'))) {
-                        this.data.setSelectedCellsBorder('border-bottom' as CellBorderStyle);
-                    } else if ((clickMenuItem && todo === 'border-top') || (clickBtn && icon.includes('icon-border-top'))) {
-                        this.data.setSelectedCellsBorder('border-top' as CellBorderStyle);
-                    } else if ((clickMenuItem && todo === 'border-left') || (clickBtn && icon.includes('icon-border-left'))) {
-                        this.data.setSelectedCellsBorder('border-left' as CellBorderStyle);
-                    } else if ((clickMenuItem && todo === 'border-right') || (clickBtn && icon.includes('icon-border-right'))) {
-                        this.data.setSelectedCellsBorder('border-right' as CellBorderStyle);
+                    const chosen = clickMenuItem ? todo : (clickBtn ? icon : '');
+                    if (chosen === 'border-none' || (chosen || '').includes('icon-border-none')) {
+                        this.bus.dispatch('setBorder', { value: 'border-none' });
+                    } else if (chosen === 'border-all' || (chosen || '').includes('icon-border-all')) {
+                        this.bus.dispatch('setBorder', { value: 'border-all' });
+                    } else if (chosen === 'border-outer' || (chosen || '').includes('icon-border-outer')) {
+                        this.bus.dispatch('setBorder', { value: 'border-outer' });
+                    } else if (chosen === 'border-wide-outer' || (chosen || '').includes('icon-border-wide-outer')) {
+                        this.bus.dispatch('setBorder', { value: 'border-wide-outer' });
+                    } else if (chosen === 'border-bottom' || (chosen || '').includes('icon-border-bottom')) {
+                        this.bus.dispatch('setBorder', { value: 'border-bottom' });
+                    } else if (chosen === 'border-top' || (chosen || '').includes('icon-border-top')) {
+                        this.bus.dispatch('setBorder', { value: 'border-top' });
+                    } else if (chosen === 'border-left' || (chosen || '').includes('icon-border-left')) {
+                        this.bus.dispatch('setBorder', { value: 'border-left' });
+                    } else if (chosen === 'border-right' || (chosen || '').includes('icon-border-right')) {
+                        this.bus.dispatch('setBorder', { value: 'border-right' });
                     }
                 }
             }
@@ -351,7 +343,7 @@ export class SectionFont {
 
         const paintBucketBtn = new BtnBase({
             parentElement: this.bottom,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'paintBucket',
             icon: 'icon-paint-bucket font15',
@@ -370,7 +362,7 @@ export class SectionFont {
                             onChange: (color) => {
                                 this.menu.closeMenu();
                                 paintBucketBtn.setSpanColor(color);
-                                this.data.setSelectedCellsFont({ backgroundColor: color !== 'none' ? color : 'white' });
+                                this.bus.dispatch('setBackground', { value: color !== 'none' ? color : 'white' });
                             }
                         });
                         return colorPicker.getElements().pickerContainer;
@@ -386,7 +378,7 @@ export class SectionFont {
                 if (!todo.includes('Menu')) {
                     const color = paintBucketBtn.getSpanColor();
                     if (color) {
-                        this.data.setSelectedCellsFont({ backgroundColor: color !== 'none' ? color : 'white' });
+                        this.bus.dispatch('setBackground', { value: color !== 'none' ? color : 'white' });
                     }
                 }
             }
@@ -394,7 +386,7 @@ export class SectionFont {
         
         const textColorBtn = new BtnBase({
             parentElement: this.bottom,
-            data: this.data,
+            stateSource: this.bus,
             isDisabledOnEditting: false,
             menu: this.menu,
             toDo: 'textColor',
@@ -415,11 +407,7 @@ export class SectionFont {
                                 if (color) {
                                     this.menu.closeMenu();
                                     textColorBtn.setSpanColor(color);
-                                    if (this.data.isEditting) {
-                                        this.data.setSelectedCharsFont({ fontColor: color !== 'none' ? color : 'black' }); 
-                                    } else {
-                                        this.data.setSelectedCellsFont({ fontColor: color !== 'none' ? color : 'black' });
-                                    }
+                                    this.bus.dispatch('setTextColor', { value: color !== 'none' ? color : 'black' });
                                 }
                             }
                         });
@@ -435,64 +423,51 @@ export class SectionFont {
                 if (!todo.includes('Menu')) {
                     const color = textColorBtn.getSpanColor();
                     if (color) {
-                        if (this.data.isEditting) {
-                            this.data.setSelectedCharsFont({ fontColor: color !== 'none' ? color : 'black' }); 
-                        } else {
-                            this.data.setSelectedCellsFont({ fontColor: color !== 'none' ? color : 'black' });
-                        }
+                        this.bus.dispatch('setTextColor', { value: color !== 'none' ? color : 'black' });
                     }
                 }
             }
         });
         this.toolbars = {fontSelect, fontSizeSelect, boldBtn, italicBtn, underlineBtn, strikethroughBtn, paintBucketBtn, textColorBtn};
-        this.setupDataListeners();
+        this.setupStateListeners();
     }
 
     /**
-     * 根据当前激活单元格的数据设置工具栏按钮状态
+     * 按当前宿主状态刷新按钮外观（单一数据来源：{@link CommandBus.snapshot}）
+     *
+     * 编辑态与非编辑态的差异**已由宿主在快照里归一化**：编辑态取光标处字符、
+     * 非编辑态取活动格代表值，外壳不判断该读哪里。唯一保留的分支是油漆桶——
+     * 背景色是单元格属性，编辑会话中无处可挂（{@link SheetEditHost} 的 setBackground 同样只走单元格级）。
      * @private
      */
     private setToolbarsState() {
-        const cell = this.data.getCellByName(this.data.activedCell);
-        if (this.data.isEditting) {
-            const cursorPosition = this.data.cursorAbsolutePosition - 1;
-            const char = cell?.chars?.[cursorPosition];
-            (this.toolbars.fontSelect as Select).setText(char?.fontFamily || DEFAULT_FONT_FAMILY);
-            (this.toolbars.fontSizeSelect as Select).setText((char?.fontSize || DEFAULT_FONT_SIZE).toString());
-            (this.toolbars.boldBtn as BtnBase).setActived(char?.fontWeight);
-            (this.toolbars.italicBtn as BtnBase).setActived(char?.fontStyle);
-            (this.toolbars.underlineBtn as BtnBase).setActived(char?.underline);
-            (this.toolbars.strikethroughBtn as BtnBase).setActived(char?.strikethrough);
-            (this.toolbars.textColorBtn as BtnBase).setSpanColor(char?.fontColor || 'black');
-            
-        } else {
-            (this.toolbars.fontSelect as Select).setText(cell?.fontFamily || DEFAULT_FONT_FAMILY);
-            (this.toolbars.fontSizeSelect as Select).setText((cell?.fontSize || DEFAULT_FONT_SIZE).toString());
-            (this.toolbars.boldBtn as BtnBase).setActived(cell?.fontWeight);
-            (this.toolbars.italicBtn as BtnBase).setActived(cell?.fontStyle);
-            (this.toolbars.underlineBtn as BtnBase).setActived(cell?.underline);
-            (this.toolbars.strikethroughBtn as BtnBase).setActived(cell?.strikethrough);
-            (this.toolbars.paintBucketBtn as BtnBase).setSpanColor(cell?.backgroundColor || 'white');
-            (this.toolbars.textColorBtn as BtnBase).setSpanColor(cell?.fontColor || 'black');
+        const state = this.bus.snapshot();
+        const char = state.char;
+        (this.toolbars.fontSelect as Select).setText(char.fontFamily || DEFAULT_FONT_FAMILY);
+        (this.toolbars.fontSizeSelect as Select).setText((char.fontSize || DEFAULT_FONT_SIZE).toString());
+        (this.toolbars.boldBtn as BtnBase).setActived(!!char.bold);
+        (this.toolbars.italicBtn as BtnBase).setActived(!!char.italic);
+        (this.toolbars.underlineBtn as BtnBase).setActived(!!char.underline);
+        (this.toolbars.strikethroughBtn as BtnBase).setActived(!!char.strike);
+        (this.toolbars.textColorBtn as BtnBase).setSpanColor(char.color || 'black');
+        if (!state.editing) {
+            (this.toolbars.paintBucketBtn as BtnBase).setSpanColor(char.background || 'white');
         }
     }
     
     /**
-     * 设置数据事件监听器
-     * 监听激活单元格变更和编辑状态变更事件，自动更新工具栏按钮状态
+     * 订阅「状态可能已变化」
+     *
+     * 改造前这里订阅了 4 个表格事件（ACTIVED_CELL_CHANGED / SNAPSHOT_RESTORED /
+     * IS_EDITTING_CHANGED / CURSOR_STATE_CHANGED）并各自调一次 `syncValuesFromDB()`。
+     * 现在统一为总线的一个事件，且**不再由 UI 触发数据装载**——
+     * 那是数据层的职责（`sheets.ts` 已经在做），UI 顺手再读一次库纯属浪费。
      * @private
      */
-    private setupDataListeners() {
-        this.data.syncValuesFromDB().then(() => { 
-            this.setToolbarsState();
-        });
-        this.data.on(DataEvents.ACTIVED_CELL_CHANGED, () => this.setToolbarsState());
-        // 撤销/重做回写后同步按钮状态（活动单元格未变化时无 ACTIVED_CELL_CHANGED 事件）
-        this.data.on(DataEvents.SNAPSHOT_RESTORED, () => this.setToolbarsState());
-        this.data.on(DataEvents.IS_EDITTING_CHANGED, (_, isEditting) => {
-            if(!isEditting) this.setToolbarsState();
-        });
-        this.data.on(DataEvents.CURSOR_STATE_CHANGED, () => this.setToolbarsState());
+    private setupStateListeners() {
+        this.bus.on(EDIT_STATE_CHANGED, () => this.setToolbarsState());
+        // 首帧先按当前（可能还是空的）状态刷一次，避免按钮停留在默认外观
+        this.setToolbarsState();
     }
 
     /**

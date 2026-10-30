@@ -1,28 +1,39 @@
 /*  # web 表格顶部工具栏打印设置集合 TS 文件（「页面」标签页）
-    # 提供：打印预览、页边距、纸张方向、纸张大小、打印区域、打印缩放按钮。
-    # 除打印预览外均为「上图标下文字 + 下拉菜单」按钮，
-    # 设置通过共享 Printer 实例（getSharedPrinter）写入，与快速访问栏互通。
+    # 项目名称: silkspaces（藕丝空间）
+    # 项目描述: 基于 HTML5 Canvas 的 Web 电子表格组件，无需服务端支持即可在浏览器中创建、读取、写入 Excel 文件。
+    # 项目目标: 提供打印预览、页边距、纸张方向、纸张大小、打印区域、打印缩放按钮。
+    # 本文件职责: 只负责**外观与交互**；设置通过注入的共享 Printer 实例写入，与快速访问栏互通。
+    # 依赖方向: contract/commandBus + common/* + utils/printer。
+    #           **不再 import dataArchitecture** —— 打印引擎由装配层（App）注入，
+    #           因此本文件不知道数据是表格的还是别的什么。
     # author: 东方鹗
     # B站: https://space.bilibili.com/194359739
     # 知乎: https://www.zhihu.com/people/eastossifrage
     # CSDN: https://blog.csdn.net/os373
+    # 项目许可证: MIT 许可证
 */
 
 import { createDiv } from "../../../utils/dom";
 import { TOOLBAR_CLASS_NAME, MENU_CLASS_NAMES } from "../../constant";
-import { DataCollection } from "../../dataArchitecture/dataCollection";
 import { Menu } from "../../common/menu";
 import { BtnBase } from "../../common/button";
-import { Printer, getSharedPrinter, MarginPreset, PaperOrientation, PaperSize, ScaleMode } from "../../../utils/printer";
+import { CommandBus } from "../../contract/commandBus";
+import { Printer, MarginPreset, PaperOrientation, PaperSize, ScaleMode } from "../../../utils/printer";
 import { hideFindReplace } from "../start/searchDialog";
 
 /**
  * sectionPrintOptions 接口
+ * @property {HTMLElement} [parentElement] - 父元素，工具栏容器
+ * @property {CommandBus} bus - 命令总线（按钮只借它订阅编辑态）
+ * @property {Menu} menu - 菜单实例
+ * @property {Printer} printer - 共享打印实例（装配层注入，与快速访问栏用的是同一个）
+ * @property {string} [title] - 工具栏标题
  */
 export interface sectionPrintOptions {
     parentElement?: HTMLElement;  // 父元素，工具栏容器
-    data: DataCollection;  // 数据集合
+    bus: CommandBus;  // 命令总线
     menu: Menu;  // 菜单实例
+    printer: Printer;  // 共享打印实例
     title?: string;
 }
 
@@ -47,7 +58,7 @@ export interface sectionPrintOptions {
  */
 export class SectionPrint {
     private sectionPrint: HTMLDivElement;  // 打印设置区域容器
-    private data: DataCollection;  // 数据集合
+    private bus: CommandBus;  // 命令总线（外壳与宿主之间唯一的接触面）
     private menu: Menu;  // 菜单实例
     /** 共享打印实例：与快速访问栏的打印/打印预览按钮共用，打印设置互通 */
     private printer: Printer;
@@ -63,9 +74,9 @@ export class SectionPrint {
         if (options.parentElement) {
             options.parentElement.append(this.sectionPrint);
         }
-        this.data = options.data;
+        this.bus = options.bus;
         this.menu = options.menu;
-        this.printer = getSharedPrinter(options.data);
+        this.printer = options.printer;
         this.init();
     }
 
@@ -77,7 +88,7 @@ export class SectionPrint {
         /*------------------ 打印预览 ------------------*/
         new BtnBase({
             parentElement: this.sectionPrint,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'printPreview',
             icon: 'icon-printer-view',
@@ -97,7 +108,7 @@ export class SectionPrint {
         const marginTodos = ['normal', 'wide', 'narrow'];
         const marginBtn = new BtnBase({
             parentElement: this.sectionPrint,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'margin',
             icon: 'icon-page-margins',
@@ -128,7 +139,7 @@ export class SectionPrint {
         const orientationTodos = ['portrait', 'landscape'];
         const orientationBtn = new BtnBase({
             parentElement: this.sectionPrint,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'orientation',
             icon: 'icon-orientation',
@@ -158,7 +169,7 @@ export class SectionPrint {
         const paperTodos = ['A4', 'A3', 'B5', 'Letter'];
         const paperBtn = new BtnBase({
             parentElement: this.sectionPrint,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'paper',
             icon: 'icon-paper-size',
@@ -217,7 +228,7 @@ export class SectionPrint {
         }
         const areaBtn = new BtnBase({
             parentElement: this.sectionPrint,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'area',
             icon: 'icon-print-area',
@@ -315,7 +326,7 @@ export class SectionPrint {
 
         const scaleBtn = new BtnBase({
             parentElement: this.sectionPrint,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'scale',
             icon: 'icon-print-zoom',

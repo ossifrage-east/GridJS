@@ -73,7 +73,7 @@ export class QuickAccess {
         const backBtn = new BtnBase(  // 撤销按钮
             {
                 parentElement: this.panel, 
-                data: this.data,
+                stateSource: this.data,
                 isDisabledOnEditting: false,
                 menu: this.menu,
                 toDo: 'back',
@@ -90,7 +90,7 @@ export class QuickAccess {
         const forwardBtn = new BtnBase(  // 恢复按钮
             {
                 parentElement: this.panel,
-                data: this.data,
+                stateSource: this.data,
                 isDisabledOnEditting: false,
                 menu: this.menu,
                 toDo: 'forward',
@@ -122,7 +122,7 @@ export class QuickAccess {
         const printBtn = new BtnBase(  // 打印按钮
             {
                 parentElement: this.panel,
-                data: this.data,
+                stateSource: this.data,
                 menu: this.menu,
                 toDo: 'print',
                 icon: 'icon-printer',
@@ -138,7 +138,7 @@ export class QuickAccess {
         const printViewBtn = new BtnBase(  // 打印预览按钮
             {
                 parentElement: this.panel,
-                data: this.data,
+                stateSource: this.data,
                 menu: this.menu,
                 toDo: 'printView',
                 icon: 'icon-printer-view',

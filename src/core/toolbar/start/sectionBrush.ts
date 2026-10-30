@@ -1,28 +1,36 @@
 /*  # web 表格顶部工具栏格式刷集合 TS 文件
+    # 项目名称: silkspaces（藕丝空间）
+    # 项目描述: 基于 HTML5 Canvas 的 Web 电子表格组件，无需服务端支持即可在浏览器中创建、读取、写入 Excel 文件。
+    # 项目目标: 工具栏的「格式刷」分区 —— 格式刷、复制、剪切、粘贴（含只粘值 / 只粘格式）。
+    # 本文件职责: 只负责**外观与交互**；剪贴板与撤销记账全部经 {@link CommandBus} 派发。
+    #             改造前这里直接调了 runWithFullStateUndo / emit(VALUES_CHANGED) ——
+    #             「撤销怎么记账」是宿主的事，外壳不该知道，现已搬进 SheetEditHost。
+    # 依赖方向: contract/commandBus + common/*，**不再 import dataArchitecture**。
     # author: 东方鹗
     # B站: https://space.bilibili.com/194359739
     # 知乎: https://www.zhihu.com/people/eastossifrage
     # CSDN: https://blog.csdn.net/os373
+    # 项目许可证: MIT 许可证
 */
 
-
 import { createDiv } from "../../../utils/dom";
-import { TOOLBAR_CLASS_NAME, DataEvents } from "../../constant";
-import { DataCollection } from "../../dataArchitecture/dataCollection";
+import { TOOLBAR_CLASS_NAME } from "../../constant";
 import { Menu } from "../../common/menu";
 import { BtnBase } from "../../common/button";
+import { CommandBus } from "../../contract/commandBus";
+import { EDIT_STATE_CHANGED } from "../../contract/editHost";
 
 /**
  * SectionBrush 构造选项接口
  * @interface
  * @property {HTMLElement} [parentElement] - 父元素容器
- * @property {DataCollection} data - 数据集合实例
+ * @property {CommandBus} bus - 命令总线（编辑宿主的状态与命令入口）
  * @property {Menu} menu - 菜单实例
  * @property {string} [title] - 工具栏标题
  */
 export interface sectionBrushOptions {
     parentElement?: HTMLElement;
-    data: DataCollection;
+    bus: CommandBus;
     menu: Menu;
     title?: string;
 }
@@ -35,10 +43,12 @@ export interface sectionBrushOptions {
 export class SectionBrush {
     /** @type {HTMLDivElement} 格式刷区域容器元素 */
     private sectionBrush: HTMLDivElement;
-    /** @type {DataCollection} 数据集合实例 */
-    private data: DataCollection;
+    /** @type {CommandBus} 命令总线（外壳与宿主之间唯一的接触面） */
+    private bus: CommandBus;
     /** @type {Menu} 菜单实例 */
     private menu: Menu;
+    /** 格式刷按钮（状态刷新时需要单独回写高亮） */
+    private brushBtn!: BtnBase;
 
     /**
      * 创建 SectionBrush 实例
@@ -52,7 +62,7 @@ export class SectionBrush {
         if (options.parentElement) {
             options.parentElement.append(this.sectionBrush);
         }
-        this.data = options.data;
+        this.bus = options.bus;
         this.menu = options.menu;
         this.init();
     }
@@ -66,7 +76,7 @@ export class SectionBrush {
         /*------------------ 格式刷分区 ------------------*/        
         const brushBtn = new BtnBase({  // 格式刷按钮
             parentElement: this.sectionBrush,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'brush',
             icon: 'icon-brush',
@@ -74,30 +84,19 @@ export class SectionBrush {
             ishow: true,
             tshow: true,
             layout: 'vertical',
+            // 单击 / 双击是两个不同命令：单击 = 单次刷，双击 = 连续刷。
+            // 高亮不再由这里手写 setActived，而是统一按快照的 brushMode 推导
             onClick: (todo: string) => {
-                if (this.data.brushMode === 'continuous') {
-                    this.data.brushMode = null;
-                    brushBtn.setActived(false);
-                } else {
-                    this.data.brushMode = 'single';
-                    this.data.copySelection();
-                }
+                this.bus.dispatch('brushClick');
             },
             onDoubleClick: (todo: string) => {
-                if (this.data.brushMode === 'continuous') {
-                    this.data.brushMode = null;
-                    brushBtn.setActived(false);
-                } else {
-                    this.data.brushMode = 'continuous';
-                    // brushBtn.setActived(true);
-                }
-                this.data.copySelection();
+                this.bus.dispatch('brushDoubleClick');
             }
         });
         
         const copyBtn = new BtnBase({  // 复制按钮
             parentElement: this.sectionBrush,
-            data: this.data,
+            stateSource: this.bus,
             isDisabledOnEditting: false,
             menu: this.menu,
             toDo: 'copy',
@@ -106,20 +105,15 @@ export class SectionBrush {
             ishow: true,
             tshow: true,
             layout: 'vertical',
+            // 「编辑态有字符选区 → 字符级复制，否则单元格级」这个判断在宿主内
             onClick: (todo: string) => {
-                if (this.data.selectionOnEditting && this.data.isEditting) {
-                    // 编辑状态下有字符选择，进行字符级复制
-                    this.data.copyChars();
-                } else {
-                    // 单元格级复制
-                    this.data.copySelection();
-                }
+                this.bus.dispatch('copy');
             }
         });
         
         const cutBtn = new BtnBase({  // 剪切按钮
             parentElement: this.sectionBrush,
-            data: this.data,
+            stateSource: this.bus,
             isDisabledOnEditting: false,
             menu: this.menu,
             toDo: 'cut',
@@ -129,24 +123,13 @@ export class SectionBrush {
             tshow: true,
             layout: 'vertical',
             onClick: (todo: string) => {
-                if (this.data.selectionOnEditting && this.data.isEditting) {
-                    // cutChars 返回目标光标绝对位置（被删除区间起点）。
-                    // VALUES_CHANGED 会同步触发重绘并刷新 data.lines，因此此处写入
-                    // cursorAbsolutePosition 时 lines 已是最新布局。
-                    const caretIndex = this.data.cutChars();
-                    this.data.cursorAbsolutePosition = caretIndex;
-                } else {
-                    // 单元格级剪切：与右键菜单同口径包裹，大表按选区稀疏补丁记账可撤销/重做
-                    this.data.runWithFullStateUndo('剪切', () => this.data.cutSelection(), 'selection');
-                    // 包裹抑制了 commitValues 的自动广播，这里补一次驱动重绘（draw 按 rAF 合帧）
-                    this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
-                }
+                this.bus.dispatch('cut');
             }
         });
 
         const pasteBtn = new BtnBase({  // 粘贴按钮
             parentElement: this.sectionBrush,
-            data: this.data,
+            stateSource: this.bus,
             isDisabledOnEditting: false,
             menu: this.menu,
             toDo: 'paste',
@@ -175,58 +158,48 @@ export class SectionBrush {
             }
         });
 
-        this.data.on(DataEvents.BRUSH_MODE_CHANGED, (mode) => {
-            brushBtn.setActived(mode === 'continuous');
-        });        
+        this.brushBtn = brushBtn;
+        this.setupStateListeners();
     }
 
     /**
      * 处理粘贴操作
-     * 根据操作类型执行不同的粘贴逻辑（全部粘贴、仅粘贴值、仅粘贴格式）
+     * 根据操作类型派发不同命令（全部粘贴、仅粘贴值、仅粘贴格式）
      * @param {string} todo - 操作类型标识（'paste' | 'paste-value' | 'paste-style'）
      * @private
      */
     private handlePaste(todo: string) {
         switch (todo) {
             case 'paste':
-                if (this.data.isEditting) {
-                    // 编辑状态下进行字符级粘贴
-                    const clipboard = this.data.clipboardManager.getClipboard();
-                    if (clipboard && clipboard.type === 'char' && clipboard.chars) {
-                        // getSelectedCharsStartIndex(): 有选区时返回选区起点，无选区时返回光标处，
-                        // 即真正的插入起点。pasteChars 返回插入完成后光标应处的绝对位置。
-                        // VALUES_CHANGED 会同步触发重绘并刷新 data.lines，因此此处写入
-                        // cursorAbsolutePosition 时 lines 已是最新布局。
-                        const insertIndex = this.data.getSelectedCharsStartIndex();
-                        const caretIndex = this.data.pasteChars(insertIndex, clipboard.chars);
-                        this.data.cursorAbsolutePosition = caretIndex;
-                    }
-                } else {
-                    // 非编辑态单元格级粘贴：与右键菜单同口径包裹，'paste' 档按粘贴目标矩形
-                    // 捕获稀疏补丁，大表同样可撤销/重做（超大块粘贴超上限时放弃记账）
-                    this.data.runWithFullStateUndo('粘贴', () => this.data.pasteSelection(), 'paste');
-                    this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
-                }
+                this.bus.dispatch('paste');
                 break;
             case 'paste-value':
-                // 编辑态下不纳入全量/补丁记账（字符级编辑有独立编辑内栈），保持裸调用
-                if (this.data.isEditting) {
-                    this.data.pastePlainText();
-                } else {
-                    this.data.runWithFullStateUndo('只粘贴文本', () => this.data.pastePlainText(), 'paste');
-                    this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
-                }
+                this.bus.dispatch('pasteValue');
                 break;
             case 'paste-style':
-                // 同上：编辑态裸调用，避免污染编辑内撤销栈
-                if (this.data.isEditting) {
-                    this.data.pasteFormatOnly();
-                } else {
-                    this.data.runWithFullStateUndo('只粘贴格式', () => this.data.pasteFormatOnly(), 'paste');
-                    this.data.emit(DataEvents.VALUES_CHANGED, this.data.values);
-                }
+                this.bus.dispatch('pasteStyle');
                 break;
         }
+    }
+
+    /**
+     * 按当前宿主状态刷新按钮高亮
+     *
+     * 只有「连续模式」才让格式刷按钮保持高亮：单次模式刷一次就自动退出，
+     * 亮着反而误导（改造前 BRUSH_MODE_CHANGED 的订阅回调就是这个口径）。
+     * @private
+     */
+    private setToolbarsState() {
+        this.brushBtn.setActived(this.bus.snapshot().brushMode === 'continuous');
+    }
+
+    /**
+     * 订阅「状态可能已变化」
+     * @private
+     */
+    private setupStateListeners() {
+        this.bus.on(EDIT_STATE_CHANGED, () => this.setToolbarsState());
+        this.setToolbarsState();
     }
 
     /**

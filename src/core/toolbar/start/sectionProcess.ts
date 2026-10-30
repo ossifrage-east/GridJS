@@ -1,17 +1,26 @@
 /*  # web 表格顶部工具栏数据处理工具集合 TS 文件
+    # 项目名称: silkspaces（藕丝空间）
+    # 项目描述: 基于 HTML5 Canvas 的 Web 电子表格组件，无需服务端支持即可在浏览器中创建、读取、写入 Excel 文件。
+    # 项目目标: 工具栏的「数据处理」分区 —— 计算、排序、冻结、筛选、查询/替换。
+    # 本文件职责: 建按钮、开菜单、按状态高亮；排序/筛选经 {@link CommandBus} 派发。
+    #             「计算」与「查询替换」不走命令总线，而是构造期注入的回调钩子：
+    #             前者是「把结果写进活动格」的展示偏好，后者是**对话框**（要拿数据源全表扫描、
+    #             还要跨次打开保留关键字与命中游标），都不属于「一次编辑动作」。
+    # 依赖方向: contract/commandBus + common/*，**不再 import dataArchitecture / searchDialog**。
     # author: 东方鹗
     # B站: https://space.bilibili.com/194359739
     # 知乎: https://www.zhihu.com/people/eastossifrage
     # CSDN: https://blog.csdn.net/os373
+    # 项目许可证: MIT 许可证
 */
 
 
 import { createDiv } from "../../../utils/dom";
-import { DataEvents, TOOLBAR_CLASS_NAME } from "../../constant";
+import { TOOLBAR_CLASS_NAME } from "../../constant";
 import { BtnBase } from "../../common/button";
 import { Menu } from "../../common/menu";
-import { DataCollection } from "../../dataArchitecture/dataCollection";
-import { openFindReplace } from "./searchDialog";
+import { CommandBus } from "../../contract/commandBus";
+import { EDIT_STATE_CHANGED } from "../../contract/editHost";
 
 /**
  * 「计算」菜单项的 todo → 即时计算项名
@@ -30,17 +39,19 @@ const CALC_ITEM_LABELS: Record<string, string> = {
  * SectionProcess 构造选项接口
  * @interface
  * @property {HTMLElement} [parentElement] - 父元素容器
- * @property {DataCollection} data - 数据集合实例
+ * @property {CommandBus} bus - 命令总线（编辑宿主的状态与命令入口）
  * @property {Menu} menu - 菜单实例
  * @property {string} [title] - 工具栏标题
  * @property {(label: string) => void} [onCalculate] - 点选求和/平均/计数/最大/最小后的回调
+ * @property {(mode: 'find' | 'replace') => void} [onFindReplace] - 点选查询/替换后的回调（拉起对话框）
  */
 export interface sectionProcessOptions {
     parentElement?: HTMLElement;
-    data: DataCollection;
+    bus: CommandBus;
     menu: Menu;
     title?: string;
     onCalculate?: (label: string) => void;
+    onFindReplace?: (mode: 'find' | 'replace') => void;
 }
 
 /**
@@ -51,14 +62,16 @@ export interface sectionProcessOptions {
 export class SectionProcess {
     /** @type {HTMLDivElement} 数据处理区域容器元素 */
     private sectionProcess: HTMLDivElement; 
-    /** @type {DataCollection} 数据集合实例 */
-    private data: DataCollection;
+    /** @type {CommandBus} 命令总线（外壳与宿主之间唯一的接触面） */
+    private bus: CommandBus;
     /** @type {Menu} 菜单实例 */
     private menu: Menu;
     /** @type {Record<string, BtnBase | undefined>} 工具栏按钮集合 */
     private toolbars: Record<string, BtnBase | undefined> = {};
     /** 点选求和/平均/计数/最大/最小后的回调 */
     private readonly onCalculate?: (label: string) => void;
+    /** 点选查询/替换后的回调 */
+    private readonly onFindReplace?: (mode: 'find' | 'replace') => void;
 
     /**
      * 创建 SectionProcess 实例
@@ -72,9 +85,10 @@ export class SectionProcess {
         if (options.parentElement) {
             options.parentElement.append(this.sectionProcess);
         }
-        this.data = options.data;
+        this.bus = options.bus;
         this.menu = options.menu;
         this.onCalculate = options.onCalculate;
+        this.onFindReplace = options.onFindReplace;
         const line = createDiv({
             className: TOOLBAR_CLASS_NAME.SECTION_LINE, 
         });
@@ -92,7 +106,7 @@ export class SectionProcess {
         /*------------------ 数据处理分区 ------------------*/
         const calculateBtn = new BtnBase({
             parentElement: this.sectionProcess,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'sum',
             icon: 'icon-sum',
@@ -125,7 +139,7 @@ export class SectionProcess {
         
         const sortBtn = new BtnBase({
             parentElement: this.sectionProcess, 
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'sort-up',
             icon: 'icon-sort-down-alt',
@@ -147,9 +161,9 @@ export class SectionProcess {
                     this.menu.addMenuElement(sortBtn.getElements().menuContainer);
                 } else {
                     if (todo.includes('sort-up')) {
-                        this.data.sortUp();
+                        this.bus.dispatch('sortUp');
                     } else if (todo.includes('sort-down')) {
-                        this.data.sortDown();
+                        this.bus.dispatch('sortDown');
                     }
                 }
             }
@@ -157,7 +171,7 @@ export class SectionProcess {
         
         const frozenBtn = new BtnBase({
             parentElement: this.sectionProcess, 
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'frozen',
             icon: 'icon-frozen-grid',
@@ -173,7 +187,7 @@ export class SectionProcess {
 
         const filterBtn = new BtnBase({
             parentElement: this.sectionProcess, 
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'filter',
             icon: 'icon-funnel',
@@ -184,13 +198,13 @@ export class SectionProcess {
             // separate: true,
             // ashow: true,
             onClick: (todo) => {
-                this.data.setFilter();
+                this.bus.dispatch('toggleFilter');
             }
         });
 
         const searchBtn = new BtnBase({
             parentElement: this.sectionProcess, 
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'search',
             icon: 'icon-search',
@@ -215,9 +229,9 @@ export class SectionProcess {
                     // 但反过来写（先判 search）会让 todo='replace' 被 'search' 分支截胡
                     // （真实菜单项的 todo 就是 'replace'，不含 'search' 字样，但保持
                     // 「特殊的分支先判」这一顺序，后续加 'search-in-range' 之类的条目不会踩坑）
-                    this.openSearchDialog('replace');
+                    this.onFindReplace?.('replace');
                 } else if (todo.includes('search')) {
-                    this.openSearchDialog('find');
+                    this.onFindReplace?.('find');
                 }
             }        });
         this.toolbars = {
@@ -226,44 +240,28 @@ export class SectionProcess {
             filterBtn,
             searchBtn,
         };
-        this.setupEventListeners();
-    }
-    
-    
-    /**
-     * 打开查询 / 替换对话框
-     *
-     * 核心数据能力都在 DataCollection（range 解析 / 命中扫描 / 字符级替换 / 跳转滚动），
-     * 这里只是把**全局共享**的那个对话框拉起来并切到目标页签。
-     *
-     * 用共享实例而非每次 `new`：Ctrl+F / Ctrl+H 走的是同一个入口，各自新建会得到
-     * 两个互不感知的对话框（快捷键打开时菜单那个不隐藏）。对话框内部结构只建一次、
-     * 隐藏不销毁，因此再次打开会保留页签、关键字与命中位置。
-     * @param {'find' | 'replace'} mode - 目标页签
-     * @private
-     */
-    private openSearchDialog(mode: 'find' | 'replace'): void {
-        openFindReplace(this.data, mode);
+        this.setupStateListeners();
     }
 
     /**
-     * 设置工具栏状态
+     * 按当前宿主状态刷新按钮高亮
+     *
+     * 编辑会话中不刷新筛选按钮：此时筛选条件不可能变，刷了只会白写 DOM。
      * @private
      */
     private setToolbarsState() {
-        if (!this.data.isEditting) {
-            this.toolbars.filterBtn.setActived(this.data.validataFilter());
-        }
-        
+        const state = this.bus.snapshot();
+        if (state.editing) return;
+        this.toolbars.filterBtn.setActived(state.filterActive);
     }
 
-    private setupEventListeners() {
-        this.data.syncValuesFromDB().then(() => {
-            this.setToolbarsState();
-        });
-        this.data.on(DataEvents.VALUES_CHANGED, () => this.setToolbarsState());
-        // 撤销/重做回写后同步筛选按钮状态（保持与其它分区一致的刷新契约）
-        this.data.on(DataEvents.SNAPSHOT_RESTORED, () => this.setToolbarsState());
+    /**
+     * 订阅「状态可能已变化」
+     * @private
+     */
+    private setupStateListeners() {
+        this.bus.on(EDIT_STATE_CHANGED, () => this.setToolbarsState());
+        this.setToolbarsState();
     }
     
     /**

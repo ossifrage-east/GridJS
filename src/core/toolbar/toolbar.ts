@@ -1,14 +1,21 @@
 /*  # web 表格顶部工具栏 TS 文件
+    # 项目名称: silkspaces（藕丝空间）
+    # 项目描述: 基于 HTML5 Canvas 的 Web 电子表格组件，无需服务端支持即可在浏览器中创建、读取、写入 Excel 文件。
+    # 项目目标: 提供一套「与编辑载体无关」的工具箱外壳：同一份 UI 既能挂到表格上，也能挂到文档上。
+    # 本文件职责: 组装根分类页签、分区、三级渐进披露与宽度自适应；
+    #             **本身不碰数据层** —— 分区只拿到 {@link CommandBus}（问状态 / 发命令）与注入的服务。
+    # 依赖方向: 外壳层。只允许 import contract 与 common，**禁止 import dataArchitecture**。
+    #           改造前这里持有 `DataCollection` 并把它递给 5 个分区，是「UI 绑死表格」的总闸门。
     # author: 东方鹗
     # B站: https://space.bilibili.com/194359739
     # 知乎: https://www.zhihu.com/people/eastossifrage
     # CSDN: https://blog.csdn.net/os373
+    # 项目许可证: MIT 许可证
 */
 
 import { TOOLBAR_CLASS_NAME, TOOLBAR_TABS } from "../constant";
 import { createDiv } from '../../utils/dom';
 import { EventEmitter } from '../../utils/eventEmitter';
-import { DataCollection } from "../dataArchitecture/dataCollection";
 import { Menu } from "../common/menu";
 import { SectionBrush } from "./start/sectionBrush";
 import { SectionFont } from "./start/sectionFont";
@@ -19,12 +26,17 @@ import { Select } from "../common/select";
 import { needsCompact } from '../../utils/fitWidth';
 import '../style/toolbar.scss';
 import { SectionPrint } from "./pages/sectionPrint";
+import { CommandBus } from "../contract/commandBus";
+import { Printer } from "../../utils/printer";
 
 
 export interface ToolbarOptions {
     parentElement: HTMLElement;
-    data: DataCollection;
+    /** 命令总线：分区问状态、发命令的唯一入口 */
+    bus: CommandBus;
     menu: Menu;
+    /** 共享打印实例（装配层注入，与快速访问栏共用） */
+    printer: Printer;
     onTabContentShow?: (width: number, height: number) => void;
     /**
      * 「计算」菜单（求和 / 平均 / 计数 / 最大 / 最小）点选回调
@@ -33,6 +45,13 @@ export interface ToolbarOptions {
      * 工具栏构造先于即时计算模块，因此这里用回调而不是实例。
      */
     onCalculate?: (label: string) => void;
+    /**
+     * 「查询 / 替换」菜单点选回调
+     *
+     * 对话框需要数据源才能全表扫描，不属于「一次编辑动作」，因此走注入回调而非命令派发
+     * （详见 core/contract/editHost.ts 的 CommandId 注释）。
+     */
+    onFindReplace?: (mode: 'find' | 'replace') => void;
 }
 
 /** 分区描述：元素 + 菜单里显示的名字（紧凑模式下作为「一级菜单」的标签） */
@@ -78,8 +97,11 @@ export class Toolbar extends EventEmitter {
     private tabsNav: HTMLDivElement;
     /** 根分类标签，创建顺序即菜单顺序 */
     private rootTabs: HTMLDivElement[] = [];
-    private data: DataCollection;
+    /** 命令总线：分区问状态、发命令的唯一入口 */
+    private bus: CommandBus;
     private menu: Menu;
+    /** 共享打印实例（「页面」页签的打印设置分区要用） */
+    private printer: Printer;
     /** 当前是否处于紧凑模式（分区装不下时） */
     private compact: boolean = false;
     /** 当前是否处于根折叠模式（页签那一行都装不下时） */
@@ -88,6 +110,8 @@ export class Toolbar extends EventEmitter {
     private rootOpen: boolean = false;
     /** 「计算」菜单点选回调（转给数据处理分区） */
     private readonly onCalculate?: (label: string) => void;
+    /** 「查询 / 替换」菜单点选回调（转给数据处理分区） */
+    private readonly onFindReplace?: (mode: 'find' | 'replace') => void;
 
     constructor(options: ToolbarOptions) {
         super();
@@ -95,6 +119,7 @@ export class Toolbar extends EventEmitter {
             this.on('tabContentShow', options.onTabContentShow);
         }
         this.onCalculate = options.onCalculate;
+        this.onFindReplace = options.onFindReplace;
         this.container = createDiv({className: TOOLBAR_CLASS_NAME.CONTAINER});
         options.parentElement.appendChild(this.container);
 
@@ -104,8 +129,9 @@ export class Toolbar extends EventEmitter {
         this.content = createDiv({className: TOOLBAR_CLASS_NAME.CONTENT});
         this.container.appendChild(this.category);
         this.container.appendChild(this.content);
-        this.data = options.data;
+        this.bus = options.bus;
         this.menu = options.menu;
+        this.printer = options.printer;
         this.init();
 
         // 点空白处收起分类清单（点分类标签自己由标签的点击处理负责）
@@ -122,36 +148,62 @@ export class Toolbar extends EventEmitter {
     public init() {
         this.setTabs();
         const sectionBrush = new SectionBrush({ // 格式刷分区
-            data: this.data,
+            bus: this.bus,
             menu: this.menu,
             title: '格式刷'
         });
         
         const sectionFont = new SectionFont({  // 字体样式分区
-            data: this.data,
+            bus: this.bus,
             menu: this.menu,
             title: '字体样式'
         });
         
         const sectionProcess = new SectionProcess({  // 数据处理分区
-            data: this.data,
+            bus: this.bus,
             menu: this.menu,
             title: '数据处理',
             onCalculate: this.onCalculate,
+            onFindReplace: this.onFindReplace,
         });
         
         const sectionAlign = new SectionAlign({  // 对齐方式分区
-            data: this.data,
+            bus: this.bus,
             menu: this.menu,
             title: '对齐方式'
         });
         
         const sectionPrint = new SectionPrint({  // 打印设置分区
-            data: this.data,
+            bus: this.bus,
             menu: this.menu,
+            printer: this.printer,
             title: '打印设置'
         });
 
+        this.mountSections(sectionBrush, sectionFont, sectionAlign, sectionProcess, sectionPrint);
+        // 首屏就可能已经是窄屏：init 末尾按当前宽度定一次模式
+        this.updateCompact();
+    }
+
+    /**
+     * 把分区挂进各自的根分类
+     *
+     * 与 {@link init} 分开是为了**切换工作区时只重挂、不重建**：
+     * 重建分区会重新订阅总线、重新绑定一批 DOM 监听，切几次就积几层。
+     * @param sectionBrush - 格式刷分区
+     * @param sectionFont - 字体样式分区
+     * @param sectionAlign - 对齐方式分区
+     * @param sectionProcess - 数据处理分区
+     * @param sectionPrint - 打印设置分区
+     * @private
+     */
+    private mountSections(
+        sectionBrush: SectionBrush,
+        sectionFont: SectionFont,
+        sectionAlign: SectionAlign,
+        sectionProcess: SectionProcess,
+        sectionPrint: SectionPrint,
+    ): void {
         this.setTabContent(TOOLBAR_TABS.START, [
             { el: sectionBrush.getElements().sectionBrush, title: '格式刷' },
             { el: sectionFont.getElements().sectionFont, title: '字体样式' },
@@ -161,11 +213,11 @@ export class Toolbar extends EventEmitter {
         this.setTabContent(TOOLBAR_TABS.PAGE, [
             { el: sectionPrint.getElements().sectionPrint, title: '打印设置' },
         ]);
-        // 首屏就可能已经是窄屏：init 末尾按当前宽度定一次模式
-        this.updateCompact();
     }
 
     public setTabs() { // 设置工具栏标签
+        // 【幂等】重复调用不应再建一套分组（否则 groups 里只剩最后一套，旧的那套永远摘不掉）
+        if (this.rootTabs.length > 0) return;
         const murmur = require("murmurhash-js");
         // 分类清单浮层：根折叠时点「露出来的那个分类」展开它（同级分类的「一级菜单」）
         this.tabsNav = createDiv({ className: TOOLBAR_CLASS_NAME.TABS_NAV });
@@ -280,6 +332,9 @@ export class Toolbar extends EventEmitter {
      *
      * 紧凑模式下只显示 {@link TOOLBAR_CLASS_NAME.SECTION_ACTIVE} 的那个分区，
      * 所以这里给每个分区打上标题与下标，并默认展开第一个。
+     *
+     * **可重入**：再次用同一 `tabText` 调用会先清空该分组再挂，用于「换一套分区」的场景
+     * （例如将来切换工作区时换成文档专用分区）。
      * @param {string} tabText - 根分类名（开始 / 页面）
      * @param {ToolbarSectionItem[]} sections - 分区列表（顺序即菜单顺序）
      */
@@ -288,6 +343,16 @@ export class Toolbar extends EventEmitter {
         const hashString = murmur.murmur3(tabText, 'hawk@#');
         const group = this.groups.get(hashString.toString(16));
         if (!group) return;
+
+        // 【可重入】改造前这里是纯 append：同一页签装配两次就会得到两套分区，
+        // 窄屏下一级菜单还会出现重名条目。先整体清空再挂，重复装配 = 原地替换。
+        // 分区元素本身由调用方持有（见 mountSections），摘下来再挂回去不影响其内部监听。
+        while (group.firstChild) {
+            group.removeChild(group.firstChild);
+        }
+        this.navs.delete(group.id);
+        delete group.dataset.activeSection;
+        if (sections.length === 0) return;
 
         // 只有一个分区时没有「切换」可言，不生成菜单条（如「页面」页签只有一个打印设置）
         const nav = sections.length > 1

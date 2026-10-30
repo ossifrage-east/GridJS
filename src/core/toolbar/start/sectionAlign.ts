@@ -1,30 +1,37 @@
 /*  # web 表格顶部工具栏对齐工具集合 TS 文件
+    # 项目名称: silkspaces（藕丝空间）
+    # 项目描述: 基于 HTML5 Canvas 的 Web 电子表格组件，无需服务端支持即可在浏览器中创建、读取、写入 Excel 文件。
+    # 项目目标: 工具栏的「对齐方式」分区 —— 垂直/水平对齐、缩进、换行、合并单元格。
+    # 本文件职责: 只负责**外观与交互**；样式与数据改动一律经 {@link CommandBus} 派发。
+    #             「一次缩进多宽」曾以 getIndentStep 的形式住在这里（依赖字号、单双字节、缩放），
+    #             那是载体相关知识，已随解耦搬到 SheetEditHost —— 本文件现在只说「+1 / -1」。
+    # 依赖方向: contract/commandBus + common/*，**不再 import dataArchitecture**。
     # author: 东方鹗
     # B站: https://space.bilibili.com/194359739
     # 知乎: https://www.zhihu.com/people/eastossifrage
     # CSDN: https://blog.csdn.net/os373
+    # 项目许可证: MIT 许可证
 */
 
 
 import { createDiv } from "../../../utils/dom";
-import { DataEvents, TOOLBAR_CLASS_NAME } from "../../constant";
-import { DataCollection } from "../../dataArchitecture/dataCollection";
+import { TOOLBAR_CLASS_NAME } from "../../constant";
 import { BtnBase } from "../../common/button";
 import { Menu } from "../../common/menu";
-import { Cell, TextAlign, VerticalAlign } from "../../dataArchitecture/cell";
-import { indentStepPx } from "../../../utils/textWidth";
+import { CommandBus } from "../../contract/commandBus";
+import { EDIT_STATE_CHANGED } from "../../contract/editHost";
 
 /**
  * SectionAlign 构造选项接口
  * @interface
  * @property {HTMLElement} [parentElement] - 父元素容器
- * @property {DataCollection} data - 数据集合实例
+ * @property {CommandBus} bus - 命令总线（编辑宿主的状态与命令入口）
  * @property {Menu} menu - 菜单实例
  * @property {string} [title] - 工具栏标题
  */
 export interface sectionAlignOptions {
     parentElement?: HTMLElement;
-    data: DataCollection;
+    bus: CommandBus;
     menu: Menu;
     title?: string;
 }
@@ -37,8 +44,8 @@ export interface sectionAlignOptions {
 export class SectionAlign {
     /** @type {HTMLDivElement} 对齐区域容器元素 */
     private sectionAlign: HTMLDivElement;
-    /** @type {DataCollection} 数据集合实例 */
-    private data: DataCollection;
+    /** @type {CommandBus} 命令总线（外壳与宿主之间唯一的接触面） */
+    private bus: CommandBus;
     /** @type {Menu} 菜单实例 */
     private menu: Menu;
     /** @type {HTMLDivElement} 垂直对齐按钮容器 */
@@ -63,7 +70,7 @@ export class SectionAlign {
         if (options.parentElement) {
             options.parentElement.append(this.sectionAlign);
         }
-        this.data = options.data;
+        this.bus = options.bus;
         this.menu = options.menu;
         
         const div = createDiv({
@@ -130,7 +137,7 @@ export class SectionAlign {
         /*------------------ 对齐方式分区 ------------------*/        
         const topBtn = new BtnBase({
             parentElement: this.top,
-            data: this.data,            
+            stateSource: this.bus,            
             menu: this.menu,
             toDo: 'top',
             icon: 'icon-align-top font15',
@@ -139,7 +146,7 @@ export class SectionAlign {
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
-                this.data.setSelectedCellsFont({ alignItems: 'top' });
+                this.bus.dispatch('setVAlign', { value: 'top' });
                 topBtn.setActived(true);
                 middleBtn.setActived(false);
                 bottomBtn.setActived(false);
@@ -148,7 +155,7 @@ export class SectionAlign {
 
         const middleBtn = new BtnBase({
             parentElement: this.top,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'middle',
             icon: 'icon-align-middle font15',
@@ -157,7 +164,7 @@ export class SectionAlign {
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
-                this.data.setSelectedCellsFont({ alignItems: 'middle' });
+                this.bus.dispatch('setVAlign', { value: 'middle' });
                 topBtn.setActived(false);
                 middleBtn.setActived(true);
                 bottomBtn.setActived(false);
@@ -166,7 +173,7 @@ export class SectionAlign {
 
         const bottomBtn = new BtnBase({
             parentElement: this.top,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'bottom',
             icon: 'icon-align-bottom font15',
@@ -175,7 +182,7 @@ export class SectionAlign {
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
-                this.data.setSelectedCellsFont({ alignItems: 'bottom' });
+                this.bus.dispatch('setVAlign', { value: 'bottom' });
                 topBtn.setActived(false);
                 middleBtn.setActived(false);
                 bottomBtn.setActived(true);
@@ -184,7 +191,7 @@ export class SectionAlign {
 
         const indentIncreaseBtn = new BtnBase({
             parentElement: this.top,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'indentIncrease',
             icon: 'icon-text-indent-left font15',
@@ -193,13 +200,14 @@ export class SectionAlign {
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
-                this.data.changeSelectedCellsIndent(this.getIndentStep());
+                // 步长由宿主按「当前字号 + 单双字节 + 缩放」现算，外壳只说方向
+                this.bus.dispatch('indentStep', { value: 1 });
             }
         });
 
         const indentDecreaseBtn = new BtnBase({
             parentElement: this.top,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'indentDecrease',
             icon: 'icon-text-indent-right font15',
@@ -208,13 +216,13 @@ export class SectionAlign {
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
-                this.data.changeSelectedCellsIndent(-this.getIndentStep());
+                this.bus.dispatch('indentStep', { value: -1 });
             }
         }); 
         
         const leftBtn = new BtnBase({
             parentElement: this.bottom,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'left',
             icon: 'icon-text-left font15',
@@ -223,7 +231,7 @@ export class SectionAlign {
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
-                this.data.setSelectedCellsFont({ textAlign: 'left' });
+                this.bus.dispatch('setAlign', { value: 'left' });
                 leftBtn.setActived(true);
                 centerBtn.setActived(false);
                 rightBtn.setActived(false);
@@ -233,7 +241,7 @@ export class SectionAlign {
         
         const centerBtn = new BtnBase({
             parentElement: this.bottom,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'center',
             icon: 'icon-text-center font15',
@@ -242,7 +250,7 @@ export class SectionAlign {
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
-                this.data.setSelectedCellsFont({ textAlign: 'center' });
+                this.bus.dispatch('setAlign', { value: 'center' });
                 leftBtn.setActived(false);
                 centerBtn.setActived(true);
                 rightBtn.setActived(false);
@@ -252,7 +260,7 @@ export class SectionAlign {
 
         const rightBtn = new BtnBase({
             parentElement: this.bottom,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'right',
             icon: 'icon-text-right font15',
@@ -261,7 +269,7 @@ export class SectionAlign {
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
-                this.data.setSelectedCellsFont({ textAlign: 'right' });
+                this.bus.dispatch('setAlign', { value: 'right' });
                 leftBtn.setActived(false);
                 centerBtn.setActived(false);
                 rightBtn.setActived(true);
@@ -271,7 +279,7 @@ export class SectionAlign {
 
         const justifyBtn = new BtnBase({
             parentElement: this.bottom,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'justify',
             icon: 'icon-justify font15',
@@ -280,7 +288,7 @@ export class SectionAlign {
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
-                this.data.setSelectedCellsFont({ textAlign: 'justify' });
+                this.bus.dispatch('setAlign', { value: 'justify' });
                 leftBtn.setActived(false);
                 centerBtn.setActived(false);
                 rightBtn.setActived(false);
@@ -290,7 +298,7 @@ export class SectionAlign {
 
         const lineBreakBtn = new BtnBase({
             parentElement: this.right,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'lineBreak',
             icon: 'icon-line-break font20',
@@ -301,13 +309,13 @@ export class SectionAlign {
             onClick: (todo) => {
                 const bool = !lineBreakBtn.isActived;
                 lineBreakBtn.setActived(bool);
-                this.data.setSelectedCellsFont({ wrap: bool });
+                this.bus.dispatch('toggleWrap', { toggle: bool });
             }
         });
 
         const mergeBtn = new BtnBase({
             parentElement: this.right,
-            data: this.data,
+            stateSource: this.bus,
             menu: this.menu,
             toDo: 'merge',
             icon: 'icon-merge font20',
@@ -336,96 +344,55 @@ export class SectionAlign {
         });
 
         this.toolbars = { topBtn, middleBtn, bottomBtn, leftBtn, centerBtn, rightBtn, justifyBtn, lineBreakBtn, mergeBtn };
-        this.setupDataListeners();
+        this.setupStateListeners();
     }
     
     /**
-     * 获取单次缩进量（2 个字符宽，「2em」）
-     *
-     * ## 基准是**当前单元格**的字号
-     *
-     * em 取活动单元格的实时字号（不是根元素字号）：16px 的格子汉字缩进 32px，
-     * 20px 则是 40px —— 缩进与文字大小始终同比例。
-     * 每次点击都现取（{@link indentStepPx} 不做缓存），改过字号立刻生效。
-     * 单元格为空（字号挂在字符上，空格取不到）时回退根元素字号。
-     *
-     * ## 单字节 / 双字节分别折算
-     *
-     * 一次缩进 = 2 个字符宽，而字符宽取决于内容：双字节（汉字/全角）1 字 = 1em、
-     * 单字节（数字/英文）1 字 = 0.5em。故同样是一次缩进：
-     * - 汉字单元格：2 × 1em = 2em（32px @16px）
-     * - 数字单元格：2 × 0.5em = 1em（16px @16px）
-     * 两者视觉上都是「缩进两个字」，不会出现「中文正好、数字缩了四个字」。
-     * @returns {number} 单次缩进像素值（已含缩放）
-     * @private
-     */
-    private getIndentStep(): number {
-        // 【必须每次现取】字号是逐字符属性（挂在 chars 上），改完字号立刻点击也要拿到新值，
-        // 因此这里不做任何缓存：`Cell.fontSize` 取首字符字号，无字符时是 undefined。
-        const cell = this.data.getCellByName(this.data.activedCell);
-        let fontSize = cell?.fontSize;
-        if (fontSize === undefined || !(fontSize > 0)) {
-            // 单元格为空（字号无处可挂）时回退到根元素字号 —— 仍是「相对当前环境」的 1em
-            fontSize = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
-        }
-        // 单/双字节字符宽度不同：汉字 1em、数字字母 0.5em，取首字符判断（与 Cell.fontSize 同源）
-        const sampleChar = cell?.chars?.[0]?.char;
-        return indentStepPx(fontSize, sampleChar) * this.data.zoom;
-    }
-
-    /**
      * 处理合并单元格操作
-     * @param {string} todo - 操作类型标识
+     * @param {string} todo - 操作类型标识（'merge' | 'merge-row' | 'merge-col'）
      * @private
      */
     private handleMergeCells(todo: string) {
         switch (todo) {
             case 'merge':
-                this.data.toggleMergeCells();
+                this.bus.dispatch('toggleMergeCells');
                 break;
             case 'merge-row':
-                this.data.toggleMergeCells('row');
+                this.bus.dispatch('toggleMergeCells', { value: 'row' });
                 break;
             case 'merge-col':
-                this.data.toggleMergeCells('col');
+                this.bus.dispatch('toggleMergeCells', { value: 'col' });
                 break;
         }
     }
 
     /**
-     * 设置工具栏状态
+     * 按当前宿主状态刷新按钮高亮
+     *
+     * 编辑会话中不刷新：段落级样式在字符编辑时不会变，刷了反而会在退出编辑的瞬间闪一下。
      * @private
      */
     private setToolbarsState() {
-        const cell = this.data.getCellByName(this.data.activedCell);
-        if (!this.data.isEditting) {
-            this.toolbars.topBtn.setActived(cell?.alignItems === 'top');
-            this.toolbars.middleBtn.setActived(cell?.alignItems === 'middle' || cell?.alignItems === undefined);
-            this.toolbars.bottomBtn.setActived(cell?.alignItems === 'bottom');
-            this.toolbars.leftBtn.setActived(cell?.textAlign === 'left');
-            this.toolbars.centerBtn.setActived(cell?.textAlign === 'center' || cell?.textAlign === undefined);
-            this.toolbars.rightBtn.setActived(cell?.textAlign === 'right');
-            this.toolbars.justifyBtn.setActived(cell?.textAlign === 'justify');
-            this.toolbars.lineBreakBtn.setActived(cell?.wrap);
-        }
-        
+        const state = this.bus.snapshot();
+        if (state.editing) return;
+        const para = state.para;
+        this.toolbars.topBtn.setActived(para.valign === 'top');
+        this.toolbars.middleBtn.setActived(para.valign === 'middle' || para.valign === undefined);
+        this.toolbars.bottomBtn.setActived(para.valign === 'bottom');
+        this.toolbars.leftBtn.setActived(para.align === 'left');
+        this.toolbars.centerBtn.setActived(para.align === 'center' || para.align === undefined);
+        this.toolbars.rightBtn.setActived(para.align === 'right');
+        this.toolbars.justifyBtn.setActived(para.align === 'justify');
+        this.toolbars.lineBreakBtn.setActived(!!para.wrap);
     }
 
     /**
-     * 设置数据事件监听器
+     * 订阅「状态可能已变化」
      * @private
      */
-    private setupDataListeners() {
-        this.data.syncValuesFromDB().then(() => { 
-            this.setToolbarsState();
-        });
-        this.data.on(DataEvents.ACTIVED_CELL_CHANGED, () => this.setToolbarsState());
-        // 撤销/重做回写后同步按钮状态（活动单元格未变化时无 ACTIVED_CELL_CHANGED 事件）
-        this.data.on(DataEvents.SNAPSHOT_RESTORED, () => this.setToolbarsState());
-        this.data.on(DataEvents.IS_EDITTING_CHANGED, (_, isEditting) => {
-            if(!isEditting) this.setToolbarsState();
-        });
-        this.data.on(DataEvents.CURSOR_STATE_CHANGED, () => this.setToolbarsState());
+    private setupStateListeners() {
+        this.bus.on(EDIT_STATE_CHANGED, () => this.setToolbarsState());
+        this.setToolbarsState();
     }
 
     /**

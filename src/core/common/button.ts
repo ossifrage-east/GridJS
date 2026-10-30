@@ -2,6 +2,14 @@
  * 通用 Button 组件
  * 提供按钮的创建、图标、文字、下拉菜单等功能
  *
+ * ## 依赖边界
+ *
+ * 按钮是**通用 UI 外壳**，它唯一需要的外部能力是「订阅编辑态变化」——
+ * 用来实现 `isDisabledOnEditting`（编辑时置灰）。历史实现直接持有 `DataCollection`，
+ * 于是一个与表格无关的组件被迫依赖整个表格数据层；现在退化为
+ * {@link EditingStateSource}（只有 `on` / `off` 两个方法），
+ * `DataCollection`、`CommandBus` 都能直接传入。
+ *
  * @module Button
  * @author 东方鹗
  * @see
@@ -14,7 +22,7 @@ import { createDiv, createSpan } from "../../utils/dom";
 import { EventEmitter } from '../../utils/eventEmitter';
 import chevronDown from '../../assets/images/toolbar/chevron-down.svg';
 import { Menu, MenuContent, MenuContentOptions } from "../common/menu";
-import { DataCollection } from "../dataArchitecture/dataCollection";
+import { EditingStateSource } from "../contract/editHost";
 import { DataEvents } from "../constant";
 
 /**
@@ -23,8 +31,12 @@ import { DataEvents } from "../constant";
 export interface BtnOptions {
     /** 父元素 */
     parentElement?: HTMLElement | null;
-    /** 数据集合 */
-    data?: DataCollection;
+    /**
+     * 编辑态事件源（用来实现「编辑时置灰」）
+     *
+     * 只需要能订阅 / 退订 `IS_EDITTING_CHANGED`，不关心它是表格还是文档。
+     */
+    stateSource?: EditingStateSource;
     /** 是否在编辑状态下禁用按钮 */
     isDisabledOnEditting?: boolean;
     /** 菜单实例 */
@@ -65,8 +77,8 @@ export interface BtnOptions {
  * @extends EventEmitter
  */
 export class BtnBase extends EventEmitter {
-    /** 数据集合 */
-    private data: DataCollection;
+    /** 编辑态事件源（用于「编辑时置灰」；未提供时该特性静默关闭） */
+    private stateSource: EditingStateSource | undefined;
     /** 是否在编辑状态下禁用按钮 */
     private isDisabledOnEditting: boolean = true;
     /** 菜单实例 */
@@ -123,8 +135,8 @@ export class BtnBase extends EventEmitter {
         if (options.onDoubleClick) {
             this.on('dblclick', options.onDoubleClick);
         }
-        if (options.data !== undefined) {
-            this.data = options.data;
+        if (options.stateSource !== undefined) {
+            this.stateSource = options.stateSource;
         }
         if (options.menu !== undefined) {
             this.menu = options.menu;
@@ -442,7 +454,9 @@ export class BtnBase extends EventEmitter {
             e.stopPropagation();
             element.style.background = 'rgba(0, 0, 0, 0.1)';
         });
-        this.data.on(DataEvents.IS_EDITTING_CHANGED, (_, isEditting: boolean) => {
+        // 编辑态变化 → 按需置灰。未提供事件源时静默跳过（不再像改造前那样
+        // 因为漏传 `data` 而在构造期抛 TypeError）
+        this.stateSource?.on(DataEvents.IS_EDITTING_CHANGED, (_, isEditting: boolean) => {
             if (this.isDisabledOnEditting) {
                 this.setDisabled(isEditting);
             }

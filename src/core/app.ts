@@ -43,6 +43,10 @@ import { Menu } from "./common/menu";
 import { QuickAccess } from "./toolbar/quickAccess";
 import { stripExtension, toArchiveKey } from "../utils/fileName";
 import { createXlsxTask, type XlsxTask } from "../utils/parser/xlsxWriter";
+import { getSharedPrinter } from "../utils/printer";
+import { CommandBus } from "./contract/commandBus";
+import { SheetEditHost } from "./sheets/sheetEditHost";
+import { openFindReplace } from "./toolbar/start/searchDialog";
 import favicon from "../assets/images/favicon.ico";
 
 /** 导航内容区宽度在 IndexDB 中的键前缀（完整键 = 前缀 + 导航项文本） */
@@ -99,6 +103,19 @@ export class App {
      */
     private _sheetDrawFrame: number | null = null;
     private toolbar!: Toolbar;
+    /**
+     * 命令总线：工具栏外壳与当前编辑宿主之间的唯一通道
+     *
+     * 外壳（工具栏 / 按钮 / 下拉）只认识它，不认识 `DataCollection`。
+     * 将来新增文档工作区时，只需 `bind` 一个文档宿主，UI 一行都不用改。
+     */
+    private commandBus!: CommandBus;
+    /**
+     * 表格编辑宿主：把「粗体 / 对齐 / 粘贴 / 合并…」翻译成 `DataCollection` 调用
+     *
+     * 与 {@link commandBus} 一对一；工作区切换时换掉宿主即可（`bind` 会退订旧的）。
+     */
+    private sheetEditHost!: SheetEditHost;
     private menu!: Menu;
     private navigator!: Navigator;
     private fileTree!: FileTree;
@@ -183,12 +200,25 @@ export class App {
 
     /**
      * 初始化工具栏
+     *
+     * ## 装配顺序有讲究
+     *
+     * 1. 先建宿主、再建总线、**先 bind**：分区在构造时就订阅总线，
+     *    绑定晚于构造会漏掉 bind 那一发的初始广播。
+     * 2. 数据是从 IndexedDB 异步读出来的，各分区构造时读到的还是空表 ——
+     *    等 `dataLoaded` 兑现后补一次广播，让按钮刷新成真实状态
+     *    （改造前这件事由每个分区各自调一次 `syncValuesFromDB()` 完成，三处重复读库）。
      */
     private initToolbar() {
+        this.sheetEditHost = new SheetEditHost(this.data);
+        this.commandBus = new CommandBus();
+        this.commandBus.bind(this.sheetEditHost);
+
         this.toolbar = new Toolbar({
             parentElement: this.containerSplit.getElements().splitPrev,
-            data: this.data,
+            bus: this.commandBus,
             menu: this.menu,
+            printer: getSharedPrinter(this.data),
             onTabContentShow: (width: number, height: number) => {
                 const rect = this.sheets.getElements().sheets.parentElement.getBoundingClientRect();
                 // this.sheets.getElements().sheets.style.width = `${rect.width - width}px`;
@@ -196,6 +226,8 @@ export class App {
             },
             // 计算菜单点选 → 把该项结果写入空白的活动单元格（实例稍后创建，回调按需取用）
             onCalculate: (label: string) => this.selectionCalc?.applyToActivedCell(label),
+            // 查询 / 替换是对话框而非一次编辑动作，需要数据源全表扫描，因此由装配层注入
+            onFindReplace: (mode: 'find' | 'replace') => openFindReplace(this.data, mode),
         });
         const quickAccess = new QuickAccess({  // 快速访问分区
             parentElement: this.toolbar.getElements().tabs,
@@ -207,6 +239,9 @@ export class App {
         // 但内容区尺寸没变（ResizeObserver 不会触发），得主动重排一次，
         // 否则「加上快速访问区之后已经装不下」这种情况要等到下一次窗口变化才被发现。
         this.toolbar.refreshLayout();
+
+        // 数据装载完成 → 通知外壳按真实状态刷新一次（见方法头注释第 2 点）
+        void this.data.dataLoaded.then(() => this.commandBus.notifyStateChanged());
     }
 
     /**
