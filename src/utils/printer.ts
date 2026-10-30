@@ -296,9 +296,9 @@ export class Printer {
     private nextBtn: HTMLButtonElement | null = null;
     /** 目标打印机名称（浏览器沙箱无法枚举/指定系统打印机，最终在打印对话框中确认） */
     private printerName = '';
-    /** 打印份数（默认 1） */
+    /** 打印份数（默认 1）：Web API 无法预设浏览器对话框份数，此处仅用于面板回显与持久化 */
     private copies = 1;
-    /** 打印顺序：page=逐页打印（1,1,2,2,3,3），copies=逐份打印（1,2,3,1,2,3） */
+    /** 打印顺序：page=逐页打印（1,1,2,2,3,3），copies=逐份打印（1,2,3,1,2,3）；同上，仅面板回显 */
     private collate: 'page' | 'copies' = 'page';
     /** 追加注册的自定义字体 @font-face CSS（来自 options.fontFaceCss 与 registerFontCss 调用） */
     private _fontFaceCss: string[] = [];
@@ -1112,13 +1112,16 @@ export class Printer {
      *
      * 与预览一致复用分页计划；只生成「页面范围」选中的页，并按时间片分批写入 iframe，
      * 避免一次性生成全量 HTML 造成长时间主线程阻塞。准备期间显示进度提示。
+     *
+     * 页面数量约定：**一张输出页对应一张预览页**（一个 .gs-print-sheet = 一张纸），
+     * 因此浏览器打印对话框的页数与预览页数一致；不在文档内按份数复制页面。
+     * 份数、打印方式（双面）与目标打印机无法通过 Web API 预设，需在对话框中选择。
      */
     public print(): void {
         const plan = this._buildPlan();
         const selected = this._selectedPageIndices(plan.totalPages);
         if (selected.length === 0) return;
-        const copies = Math.max(1, Math.floor(this.copies));
-        const sheetCount = selected.length * copies;
+        const sheetCount = selected.length;
 
         // 新的打印任务：使上一次未完成的异步写入失效并清理其 iframe/进度提示
         const token = ++this._printToken;
@@ -1172,6 +1175,11 @@ export class Printer {
 
         this._showPrintProgress(sheetCount);
 
+        // 空白文档：预览显示一张空白纸，打印也要输出且只输出一张空白页。
+        // 零高度容器可能被判为无内容而不产生页面，故给到一个「可打印区高度」，
+        // 该值不超过 .gs-print-sheet 的 max-height，不会溢出成两页。
+        const blankSheetHmm = Math.max(1, plan.paperHmm - this.margins.top - this.margins.bottom - 0.5);
+
         let cursor = 0;
         const writeBatch = (): void => {
             if (token !== this._printToken) {
@@ -1182,8 +1190,10 @@ export class Printer {
             const start = Date.now();
             const chunks: string[] = [];
             while (cursor < sheetCount && Date.now() - start < 12) {
-                const pageIndex = this._sheetPageIndex(cursor, selected, copies);
-                chunks.push(`<div class="gs-print-sheet">${this._renderPageHtml(plan, pageIndex)}</div>`);
+                const pageIndex = selected[cursor];
+                chunks.push(plan.blank
+                    ? `<div class="gs-print-sheet" style="height:${blankSheetHmm}mm"></div>`
+                    : `<div class="gs-print-sheet">${this._renderPageHtml(plan, pageIndex)}</div>`);
                 cursor++;
             }
             if (chunks.length > 0) {
@@ -1221,20 +1231,6 @@ export class Printer {
             return all;
         }
         return Array.from(hits).sort((a, b) => a - b).map(p => p - 1);
-    }
-
-    /**
-     * 计算第 pos 张纸对应的页索引（0-based），避免为「份数 × 顺序」展开巨大的索引数组
-     * 逐页打印（page）：1,1,2,2,3,3；逐份打印（copies）：1,2,3,1,2,3
-     * @param {number} pos - 纸张序号（0-based）
-     * @param {number[]} selected - 参与打印的页索引（0-based）
-     * @param {number} copies - 份数（≥1）
-     * @returns {number} 页索引（0-based）
-     * @private
-     */
-    private _sheetPageIndex(pos: number, selected: number[], copies: number): number {
-        if (this.collate === 'copies') return selected[pos % selected.length];
-        return selected[Math.floor(pos / copies)];
     }
 
     /**
@@ -1573,6 +1569,7 @@ export class Printer {
     /**
      * 取数据中「最远单元格」的行列号（1-based，作为行列总数使用）。
      * 用一次遍历替代 matrixValues() 的稠密 rows×cols 分配。
+     * 合并区右下角即使没有数据也计入范围（否则打印时合并块会被截断成单格）。
      * @returns {{rows: number, cols: number}} 行数/列数
      * @private
      */
@@ -1583,6 +1580,14 @@ export class Printer {
             const pos = this.data.getCellColAndRow(cell.cell);
             if (pos.row > rows) rows = pos.row;
             if (pos.col > cols) cols = pos.col;
+        }
+        // 合并单元格：内容只存在锚点格子里，合并区右下角的格子可能**根本没有数据**。
+        // 若只按「有值的格子」求边界，合并区的跨度会被截断在锚点所在的行列，
+        // 打印时该块只剩 1 行 1 列、文字被裁掉（下方或右侧另有内容时才会被撑开）。
+        // 因此把每个合并区的右下角也计入内容范围。
+        for (const rect of this.data.getMergeRects()) {
+            if (rect.endRow > rows) rows = rect.endRow;
+            if (rect.endCol > cols) cols = rect.endCol;
         }
         return { rows, cols };
     }
@@ -1870,30 +1875,37 @@ export class Printer {
      * 页面不再一次性拼进文档：print() 按时间片逐页生成并追加到 body，
      * 大表打印时主线程不再被一次性字符串生成与 HTML 解析占满。
      *
-     * 自定义打印设置同步到浏览器打印对话框的方式：
-     * - 纸张大小与方向：通过 @page size 规则同步，Chrome/Edge 打印预览随其变化；
-     * - 页眉页脚：浏览器页眉页脚渲染在页边距区域内，@page 边距设为 0 后不再显示；
-     *   页边距改由逐页包裹层（.gs-print-sheet）的 padding 实现，版面效果与原来一致；
-     * - 打印机 / 份数 / 顺序：Web API 无法预设浏览器打印对话框，需在对话框中确认。
+     * 打印设置同步到浏览器打印对话框的方式：
+     * - 纸张大小与方向：@page size 直接采用当前设置，浏览器打印预览随之变化；
+     * - 页边距：@page margin 直接采用当前设置（mm），打印输出与预览的版面一致；
+     *   页面内容不再用 padding 模拟页边距，避免与实际页边距叠加；
+     * - 页数：每个 .gs-print-sheet 恰好对应一张纸（内容高度已按可打印区域分页，
+     *   不设固定页高，避免 mm→px 取整溢出多出空白页），对话框页数 = 预览页数；
+     * - 页眉页脚：由浏览器对话框的「页眉和页脚」选项控制，Web 端无法预设；
+     * - 打印机 / 份数 / 打印方式（双面）：Web API 无法预设，需在对话框中选择。
      * @returns {string} 可直接写入 iframe 的 HTML 文档骨架
      * @private
      */
     private _buildPrintHead(): string {
         const size = PAPER_SIZES[this.paperSize];
-        // 纸张在当前方向下的实际高度（mm）：@page 边距为 0，逐页容器必须与纸张等高，
-        // 否则页高超出可打印区域会导致出现空白页
-        const paperH = this.orientation === 'portrait' ? size.height : size.width;
+        const m = this.margins;
+        const paperHmm = this.orientation === 'portrait' ? size.height : size.width;
+        // 可打印高度（mm），再留 0.5mm 余量：分页容差为 0.5px，理论上单页内容可能
+        // 恰好贴边，留出余量后由 max-height 兜底，杜绝溢出再拆出一张空白页
+        const sheetMaxHmm = Math.max(1, paperHmm - m.top - m.bottom - 0.5);
         return `<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <title>${this.title}</title>
     <style>
-        /* 页边距必须为 0：浏览器页眉页脚渲染在页边距内，边距为 0 时即不再显示 */
-        @page { size: ${size.page} ${this.orientation}; margin: 0; }
+        /* 纸张与页边距直接采用当前打印设置，浏览器打印预览随之一致 */
+        @page { size: ${size.page} ${this.orientation}; margin: ${this._marginCss()}; }
         html, body { margin: 0; padding: 0; }
-        /* 逐页容器：与纸张等高，页边距内置于 padding，超出部分裁剪防溢出产生空白页 */
-        .gs-print-sheet { box-sizing: border-box; width: 100%; height: ${paperH}mm; padding: ${this._marginCss()}; overflow: hidden; page-break-after: always; break-after: page; }
+        /* 逐页容器：内容已按「纸张 - 页边距」分页且行高固定，不会超出一页；
+           max-height 兜底并裁剪，保证「一个容器 = 一张纸」，
+           不设固定页高，避免 mm→px 取整溢出产生多余空白页 */
+        .gs-print-sheet { box-sizing: border-box; max-height: ${sheetMaxHmm}mm; overflow: hidden; page-break-after: always; break-after: page; break-inside: avoid; }
         .gs-print-sheet:last-child { page-break-after: auto; break-after: auto; }
         /* 打印时强制保留背景色与文字颜色（浏览器默认不打印背景） */
         .gs-print-sheet .gs-print-table { print-color-adjust: exact; -webkit-print-color-adjust: exact; }

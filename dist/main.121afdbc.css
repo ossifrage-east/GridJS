@@ -214,6 +214,16 @@
 .icon-play3:before {
   content: "\ea1c";
 }
+/* 暂停：标准双竖杠（图标字体未收录该字形，改用 CSS 绘制） */
+.icon-pause2:before {
+  content: "";
+  display: block;
+  width: 0.3em;
+  height: 1em;
+  background-color: currentColor;
+  box-shadow: 0.45em 0 0 currentColor;
+  margin-right: 0.45em;
+}
 .icon-stop2:before {
   content: "\ea1e";
 }
@@ -761,6 +771,14 @@ html, body {
   color: #217346; /* Excel green color */
 }
 
+/* 置灰项（暂未实现的功能）：不响应 hover 高亮，光标保持默认 */
+.menu-item.is-disabled,
+.menu-item.is-disabled:hover {
+  color: #adb5bd;
+  background-color: transparent;
+  cursor: default;
+}
+
 .menu-item i {
   font-size: 16px;
   width: 16px;
@@ -1186,6 +1204,12 @@ html, body {
   opacity: 0.45;
   cursor: not-allowed;
 }
+.file-tree-row {
+  /* 正在被拖拽的源节点：整组降透明度，表达「这几个会被一起搬走」 */
+}
+.file-tree-row.is-dragging {
+  opacity: 0.5;
+}
 
 /* 拖拽中的源节点：整体降透明度，与「不可放置」的子树区分开 */
 .file-tree-row:active {
@@ -1369,6 +1393,178 @@ html, body {
   color: #212529;
   /* 路径等长文本允许在任意位置折行，避免撑破对话框 */
   word-break: break-all;
+}
+
+/* —— 「另存为xlsx」对话框：导出清单表格 —— */
+.file-tree-save-as-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.file-tree-save-as-table th,
+.file-tree-save-as-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid #e9ecef;
+  text-align: left;
+  /* 文件名过长时省略，保证四列宽度稳定 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-tree-save-as-table th {
+  background-color: #f8f9fa;
+  color: #495057;
+  font-weight: 600;
+}
+.file-tree-save-as-table {
+  /* 多选框 + 序号 */
+}
+.file-tree-save-as-table th:nth-child(1),
+.file-tree-save-as-table td:nth-child(1) {
+  width: 96px;
+  text-align: left;
+}
+.file-tree-save-as-table th:nth-child(3),
+.file-tree-save-as-table td:nth-child(3) {
+  width: 100px;
+  text-align: right;
+}
+.file-tree-save-as-table th:nth-child(4),
+.file-tree-save-as-table td:nth-child(4) {
+  width: 96px;
+  text-align: right;
+}
+.file-tree-save-as-table {
+  /* 操作列：开始 / 暂停 / 删除 */
+}
+.file-tree-save-as-table th:nth-child(5),
+.file-tree-save-as-table td:nth-child(5) {
+  width: 104px;
+  text-align: center;
+}
+.file-tree-save-as-table {
+  /* 下载列 */
+}
+.file-tree-save-as-table th:nth-child(6),
+.file-tree-save-as-table td:nth-child(6) {
+  width: 88px;
+  text-align: center;
+}
+
+/* 行首多选框（表头全选 + 每行选择） */
+.file-tree-save-as-select {
+  width: 14px;
+  height: 14px;
+  margin: 0 6px 0 0;
+  vertical-align: middle;
+  cursor: pointer;
+}
+
+.file-tree-save-as-index {
+  vertical-align: middle;
+}
+
+/* 操作列的三枚纯图标按钮（行内与表头批量操作共用） */
+.file-tree-save-as-action {
+  display: -webkit-inline-box;
+  display: -webkit-inline-flex;
+  display: -ms-inline-flexbox;
+  display: inline-flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  width: 26px;
+  height: 26px;
+  margin: 0 2px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: #6c757d;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.file-tree-save-as-action i {
+  display: block;
+  font-size: 14px;
+  line-height: 1;
+}
+.file-tree-save-as-action:hover:not(:disabled) {
+  border-color: rgba(0, 0, 0, 0.06);
+  background-color: rgba(0, 0, 0, 0.08);
+  color: #217346;
+}
+.file-tree-save-as-action {
+  /* 当前状态下不可用（如转换中不能再次「开始」） */
+}
+.file-tree-save-as-action:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* 行内「下载」：转换完成前不可用 */
+.file-tree-save-as-download {
+  color: #217346;
+  cursor: pointer;
+  -webkit-transition: color 0.15s ease;
+  transition: color 0.15s ease;
+}
+.file-tree-save-as-download:hover {
+  color: #4CAF50;
+  text-decoration: underline;
+}
+.file-tree-save-as-download.is-disabled, .file-tree-save-as-download.is-disabled:hover {
+  color: #adb5bd;
+  text-decoration: none;
+  cursor: default;
+}
+
+/* 表头的「打包下载」按钮 */
+.file-tree-save-as-download-all {
+  padding: 2px 8px;
+  border: 1px solid #4CAF50;
+  border-radius: 4px;
+  background: transparent;
+  color: #217346;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  cursor: pointer;
+  -webkit-transition: color 0.15s ease, background-color 0.15s ease;
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+.file-tree-save-as-download-all:hover:not(:disabled) {
+  background-color: #4CAF50;
+  color: #fff;
+}
+.file-tree-save-as-download-all {
+  /* 没有勾选且已完成的文件时整列不可用 */
+}
+.file-tree-save-as-download-all:disabled {
+  border-color: #dee2e6;
+  color: #adb5bd;
+  cursor: default;
+}
+
+/* 已完成的行：进度数字用主色标出 */
+.file-tree-save-as-table tr.is-done td:nth-child(4) {
+  color: #217346;
+  font-weight: 600;
+}
+
+/* 没有可导出的文件时的提示 */
+.file-tree-save-as-empty {
+  padding: 16px 8px;
+  color: #adb5bd;
+  font-size: 13px;
+  text-align: center;
 }
 /*!***********************************************************************************************************************************************************************************************!*\
   !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/fileOpener.scss ***!

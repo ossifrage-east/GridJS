@@ -211,6 +211,16 @@
 .icon-play3:before {
   content: "\ea1c";
 }
+/* 暂停：标准双竖杠（图标字体未收录该字形，改用 CSS 绘制） */
+.icon-pause2:before {
+  content: "";
+  display: block;
+  width: 0.3em;
+  height: 1em;
+  background-color: currentColor;
+  box-shadow: 0.45em 0 0 currentColor;
+  margin-right: 0.45em;
+}
 .icon-stop2:before {
   content: "\ea1e";
 }

@@ -7,9 +7,11 @@
 
 import { createDiv, createSpan, createInput, createButton, createElement } from "../../utils/dom";
 import { stripExtension, extractExtension, toArchiveKey } from "../../utils/fileName";
+import { createZipBlob, type XlsxTask } from "../../utils/parser/xlsxWriter";
 import { FILE_TREE_CLASS_NAMES as TREE, MENU_CLASS_NAMES } from "../constant";
-import { Menu, MenuContent } from "./menu";
+import { Menu, MenuContent, MenuItemSpec } from "./menu";
 import { Dialog } from "./dialog";
+import { MessageBox } from "./message";
 import '../style/fileTree.scss';
 
 /**
@@ -180,6 +182,23 @@ export interface FileTreeOptions {
      * 供外部在对话框关闭时做额外处理（如埋点、刷新视图）。不传则仅关闭对话框。
      */
     onPropertyClose?: (path: string) => void;
+    /**
+     * 读取文件内容的存档大小（字节），用于「另存为」对话框的「文件大小」列（可选）
+     *
+     * 文件内容存在外部（IndexedDB），树只认识路径，因此由外部按路径读取；
+     * 不传或读取失败时该列显示「—」。
+     */
+    fileSize?: (path: string) => Promise<number | null>;
+    /**
+     * 为 `.grid` 文件创建 xlsx 转换作业（「另存为xlsx」对话框的真实转换，可选）
+     *
+     * 存档在 IndexedDB 中，树只认识路径，因此由外部读取内容并创建作业；
+     * 作业由对话框按时间片推进（单飞队列：一次只跑一个），暂停即停止推进、
+     * 继续则从断点接着跑。不传时转换会报错并回到「待开始」。
+     * @param path - 文件路径（含扩展名）
+     * @param name - 文件名（用于工作表名）
+     */
+    convertXlsx?: (path: string, name: string) => Promise<XlsxTask>;
 }
 
 /**
@@ -237,6 +256,142 @@ function localUser(): string {
 const LOCAL_USER = localUser();
 
 /**
+ * 把字节数格式化为易读的文件大小（「另存为」对话框的「文件大小」列）
+ *
+ * 小于 1KB 显示为整数 B；更大的单位保留一位小数（`1.5 KB` / `2.3 MB`）。
+ * 非法值（负数 / 非有限数）返回「—」，与「读取失败」的展示保持一致。
+ * @param {number} bytes - 字节数
+ * @returns {string} 易读的文件大小，如 `860 B` / `12.4 KB`
+ */
+function formatFileSize(bytes: number): string {
+    if (!Number.isFinite(bytes) || bytes < 0) return '—';
+    if (bytes < 1024) return `${Math.round(bytes)} B`;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let value = bytes / 1024;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit++;
+    }
+    return `${value.toFixed(1)} ${units[unit]}`;
+}
+
+/**
+ * 「另存为」清单行的转换状态
+ *
+ * `queued` 是单飞队列里的排队态：批量开始后，除第一个之外的行都在排队等待，
+ * 只有当前转换被暂停 / 完成 / 删除，队列才会轮到下一行。
+ */
+type SaveAsRowState = 'idle' | 'queued' | 'converting' | 'paused' | 'done';
+
+/**
+ * 触发浏览器下载
+ * @param {Blob} blob - 文件内容
+ * @param {string} filename - 保存的文件名
+ */
+function triggerDownload(blob: Blob, filename: string): void {
+    const url = URL.createObjectURL(blob);
+    const anchor = createElement('a', {
+        attributes: { href: url, download: filename },
+    }) as HTMLAnchorElement;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    // 给浏览器留出读取时间后再释放，避免大文件下载中断
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+/**
+ * 取出错误对象的可读文本（转换失败提示用）
+ * @param {unknown} error - 捕获到的异常
+ * @returns {string} 可读的错误信息
+ */
+function errorMessage(error: unknown): string {
+    if (error instanceof Error && error.message) return error.message;
+    if (typeof error === 'string' && error) return error;
+    return '未知错误';
+}
+
+/** 单次驱动转换的时间片（毫秒）：到点就交还主线程，保证暂停能及时生效、界面不卡 */
+const SAVE_AS_SLICE_MS = 8;
+
+/** 交还主线程用的共享消息通道（懒创建） */
+let yieldPort: MessageChannel | null = null;
+/** 同一时刻等待让出完成的回调 */
+let yieldResolvers: Array<() => void> = [];
+
+/**
+ * 让出主线程一次（给浏览器渲染与用户点击的机会）
+ *
+ * 优先用 `scheduler.yield`（语义最准）；否则用 `MessageChannel`，
+ * 避免 `setTimeout(0)` 被钳到 4ms —— 后者会让每个时间片都白等一截。
+ * @returns {Promise<void>} 下一轮任务开始时兑现
+ */
+function yieldToHost(): Promise<void> {
+    const scheduler = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
+    if (scheduler && typeof scheduler.yield === 'function') return scheduler.yield();
+    if (!yieldPort) {
+        yieldPort = new MessageChannel();
+        yieldPort.port1.onmessage = () => {
+            const batch = yieldResolvers;
+            yieldResolvers = [];
+            batch.forEach((resolve) => resolve());
+        };
+    }
+    return new Promise<void>((resolve) => {
+        yieldResolvers.push(resolve);
+        yieldPort?.port2.postMessage(0);
+    });
+}
+
+/**
+ * 「另存为xlsx」清单的一行
+ *
+ * 行内元素引用随行创建一并持有，后续状态变化（进度、按钮可用性、下载可用性）
+ * 只改这些引用，不重建 DOM。真实转换由 {@link FileTreeOptions.convertXlsx} 建出的
+ * {@link XlsxTask} 承担，进度取自作业的真实值（见 {@link FileTree.runSaveAsRow}）。
+ * @interface SaveAsRow
+ */
+interface SaveAsRow {
+    /** 文件路径（相对根节点，含扩展名；打包下载时据此还原目录层级，避免同名冲突） */
+    path: string;
+    /** 文件名（显示用） */
+    name: string;
+    /** 转换状态 */
+    state: SaveAsRowState;
+    /** 转换进度（0–100，取自作业的真实进度） */
+    progress: number;
+    /**
+     * 转换作业：首次出队时创建，暂停 / 排队期间一直保留，因此再次「开始」
+     * 会从断点继续，而不是从头重跑。产物 Blob 也在作业里（`task.blob`）。
+     */
+    task: XlsxTask | null;
+    /**
+     * 驱动序号：每次出队自增
+     *
+     * 「暂停后立刻又按开始」会让同一个行先后存在两个驱动循环（旧的停在
+     * `await` 上，新的已经出队），据此让旧循环在下一个检查点自行退出，
+     * 避免两个循环同时推进同一个作业。
+     */
+    runToken: number;
+    /** 行元素（删除时整体移除） */
+    rowEl: HTMLTableRowElement;
+    /** 行首多选框 */
+    check: HTMLInputElement;
+    /** 序号文本（删除行后需要重新编号） */
+    indexEl: HTMLSpanElement;
+    /** 进度单元格 */
+    progressCell: HTMLTableCellElement;
+    /** 开始按钮 */
+    startBtn: HTMLButtonElement;
+    /** 暂停按钮 */
+    pauseBtn: HTMLButtonElement;
+    /** 下载单元格 */
+    downloadCell: HTMLTableCellElement;
+}
+
+/**
  * 默认文件树：仅保留顶层「工作区」
  *
  * 真实数据可通过 {@link FileTreeOptions.nodes} 注入；
@@ -282,9 +437,19 @@ const DEFAULT_FILE_NODES: FileNode[] = [
  *   新增只「补建」不覆盖，因此刷新恢复、打开文件登记等路径同样安全。
  * - 拖拽移动：把文件 / 文件夹拖到另一个文件夹即可改变其路径（含全部子孙），
  *   路径变化由 {@link FileTreeOptions.content} 的 `move` 通知外部搬迁存档；
- *   不能拖到自身或自身的子孙里（防环），拖到原父目录视为无操作。
+ *   **多选（Shift 连选）后拖动选区中的任意一行，整组选区一起移动**，落点目录内
+ *   的先后次序与拖拽前在树中的顺序一致；不能拖到自身或自身的子孙里（防环），
+ *   拖到原父目录视为无操作。
  * - 属性对话框：右键菜单「属性」打开一个对话框，展示名称与后缀、位置、创建与
  *   修改时间及人员、是否可编辑。
+ * - 另存为：右键菜单「打开」下方为「另存为」（hover 展开二级菜单：另存为xlsx /
+ *   另存为docx / 另存为pptx / 另存为pdf，后三项暂未实现、置灰不可点）。
+ *   「另存为xlsx」弹出一个表格对话框，列出当前选中的 `.grid` 文件：
+ *   多选框 + 序号（表头多选框全选）/ 文件名 / 文件大小 / 进度 /
+ *   操作（开始、暂停、删除，仅图标）/ 下载（表头为「打包下载」按钮）。
+ *   转换由 {@link FileTreeOptions.convertXlsx} 建出的作业真实生成 xlsx，按单飞队列
+ *   （一次只跑一个，其余显示「排队中」）与时间片驱动；暂停会真正停下并保留断点，
+ *   再次「开始」从断点续跑。未转换完成的行其「下载」与表头「打包下载」均不可用。
  * - 持久化：新增 / 删除 / 重命名 / 粘贴，以及文件夹展开收起，都会通过
  *   {@link FileTreeOptions.onChange} 通知外部落库；外部在下次启动时用
  *   {@link FileTreeOptions.nodes} 注入还原，即「刷新后树里仍是刷新前的文件，
@@ -337,10 +502,38 @@ export class FileTree {
     private clipboardSources: TreeNodeView[] = [];
     /** 正在重命名的节点视图（同一时刻仅允许一个） */
     private renaming: { view: TreeNodeView; input: HTMLInputElement } | null = null;
-    /** 正在被拖拽的节点（拖拽期间非 null，供放置校验与落点目标判定） */
+    /** 正在被拖拽的节点（拖拽期间非 null，用于判定「当前是否处于拖拽中」） */
     private dragging: TreeNodeView | null = null;
+    /**
+     * 本次拖拽要移动的节点集合（多选时即整组选区）
+     *
+     * 只保存选区里**最靠上**的节点：文件夹与其子孙同时被选中时，子孙会随文件夹
+     * 整体搬走，若再单独移动一次就会被从文件夹里摘出来。顺序按树中的可见顺序。
+     */
+    private dragSources: TreeNodeView[] = [];
     /** 「属性」对话框实例（复用同一实例，避免反复创建 DOM） */
     private propertyDialog: Dialog | null = null;
+    /** 「另存为xlsx」对话框实例（复用同一实例，避免反复创建 DOM） */
+    private saveAsDialog: Dialog | null = null;
+    /** 「另存为xlsx」清单的当前行（含转换状态、转换作业与 DOM 引用） */
+    private saveAsRows: SaveAsRow[] = [];
+    /** 单飞队列：等待转换的行（FIFO，一次只跑一个） */
+    private saveAsQueue: SaveAsRow[] = [];
+    /** 当前正在转换的行（单飞：同一时刻至多一个） */
+    private saveAsRunning: SaveAsRow | null = null;
+    /**
+     * 批量暂停正在进行：暂停当前行时先不急着起下一行，
+     * 否则「暂停第 1 行 → 起第 2 行 → 又立刻暂停第 2 行…」会连锁空转
+     */
+    private saveAsBatchPausing = false;
+    /** 「另存为xlsx」表头的全选多选框 */
+    private saveAsSelectAll: HTMLInputElement | null = null;
+    /** 「另存为xlsx」表头「打包下载」按钮 */
+    private saveAsDownloadAll: HTMLButtonElement | null = null;
+    /** 「另存为xlsx」表头批量操作按钮：开始 / 暂停 / 删除勾选的行 */
+    private saveAsHeaderStart: HTMLButtonElement | null = null;
+    private saveAsHeaderPause: HTMLButtonElement | null = null;
+    private saveAsHeaderRemove: HTMLButtonElement | null = null;
 
     /**
      * 构造函数
@@ -644,7 +837,8 @@ export class FileTree {
      * 绑定节点的拖拽事件（HTML5 Drag & Drop）
      *
      * 语义与「剪切 → 粘贴」等价：把节点（含其子树）移动到目标文件夹下，
-     * 由 {@link moveNodeTo} 统一完成校验、搬迁、内容同步与落库。
+     * 由 {@link moveNodesTo} 统一完成校验、搬迁、内容同步与落库。
+     * 若拖起的行在当前选区内（Shift 连选出的多行），则整组选区一起移动。
      *
      * 拖拽越界保护在**拖起时就判定**（`dragstart` 里检测自身/子孙行）
      * 而不是等到 `dragover`：被拖拽的元素在拖拽期间通常不派发 dragover/drop，
@@ -661,18 +855,27 @@ export class FileTree {
                 e.preventDefault();
                 return;
             }
+            // 拖起的行不在选区里时先选中它：mousedown 后直接拖动不会派发 click，
+            // 选区不会自动更新（与桌面文件管理器一致）
+            if (!this.highlighted.has(view)) this.select(view);
             this.dragging = view;
-            // 拖拽期间禁用「自身与全部子孙」作为放置目标，避免拖成环
+            this.dragSources = this.collectDragSources(view);
+            // 拖拽期间禁用「被拖节点自身及其全部子孙」作为放置目标，避免拖成环
             this.rootViews.forEach((root) => this.walk(root, (node) => {
-                if (node === view || this.isDescendantView(view, node)) {
+                if (this.isInDragSources(node)) {
                     node.row.draggable = false;
                     node.row.classList.add(TREE.DRAG_DISABLED);
                 }
             }));
+            // 整组降透明度：拖拽期间能看出「一次搬走的是这几个」
+            this.dragSources.forEach((source) => source.row.classList.add(TREE.DRAGGING));
             if (e.dataTransfer) {
                 e.dataTransfer.effectAllowed = 'move';
                 // 部分浏览器（Firefox）要求必须写入数据才会开始拖拽
-                e.dataTransfer.setData('text/plain', view.label.textContent ?? '');
+                const count = this.dragSources.length;
+                e.dataTransfer.setData('text/plain', count > 1
+                    ? `${count} 个项目`
+                    : view.label.textContent ?? '');
             }
         });
 
@@ -698,102 +901,152 @@ export class FileTree {
             if (!view.isFolder || !this.canDropOn(view)) return;
             e.preventDefault();
             e.stopPropagation();
-            const source = this.dragging;
-            if (!source) return;
-            // 不能先 clearDragState：它会清空 `this.dragging`，
-            // 而 moveNodeTo 内部还要用 canDropOn 做一次校验（二次校验会因此恒为 false）
-            this.moveNodeTo(source, view);
+            if (!this.dragging) return;
+            // 不能先 clearDragState：它会清空 `this.dragSources`，
+            // 而 moveNodesTo 正需要这份整组来源清单
+            this.moveNodesTo(this.dragSources, view);
             this.clearDragState();
         });
     }
 
     /**
      * 判断当前拖拽的节点能否放置到目标文件夹下（O(1) 校验）
+     *
+     * 整组移动的判定：
+     * - 目标不能是任一被拖节点自身或其子孙（会形成环）；
+     * - 至少要有一个节点不在目标目录下（全部已在目标目录 = 拖了没有变化）。
      * @private
      * @param {TreeNodeView} target - 目标文件夹
      * @returns {boolean} 是否允许放置
      */
     private canDropOn(target: TreeNodeView): boolean {
-        const source = this.dragging;
-        if (!source || source === target) return false;
-        // 不能拖进自己的子孙（会形成环），也不能拖到当前父节点（无变化）
-        if (this.isDescendantView(source, target)) return false;
-        if (source.parent === target) return false;
-        return true;
+        if (!target.isFolder || this.dragSources.length === 0) return false;
+        if (this.dragSources.some((source) =>
+            source === target || this.isDescendantView(source, target))) {
+            return false;
+        }
+        return this.dragSources.some((source) => source.parent !== target);
     }
 
     /**
-     * 清理拖拽过程中的临时状态（游标、禁止标记、放置高亮）
+     * 判断节点是否属于「本次拖拽的节点或其子孙」
+     * @private
+     * @param {TreeNodeView} node - 待判定节点
+     * @returns {boolean} 是否在拖拽子树内
+     */
+    private isInDragSources(node: TreeNodeView): boolean {
+        return this.dragSources.some((source) =>
+            source === node || this.isDescendantView(source, node));
+    }
+
+    /**
+     * 清理拖拽过程中的临时状态（游标、禁止标记、放置高亮、拖拽视觉）
      * @private
      */
     private clearDragState(): void {
         this.dragging = null;
+        this.dragSources = [];
         this.rootViews.forEach((root) => this.walk(root, (node) => {
             node.row.draggable = true;
             node.row.classList.remove(TREE.DRAG_DISABLED);
             node.row.classList.remove(TREE.DROP_TARGET);
+            node.row.classList.remove(TREE.DRAGGING);
         }));
     }
 
     /**
-     * 把节点（含子树）移动到目标文件夹下 —— 即改变其路径
+     * 把一组节点（含各自子树）移动到目标文件夹下 —— 即改变它们的路径
      *
-     * 顺序很重要，且与「剪切 → 粘贴」的既有做法一致：
+     * 多个节点按传入顺序（树中的可见顺序）依次挂载，因此目标目录内的先后次序
+     * 与拖拽前一致。每个节点都按「剪切 → 粘贴」的既有顺序处理：
      * 1. 先确定新名称（目标目录内重名去重，规则见 {@link uniqueName}）；
-     * 2. 在**移动之前**按「旧路径 → 新路径」收集搬迁计划并交给内容桥
+     * 2. 在**移动之前**按「旧路径 → 新路径」收集搬迁计划
      *    （移动之后父链已变，再也算不出旧路径）；
-     * 3. 再从 DOM 与父链上摘除、挂到目标文件夹并修正缩进；
-     * 4. 最后落库。
+     * 3. 再从 DOM 与父链上摘除、挂到目标文件夹并修正缩进。
      *
+     * 已在目标目录下的节点（路径没有变化）原地不动，直接跳过；
      * 文件夹整体移动时，其中每个文件的路径都变了 → 计划里逐个列出。
+     * 全部节点的搬迁计划汇总后一次性交给内容桥，最后统一落库一次。
      * @private
-     * @param {TreeNodeView} source - 被拖拽的节点
+     * @param {TreeNodeView[]} sources - 被拖拽的节点（同一次拖拽的整组）
      * @param {TreeNodeView} target - 目标文件夹
      */
-    private moveNodeTo(source: TreeNodeView, target: TreeNodeView): void {
-        if (!this.canDropOn(target) || !target.childrenBox) return;
+    private moveNodesTo(sources: TreeNodeView[], target: TreeNodeView): void {
+        if (!target.childrenBox || sources.length === 0) return;
 
-        const oldPaths = this.collectFilePaths(source);
-        const name = this.uniqueName(target, source.label.textContent ?? '');
+        const movable = sources.filter((source) =>
+            source !== target
+            && source.parent !== target
+            && !this.isDescendantView(source, target));
+        if (movable.length === 0) return;
 
-        // 先提交重命名（名称可能因重名去重而变），再算新路径
-        const renamed = name !== source.label.textContent;
-        if (renamed) {
-            source.label.textContent = name;
-            source.key = name.toLowerCase();
-        }
+        const plans: FileMovePlan[] = [];
+        movable.forEach((source) => {
+            const oldPaths = this.collectFilePaths(source);
+            const oldName = source.label.textContent ?? '';
+            const name = this.uniqueName(target, oldName);
 
-        // 摘除 → 挂载：parent 与 children 数组同步维护
-        const siblings = source.parent?.children;
-        if (siblings) {
-            const index = siblings.indexOf(source);
-            if (index >= 0) siblings.splice(index, 1);
-        }
-        source.parent = target;
-        target.children.push(source);
-        target.childrenBox.appendChild(source.el);
-        source.el.style.paddingLeft = '';
+            // 先提交重命名（名称可能因重名去重而变），再算新路径
+            if (name !== oldName) {
+                source.label.textContent = name;
+                source.key = name.toLowerCase();
+            }
 
-        // 修正整棵子树的缩进（深度变了）
-        this.walk(source, (node) => {
-            node.row.style.paddingLeft = `${this.getDepth(node) * 14 + 4}px`;
+            // 摘除 → 挂载：parent 与 children 数组同步维护
+            const siblings = source.parent?.children;
+            if (siblings) {
+                const index = siblings.indexOf(source);
+                if (index >= 0) siblings.splice(index, 1);
+            }
+            source.parent = target;
+            target.children.push(source);
+            target.childrenBox.appendChild(source.el);
+            source.el.style.paddingLeft = '';
+
+            // 修正整棵子树的缩进（深度变了）
+            this.walk(source, (node) => {
+                node.row.style.paddingLeft = `${this.getDepth(node) * 14 + 4}px`;
+            });
+
+            // 内容搬迁：按「旧路径 → 新路径」一一对应（顺序与 collectFilePaths 一致）
+            const newPaths = this.collectFilePaths(source);
+            for (let i = 0; i < oldPaths.length && i < newPaths.length; i++) {
+                if (oldPaths[i] !== newPaths[i]) plans.push({ from: oldPaths[i], to: newPaths[i] });
+            }
+
+            // 被移动的是当前文件、或其祖先时，高亮与「当前文件名」需要跟着走
+            this.retargetActived(source, oldPaths, newPaths);
+            this.touchNode(source);
         });
 
-        // 内容搬迁：按「旧路径 → 新路径」一一对应（顺序与 collectFilePaths 一致）
-        const newPaths = this.collectFilePaths(source);
-        const plans: FileMovePlan[] = [];
-        for (let i = 0; i < oldPaths.length && i < newPaths.length; i++) {
-            if (oldPaths[i] !== newPaths[i]) plans.push({ from: oldPaths[i], to: newPaths[i] });
-        }
         if (plans.length > 0) this.options.content?.move?.(plans);
 
-        // 被移动的是当前文件、或其祖先时，高亮与「当前文件名」需要跟着走
-        this.retargetActived(source, oldPaths, newPaths);
-
-        this.touchNode(source);
         this.setOpen(target, true);
-        this.select(source);
+        // 移动后整组保持选中（与桌面文件管理器一致），可继续拖动或删除
+        this.selectMany(movable);
         this.notifyTreeChanged();
+    }
+
+    /**
+     * 计算本次拖拽要移动的节点集合（多选时整组一起移动）
+     *
+     * - 拖起的行未被选中时，`dragstart` 已把选区重置为它，这里只返回它自己；
+     * - 拖起的行在选区里时，返回选区内的**全部可见行**（搜索过滤 / 折叠的内部行不参与）；
+     * - 选区里文件夹与其子孙同时被选中时只保留文件夹：子孙会随文件夹整体搬走，
+     *   再单独移动一次就会被从文件夹里摘出来；
+     * - 根节点「工作区」不可移动，一律排除。
+     *
+     * 顺序按树中的可见顺序（{@link visibleRows}），移动后目标目录内的次序即此顺序。
+     * @private
+     * @param {TreeNodeView} view - 被拖起的节点
+     * @returns {TreeNodeView[]} 要移动的节点集合
+     */
+    private collectDragSources(view: TreeNodeView): TreeNodeView[] {
+        const candidates = this.visibleRows()
+            .filter((node) => this.highlighted.has(node) && !this.isRootView(node));
+        const topLevel = candidates.filter((node) => !candidates.some(
+            (other) => other !== node && other.isFolder && this.isDescendantView(other, node)));
+        return topLevel.length > 0 ? topLevel : [view];
     }
 
     /**
@@ -855,8 +1108,9 @@ export class FileTree {
     /**
      * 打开节点右键菜单
      *
-     * 菜单结构（自上而下）：新建文件（hover 展开二级菜单）/ 新建文件夹 / 打开 / 分割线 /
-     * 剪切 / 复制 / 粘贴 / **删除** / 分割线 / 重命名 / **属性**。
+     * 菜单结构（自上而下）：新建文件（hover 展开二级菜单）/ 新建文件夹 / 打开 /
+     * 另存为（hover 展开二级菜单） / 分割线 / 剪切 / 复制 / 粘贴 / **删除** /
+     * 分割线 / 重命名 / **属性**。
      *
      * 「删除」放在「粘贴」之下、分割线之上（危险操作紧邻同组的文件操作，
      * 与「重命名 / 属性」这类节点自身操作分隔开）。
@@ -869,8 +1123,9 @@ export class FileTree {
         const { menu } = this.options;
         if (!menu) return;
 
-        // 右键即选中，使菜单操作对象与高亮一致
-        this.select(view);
+        // 右键即选中；但右键**已在选区中**的行时保留多选，
+        // 使「另存为」等整组操作能作用于当前选中的全部文件
+        if (!this.highlighted.has(view)) this.select(view);
         // 新建目标：文件夹自身；文件则用其父节点（根节点的父为 null，回落到根节点）
         const parent = view.isFolder ? view : view.parent;
 
@@ -880,6 +1135,8 @@ export class FileTree {
                 () => this.createNewFileSubmenuItem(view),
                 { todo: 'newFolder', icon: 'icon-new-folder', text: '新建文件夹' },
                 { todo: 'open', icon: 'icon-open', text: '打开' },
+                // 另存为：hover 展开「另存为xlsx / docx / pptx / pdf」
+                () => this.createSaveAsSubmenuItem(),
                 'separator',
                 { todo: 'cut', icon: 'icon-scissors', text: '剪切' },
                 { todo: 'copy', icon: 'icon-copy', text: '复制' },
@@ -900,22 +1157,62 @@ export class FileTree {
 
     /**
      * 构建「新建文件」右键菜单项（含 hover 展开的二级菜单）
-     *
-     * 二级菜单沿用主表格右键菜单的既有做法：独立容器 append 到 body
-     * （主菜单 max-height + overflow 会被裁剪），定位到父项右侧并重叠 1px
-     * 消除 hover 间隙，mouseleave 延迟 120ms 关闭以免鼠标穿越间隙时误关。
      * @private
      * @param {TreeNodeView} view - 被右键的节点
      * @returns {HTMLElement} 菜单项元素
      */
     private createNewFileSubmenuItem(view: TreeNodeView): HTMLElement {
         const parent = view.isFolder ? view : view.parent;
+        return this.createHoverSubmenuItem('icon-new-file', '新建文件', NEW_FILE_MENU_ITEMS, (todo: string) => {
+            this.createFileNode(todo, parent);
+        });
+    }
+
+    /**
+     * 构建「另存为」右键菜单项（含 hover 展开的二级菜单）
+     *
+     * 后三项（docx / pptx / pdf）暂未实现，置灰不可点；
+     * 「另存为xlsx」打开导出清单对话框（列出当前选中的 `.grid` 文件）。
+     * @private
+     * @returns {HTMLElement} 菜单项元素
+     */
+    private createSaveAsSubmenuItem(): HTMLElement {
+        const items: MenuItemSpec[] = [
+            { todo: 'saveAsXlsx', text: '另存为xlsx' },
+            { todo: 'saveAsDocx', text: '另存为docx', disabled: true },
+            { todo: 'saveAsPptx', text: '另存为pptx', disabled: true },
+            { todo: 'saveAsPdf', text: '另存为pdf', disabled: true },
+        ];
+        return this.createHoverSubmenuItem('icon-file', '另存为', items, (todo: string) => {
+            if (todo === 'saveAsXlsx') this.showSaveAsXlsxDialog();
+        });
+    }
+
+    /**
+     * 构建带 hover 二级菜单的菜单项（「新建文件」「另存为」共用）
+     *
+     * 二级菜单沿用主表格右键菜单的既有做法：独立容器 append 到 body
+     * （主菜单 max-height + overflow 会被裁剪），定位到父项右侧并重叠 1px
+     * 消除 hover 间隙，mouseleave 延迟 120ms 关闭以免鼠标穿越间隙时误关。
+     * @private
+     * @param {string} iconClass - 一级项图标类名
+     * @param {string} text - 一级项文字
+     * @param {MenuItemSpec[]} items - 二级菜单项
+     * @param {(todo: string) => void} onPick - 二级菜单项点击回调（菜单已关闭）
+     * @returns {HTMLElement} 菜单项元素
+     */
+    private createHoverSubmenuItem(
+        iconClass: string,
+        text: string,
+        items: MenuItemSpec[],
+        onPick: (todo: string) => void
+    ): HTMLElement {
         const wrap = createDiv({
             className: 'menu-item menu-item-has-submenu',
             style: { position: 'relative' },
         });
-        const iconEl = createElement('i', { className: 'icon-new-file' });
-        const textSpan = createSpan({ className: 'text', textContent: '新建文件' });
+        const iconEl = createElement('i', { className: iconClass });
+        const textSpan = createSpan({ className: 'text', textContent: text });
         const arrowSpan = createSpan({ textContent: '▶' });
         arrowSpan.style.cssText = 'margin-left:auto; font-size:10px; color:#999;';
         wrap.append(iconEl, textSpan, arrowSpan);
@@ -928,8 +1225,11 @@ export class FileTree {
                 closeTimer = null;
             }
         };
+        const onMenuClose = (): void => closeSubmenu();
         const closeSubmenu = (): void => {
             cancelPendingClose();
+            // 每次展开都注册一次兜底清理，关闭时同步注销，避免反复右键累积监听
+            this.options.menu?.off('close', onMenuClose);
             if (submenuEl?.isConnected) submenuEl.remove();
             submenuEl = null;
         };
@@ -938,11 +1238,11 @@ export class FileTree {
             cancelPendingClose();
             if (submenuEl) return;   // 已展开则跳过
             const subContent = new MenuContent({
-                items: NEW_FILE_MENU_ITEMS,
+                items,
                 onClick: (todo: string) => {
                     closeSubmenu();
                     this.options.menu?.closeMenu();
-                    this.createFileNode(todo, parent);
+                    onPick(todo);
                 },
             });
             submenuEl = subContent.getElements().container;
@@ -966,15 +1266,561 @@ export class FileTree {
             submenuEl.style.left = `${left}px`;
             submenuEl.style.top = `${top}px`;
             submenuEl.addEventListener('mouseenter', cancelPendingClose);
+            // 主菜单关闭时兜底清理，防止子菜单残留（关闭后由 closeSubmenu 注销）
+            this.options.menu?.on('close', onMenuClose);
         });
 
-        // 主菜单关闭时兜底清理，防止子菜单残留
-        this.options.menu?.on('close', closeSubmenu);
         wrap.addEventListener('mouseleave', () => {
+            // 记录定时器，鼠标在延迟内回到这一项（或移入子菜单）时取消关闭
             cancelPendingClose();
             closeTimer = setTimeout(closeSubmenu, 120);
         });
         return wrap;
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  另存为（导出清单对话框）
+    // ════════════════════════════════════════════════════════════
+
+    /**
+     * 收集当前选中的 `.grid` 文件（按树中可见顺序，序号即返回顺序）
+     * @private
+     * @returns {Array<{ path: string; name: string }>} 选中文件
+     */
+    private collectSelectedGridFiles(): Array<{ path: string; name: string }> {
+        return this.visibleRows()
+            .filter((view) => this.highlighted.has(view) && !view.isFolder)
+            .map((view) => ({ path: this.pathWithSelf(view), name: view.label.textContent ?? '' }))
+            .filter((file) => extractExtension(file.name) === 'grid');
+    }
+
+    /**
+     * 显示「另存为xlsx」对话框
+     *
+     * 正文为六列表格（转换由 {@link FileTreeOptions.convertXlsx} 在后台完成）：
+     * 1. 多选框 + 序号（表头多选框全选）
+     * 2. 文件名
+     * 3. 文件大小（由 {@link FileTreeOptions.fileSize} 异步补全，未提供时「—」）
+     * 4. 进度（0–100%；排队中显示「排队中」，暂停时带「已暂停」后缀）
+     * 5. 操作（每行开始 / 暂停 / 删除，仅图标；表头同样是这三枚按钮，
+     *    对勾选的行批量执行）
+     * 6. 下载（表头为「打包下载」按钮；文件转换完成前整列不可用）
+     * @private
+     */
+    private showSaveAsXlsxDialog(): void {
+        const files = this.collectSelectedGridFiles();
+        // 每次打开都从「待开始」重新来：上一次的转换作业不跨次保留
+        this.stopSaveAsProgress();
+        this.saveAsRows = [];
+        this.saveAsSelectAll = null;
+        this.saveAsDownloadAll = null;
+        this.saveAsHeaderStart = null;
+        this.saveAsHeaderPause = null;
+        this.saveAsHeaderRemove = null;
+        if (!this.saveAsDialog) {
+            this.saveAsDialog = new Dialog({
+                title: '另存为xlsx',
+                size: 'lg',
+                scrollable: true,
+                buttons: [{ text: '关闭', variant: 'secondary' }],
+            });
+            // 关闭后停止转换并释放作业，避免对话框隐藏后仍在后台空转
+            this.saveAsDialog.on('close', () => this.stopSaveAsProgress());
+        }
+
+        const body = createDiv();
+        /** 文件大小单元格：异步补全时按行更新 */
+        const sizeCells: Array<{ path: string; cell: HTMLTableCellElement }> = [];
+
+        if (files.length === 0) {
+            body.appendChild(createDiv({
+                className: TREE.SAVE_AS_EMPTY,
+                textContent: '没有可导出的文件：请先在文件树中选中 .grid 文件',
+            }));
+        } else {
+            const table = createElement('table', { className: TREE.SAVE_AS_TABLE });
+            table.appendChild(this.createSaveAsTableHead());
+            const tbody = createElement('tbody');
+            files.forEach((file, index) => {
+                tbody.appendChild(this.createSaveAsTableRow(file, index + 1, sizeCells).rowEl);
+            });
+            table.appendChild(tbody);
+            body.appendChild(table);
+        }
+
+        this.saveAsDialog.setContent(body);
+        this.saveAsDialog.show();
+        this.updateSaveAsHeader();
+        this.fillSaveAsFileSizes(sizeCells);
+    }
+
+    /**
+     * 构建「另存为xlsx」清单的表头
+     * @private
+     * @returns {HTMLTableSectionElement} thead 元素
+     */
+    private createSaveAsTableHead(): HTMLTableSectionElement {
+        const thead = createElement('thead') as HTMLTableSectionElement;
+        const headRow = createElement('tr');
+
+        // 第一列：全选多选框 + 序号
+        const indexHead = createElement('th');
+        const selectAll = createInput({
+            type: 'checkbox',
+            className: TREE.SAVE_AS_SELECT,
+            attributes: { title: '全选' },
+        });
+        selectAll.addEventListener('change', () => {
+            this.saveAsRows.forEach((row) => {
+                row.check.checked = selectAll.checked;
+            });
+            this.updateSaveAsHeader();
+        });
+        this.saveAsSelectAll = selectAll;
+        indexHead.append(selectAll, createSpan({ textContent: '序号' }));
+        headRow.appendChild(indexHead);
+
+        ['文件名', '文件大小', '进度'].forEach((text) => {
+            headRow.appendChild(createElement('th', { textContent: text }));
+        });
+        // 操作列表头：同样三枚图标按钮，对勾选的行做批量操作
+        const actionHead = createElement('th');
+        const headerStart = this.createSaveAsActionButton('icon-play3', '开始转换勾选的文件');
+        const headerPause = this.createSaveAsActionButton('icon-pause2', '暂停勾选的文件');
+        const headerRemove = this.createSaveAsActionButton('icon-bin', '从清单中删除勾选的文件');
+        headerStart.addEventListener('click', () => this.startCheckedSaveAsRows());
+        headerPause.addEventListener('click', () => this.pauseCheckedSaveAsRows());
+        headerRemove.addEventListener('click', () => this.removeCheckedSaveAsRows());
+        actionHead.append(headerStart, headerPause, headerRemove);
+        headRow.appendChild(actionHead);
+        this.saveAsHeaderStart = headerStart;
+        this.saveAsHeaderPause = headerPause;
+        this.saveAsHeaderRemove = headerRemove;
+
+        // 下载列：表头是「打包下载」按钮，没有可下载文件时不可用
+        const downloadHead = createElement('th');
+        const downloadAll = createButton({
+            className: TREE.SAVE_AS_DOWNLOAD_ALL,
+            textContent: '打包下载',
+            attributes: { type: 'button', title: '打包下载勾选的已转换文件' },
+        });
+        downloadAll.disabled = true;
+        downloadAll.addEventListener('click', () => this.handleSaveAsDownloadAll());
+        this.saveAsDownloadAll = downloadAll;
+        downloadHead.appendChild(downloadAll);
+        headRow.appendChild(downloadHead);
+
+        thead.appendChild(headRow);
+        return thead;
+    }
+
+    /**
+     * 构建「另存为xlsx」清单的一行（同时登记到 {@link saveAsRows}）
+     * @private
+     * @param file - 文件路径与名称
+     * @param index - 序号（1-based）
+     * @param sizeCells - 文件大小待补全列表（由调用方统一异步填充）
+     * @returns {SaveAsRow} 行状态与 DOM 引用
+     */
+    private createSaveAsTableRow(
+        file: { path: string; name: string },
+        index: number,
+        sizeCells: Array<{ path: string; cell: HTMLTableCellElement }>
+    ): SaveAsRow {
+        const rowEl = createElement('tr') as HTMLTableRowElement;
+
+        // 多选框 + 序号
+        const indexCell = createElement('td') as HTMLTableCellElement;
+        const check = createInput({
+            type: 'checkbox',
+            className: TREE.SAVE_AS_SELECT,
+            attributes: { title: `选择 ${file.name}` },
+        });
+        check.addEventListener('change', () => this.updateSaveAsHeader());
+        const indexEl = createSpan({ className: TREE.SAVE_AS_INDEX, textContent: String(index) });
+        indexCell.append(check, indexEl);
+        rowEl.appendChild(indexCell);
+
+        rowEl.appendChild(createElement('td', {
+            textContent: file.name,
+            attributes: { title: file.path },
+        }));
+        const sizeCell = createElement('td', { textContent: '—' }) as HTMLTableCellElement;
+        rowEl.appendChild(sizeCell);
+        sizeCells.push({ path: file.path, cell: sizeCell });
+
+        const progressCell = createElement('td', { textContent: '0%' }) as HTMLTableCellElement;
+        rowEl.appendChild(progressCell);
+
+        // 操作列：开始 / 暂停 / 删除（仅图标，不写文字）
+        const actionCell = createElement('td') as HTMLTableCellElement;
+        const startBtn = this.createSaveAsActionButton('icon-play3', `开始转换 ${file.name}`);
+        const pauseBtn = this.createSaveAsActionButton('icon-pause2', `暂停转换 ${file.name}`);
+        const removeBtn = this.createSaveAsActionButton('icon-bin', `从清单中删除 ${file.name}`);
+        actionCell.append(startBtn, pauseBtn, removeBtn);
+        rowEl.appendChild(actionCell);
+
+        // 下载列：转换完成前不可用
+        const downloadCell = createElement('td', { textContent: '下载' }) as HTMLTableCellElement;
+        downloadCell.classList.add(TREE.SAVE_AS_DOWNLOAD, TREE.SAVE_AS_DISABLED);
+        rowEl.appendChild(downloadCell);
+
+        const row: SaveAsRow = {
+            path: file.path,
+            name: file.name,
+            state: 'idle',
+            progress: 0,
+            task: null,
+            runToken: 0,
+            rowEl,
+            check,
+            indexEl,
+            progressCell,
+            startBtn,
+            pauseBtn,
+            downloadCell,
+        };
+        startBtn.addEventListener('click', () => this.startSaveAsRow(row));
+        pauseBtn.addEventListener('click', () => this.pauseSaveAsRow(row));
+        removeBtn.addEventListener('click', () => this.removeSaveAsRow(row));
+        downloadCell.addEventListener('click', () => this.handleSaveAsDownload(row));
+
+        this.saveAsRows.push(row);
+        this.updateSaveAsRow(row);
+        return row;
+    }
+
+    /**
+     * 创建操作列的一枚纯图标按钮
+     * @private
+     * @param iconClass - 图标类名（见 icon.css）
+     * @param title - 悬停提示（同时也是无障碍名称）
+     * @returns {HTMLButtonElement} 按钮元素
+     */
+    private createSaveAsActionButton(iconClass: string, title: string): HTMLButtonElement {
+        const button = createButton({
+            className: TREE.SAVE_AS_ACTION,
+            attributes: { type: 'button', title },
+        });
+        button.appendChild(createElement('i', { className: iconClass }));
+        return button;
+    }
+
+    /**
+     * 开始（或继续）一行文件的转换：只入队，真正启动由 {@link pumpSaveAsQueue} 负责
+     *
+     * 单飞队列保证同一时刻只有一个转换在跑。已暂停的行入队后会从**断点**继续：
+     * 作业状态一直留在 `row.task` 上，不会重新解析存档、也不会重跑已产出的行。
+     * @private
+     * @param {SaveAsRow} row - 目标行
+     */
+    private startSaveAsRow(row: SaveAsRow): void {
+        if (row.state === 'converting' || row.state === 'queued' || row.state === 'done') return;
+        row.state = 'queued';
+        this.saveAsQueue.push(row);
+        this.updateSaveAsRow(row);
+        this.updateSaveAsHeader();
+        void this.pumpSaveAsQueue();
+    }
+
+    /**
+     * 出队并运行队首（单飞：已有行在跑时直接返回）
+     * @private
+     */
+    private async pumpSaveAsQueue(): Promise<void> {
+        if (this.saveAsRunning || this.saveAsQueue.length === 0) return;
+        const row = this.saveAsQueue.shift();
+        if (!row) return;
+        this.saveAsRunning = row;
+        row.state = 'converting';
+        this.updateSaveAsRow(row);
+        this.updateSaveAsHeader();
+        await this.runSaveAsRow(row);
+    }
+
+    /**
+     * 用时间片驱动一行的转换，直到完成 / 被暂停 / 被删除
+     *
+     * 每片最多跑 {@link SAVE_AS_SLICE_MS} 毫秒就交还主线程：界面保持可响应，
+     * 暂停也在片与片之间生效。停止推进时作业状态原样保留，下次「开始」续跑。
+     * @private
+     * @param {SaveAsRow} row - 目标行
+     */
+    private async runSaveAsRow(row: SaveAsRow): Promise<void> {
+        const token = ++row.runToken;
+        let task = row.task;
+        try {
+            if (!task) {
+                const convert = this.options.convertXlsx;
+                if (!convert) throw new Error('未配置 xlsx 转换器');
+                const created = await convert(row.path, row.name);
+                // 等待读档期间可能被「暂停 → 又开始」：交由新的驱动循环接管
+                if (row.runToken !== token) return;
+                row.task = created;
+                task = created;
+            }
+            while (this.saveAsRunning === row
+                && this.saveAsRows.includes(row)
+                && row.state === 'converting'
+                && row.runToken === token) {
+                if (task.step(performance.now() + SAVE_AS_SLICE_MS)) {
+                    row.progress = 100;
+                    row.state = 'done';
+                    this.updateSaveAsRow(row);
+                    break;
+                }
+                const value = Math.min(99, Math.round(task.progress));
+                if (value > row.progress) {
+                    row.progress = value;
+                    this.updateSaveAsRow(row);
+                }
+                await yieldToHost();
+            }
+        } catch (error) {
+            // 行可能在等待读档期间被删除：此时不再改已失效的 DOM
+            if (row.runToken === token && this.saveAsRows.includes(row)) {
+                row.task = null;
+                row.state = 'idle';
+                row.progress = 0;
+                this.updateSaveAsRow(row);
+                new MessageBox().show(`「${row.name}」转换失败：${errorMessage(error)}`, { type: 'error' });
+            }
+        } finally {
+            // 只有仍占着「当前运行」的驱动才交棒（暂停 / 删除 / 新驱动接管都已让位）
+            if (this.saveAsRunning === row && row.runToken === token) {
+                this.saveAsRunning = null;
+                this.updateSaveAsHeader();
+                void this.pumpSaveAsQueue();
+            }
+        }
+    }
+
+    /**
+     * 暂停一行文件的转换
+     *
+     * 排队中的行直接从队列摘下；正在跑的行在下一个时间片边界停下来，
+     * 作业状态原样留在 `row.task` 上 —— 再次「开始」从断点继续。
+     * @private
+     * @param {SaveAsRow} row - 目标行
+     */
+    private pauseSaveAsRow(row: SaveAsRow): void {
+        if (row.state === 'queued') {
+            this.saveAsQueue = this.saveAsQueue.filter((item) => item !== row);
+            // 从未出队（还没有作业）时回到「待开始」，否则保持可续传的「已暂停」
+            row.state = row.task ? 'paused' : 'idle';
+            this.updateSaveAsRow(row);
+            this.updateSaveAsHeader();
+            return;
+        }
+        if (row.state !== 'converting') return;
+        row.state = 'paused';
+        this.updateSaveAsRow(row);
+        if (this.saveAsRunning === row) {
+            this.saveAsRunning = null;
+            this.updateSaveAsHeader();
+            if (!this.saveAsBatchPausing) void this.pumpSaveAsQueue();
+        }
+    }
+
+    /**
+     * 从清单中删除一行（同时把它从队列 / 当前运行位置摘除并重新编号）
+     * @private
+     * @param {SaveAsRow} row - 目标行
+     */
+    private removeSaveAsRow(row: SaveAsRow): void {
+        this.saveAsQueue = this.saveAsQueue.filter((item) => item !== row);
+        // 正在跑的行：释放「当前运行」占位，驱动循环会在下一个时间片自行退出
+        if (this.saveAsRunning === row) this.saveAsRunning = null;
+        row.task = null;
+        const tbody = row.rowEl.parentElement;
+        row.rowEl.remove();
+        this.saveAsRows = this.saveAsRows.filter((item) => item !== row);
+        this.saveAsRows.forEach((item, index) => {
+            item.indexEl.textContent = String(index + 1);
+        });
+        this.updateSaveAsHeader();
+        // 全部删空后换成与「无选中文件」一致的提示，避免只剩一个空表头
+        if (this.saveAsRows.length === 0) {
+            tbody?.parentElement?.remove();
+            this.saveAsDialog?.getBody().appendChild(createDiv({
+                className: TREE.SAVE_AS_EMPTY,
+                textContent: '没有可导出的文件：请先在文件树中选中 .grid 文件',
+            }));
+        } else {
+            void this.pumpSaveAsQueue();
+        }
+    }
+
+    /**
+     * 批量开始：对勾选的行逐一启动转换（已完成的会被 {@link startSaveAsRow} 跳过）
+     * @private
+     */
+    private startCheckedSaveAsRows(): void {
+        this.saveAsRows.filter((row) => row.check.checked).forEach((row) => this.startSaveAsRow(row));
+    }
+
+    /**
+     * 批量暂停：对勾选且正在转换 / 排队中的行暂停（其余状态忽略）
+     *
+     * 先暂停完所有目标行，再统一起下一行，避免暂停过程中反复启动新行。
+     * @private
+     */
+    private pauseCheckedSaveAsRows(): void {
+        const targets = this.saveAsRows.filter((row) => row.check.checked);
+        this.saveAsBatchPausing = true;
+        try {
+            targets.forEach((row) => this.pauseSaveAsRow(row));
+        } finally {
+            this.saveAsBatchPausing = false;
+        }
+        void this.pumpSaveAsQueue();
+    }
+
+    /**
+     * 批量删除：把勾选的行从清单中移除（行内删除逻辑与单行一致）
+     * @private
+     */
+    private removeCheckedSaveAsRows(): void {
+        this.saveAsRows.filter((row) => row.check.checked).forEach((row) => this.removeSaveAsRow(row));
+    }
+
+    /**
+     * 按行状态刷新进度文本、按钮可用性与下载可用性
+     * @private
+     * @param {SaveAsRow} row - 目标行
+     */
+    private updateSaveAsRow(row: SaveAsRow): void {
+        if (row.state === 'done') row.progressCell.textContent = '已完成';
+        else if (row.state === 'queued') row.progressCell.textContent = '排队中';
+        else row.progressCell.textContent = `${row.progress}%${row.state === 'paused' ? '（已暂停）' : ''}`;
+        row.startBtn.disabled = row.state === 'converting' || row.state === 'queued' || row.state === 'done';
+        row.pauseBtn.disabled = !(row.state === 'converting' || row.state === 'queued');
+        const done = row.state === 'done';
+        row.rowEl.classList.toggle(TREE.SAVE_AS_DONE, done);
+        row.downloadCell.classList.toggle(TREE.SAVE_AS_DISABLED, !done);
+        row.downloadCell.title = done ? `下载 ${row.name}` : '转换完成后可下载';
+    }
+
+    /**
+     * 刷新表头：全选框的三态，以及「打包下载」的可用性
+     *
+     * 下载列整列（含表头）都遵循「转换完成才可用」：表头按钮要求
+     * 「勾选的这些文件全部已完成」，只要还有一个勾选文件未转换完成就整列不可用；
+     * 对应行未完成时该行的「下载」同样置灰。
+     * @private
+     */
+    private updateSaveAsHeader(): void {
+        const rows = this.saveAsRows;
+        const checked = rows.filter((row) => row.check.checked);
+        if (this.saveAsSelectAll) {
+            this.saveAsSelectAll.checked = rows.length > 0 && checked.length === rows.length;
+            this.saveAsSelectAll.indeterminate = checked.length > 0 && checked.length < rows.length;
+            this.saveAsSelectAll.disabled = rows.length === 0;
+        }
+        if (this.saveAsDownloadAll) {
+            this.saveAsDownloadAll.disabled =
+                checked.length === 0 || checked.some((row) => row.state !== 'done');
+        }
+        // 表头的批量操作同样以「有勾选行」为前提
+        const noChecked = checked.length === 0;
+        [this.saveAsHeaderStart, this.saveAsHeaderPause, this.saveAsHeaderRemove].forEach((button) => {
+            if (button) button.disabled = noChecked;
+        });
+    }
+
+    /**
+     * 下载单行「转换后」的 xlsx（转换完成且拿到 Blob 才生效）
+     * @private
+     * @param {SaveAsRow} row - 目标行
+     */
+    private handleSaveAsDownload(row: SaveAsRow): void {
+        const blob = row.task?.blob;
+        if (row.state !== 'done' || !blob) return;
+        triggerDownload(blob, `${stripExtension(row.name)}.xlsx`);
+    }
+
+    /**
+     * 打包下载：把勾选且已完成的 xlsx 打成 zip
+     *
+     * ZIP 内的条目名**保留文件在树中的目录层级**（`归档/销售数据.grid` →
+     * `归档/销售数据.xlsx`），因此不同文件夹下的同名文件互不冲突。
+     * 同一目录下万一仍有重名，再按 `名称(2).xlsx` 递增去重；
+     * 所有文件都以「存储」方式写入，不重新压缩 xlsx 自身。
+     */
+    private async handleSaveAsDownloadAll(): Promise<void> {
+        const targets = this.saveAsRows.filter((row) => row.check.checked && row.state === 'done' && row.task?.blob);
+        if (targets.length === 0) return;
+        try {
+            const used = new Set<string>();
+            const entries: Array<{ name: string; data: Uint8Array }> = [];
+            for (const row of targets) {
+                const blob = row.task?.blob;
+                if (!blob) continue;
+                // 相对路径（含扩展名）→ zip 条目名：去掉 `.grid`、补 `.xlsx`，分隔符统一为 `/`。
+                // 只在最后一个 `/` 之后去扩展名，避免目录名里的点被误当作扩展名分隔符。
+                const normalized = (row.path || row.name).replace(/\\/g, '/')
+                    .split('/')
+                    .filter((segment) => segment !== '')
+                    .join('/');
+                const slash = normalized.lastIndexOf('/');
+                const dir = slash >= 0 ? normalized.slice(0, slash + 1) : '';
+                const base = stripExtension(slash >= 0 ? normalized.slice(slash + 1) : normalized);
+                let entryName = `${dir}${base}.xlsx`;
+                let index = 2;
+                while (used.has(entryName.toLowerCase())) {
+                    entryName = `${dir}${base}(${index++}).xlsx`;
+                }
+                used.add(entryName.toLowerCase());
+                entries.push({ name: entryName, data: new Uint8Array(await blob.arrayBuffer()) });
+            }
+            triggerDownload(createZipBlob(entries), 'xlsx打包下载.zip');
+        } catch (error) {
+            new MessageBox().show(`打包下载失败：${errorMessage(error)}`, { type: 'error' });
+        }
+    }
+
+    /**
+     * 停止全部转换（对话框关闭或重新打开时调用）
+     *
+     * 清空排队，让当前行在下一个时间片停下（驱动循环看到「当前运行」已清空就退出），
+     * 并丢弃所有作业 —— 关闭对话框后不再占用内存。
+     */
+    private stopSaveAsProgress(): void {
+        this.saveAsQueue = [];
+        const running = this.saveAsRunning;
+        this.saveAsRunning = null;
+        if (running && running.state === 'converting') {
+            running.state = 'paused';
+            this.updateSaveAsRow(running);
+        }
+        this.saveAsRows.forEach((row) => {
+            row.task = null;
+        });
+    }
+
+    /**
+     * 异步补全「另存为xlsx」清单中的「文件大小」列
+     *
+     * 逐行读取并写回，读取失败或未提供 {@link FileTreeOptions.fileSize} 时保持「—」；
+     * 对话框被重新打开后旧单元格已脱离文档，随即停止更新。
+     * @private
+     * @param {Array<{ path: string; cell: HTMLTableCellElement }>} rows - 待补全的行
+     */
+    private async fillSaveAsFileSizes(
+        rows: Array<{ path: string; cell: HTMLTableCellElement }>
+    ): Promise<void> {
+        const getSize = this.options.fileSize;
+        if (!getSize) return;
+        for (const row of rows) {
+            let bytes: number | null = null;
+            try {
+                bytes = await getSize(row.path);
+            } catch {
+                bytes = null;
+            }
+            if (!row.cell.isConnected) return;
+            row.cell.textContent = bytes === null ? '—' : formatFileSize(bytes);
+        }
     }
 
     // ════════════════════════════════════════════════════════════
@@ -1573,6 +2419,25 @@ export class FileTree {
         }
         // 锚点保持不动；主操作对象改为被点节点
         this.selected = to;
+    }
+
+    /**
+     * 把一组节点设为选中（多选：整组保持高亮）
+     *
+     * 主操作对象（{@link selected}）与连选锚点都取该组**最后一个**节点，
+     * 之后 Shift 点击可从这里继续扩展选区。
+     * @private
+     * @param {TreeNodeView[]} views - 要选中的节点（按可见顺序）
+     */
+    private selectMany(views: TreeNodeView[]): void {
+        this.clearHighlight();
+        const last = views.length > 0 ? views[views.length - 1] : null;
+        views.forEach((view) => {
+            view.row.classList.add(TREE.SELECTED);
+            this.highlighted.add(view);
+        });
+        this.selected = last;
+        this.selectionAnchor = last;
     }
 
     /**

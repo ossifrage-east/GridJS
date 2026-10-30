@@ -42,6 +42,7 @@ import { Toolbar } from "./toolbar/toolbar";
 import { Menu } from "./common/menu";
 import { QuickAccess } from "./toolbar/quickAccess";
 import { stripExtension, toArchiveKey } from "../utils/fileName";
+import { createXlsxTask, type XlsxTask } from "../utils/parser/xlsxWriter";
 import favicon from "../assets/images/favicon.ico";
 
 /** 导航内容区宽度在 IndexDB 中的键前缀（完整键 = 前缀 + 导航项文本） */
@@ -406,6 +407,10 @@ export class App {
                 move: (plans: FileMovePlan[]) => this.moveFileContents(plans),
                 remove: (paths: string[]) => this.removeFileContents(paths),
             },
+            // 「另存为」对话框的「文件大小」列：文件内容存在 IndexedDB，按路径换算存档键后读取
+            fileSize: (path: string) => this.getFileSize(path),
+            // 「另存为xlsx」的真实转换：读存档 → 生成 xlsx Blob（下载 / 打包下载直接写盘）
+            convertXlsx: (path: string, name: string) => this.convertGridToXlsx(path, name),
         });
         navigator.navContentItemMount(NAV_PANEL[0], this.fileTree.getElements().container);   // NAV_PANEL[0] 即「文件」
         // 「定位」的目标是「主页面正在显示的那个文件」。
@@ -570,6 +575,57 @@ export class App {
      */
     private toSheetKey(path: string): string {
         return toArchiveKey(path);
+    }
+
+    /**
+     * 读取某文件在数据库中的存档大小（字节），供「另存为」对话框的「文件大小」列使用
+     *
+     * 存档由两部分组成（与 `values` / `images` 两个库一一对应）：
+     * 单元格值（JSON 文本，按 UTF-8 字节数计）与图片（累加二进制长度）。
+     * 没有存档时返回 0（视为空文件）；读取异常返回 null，由调用方显示「—」。
+     * @param path - 文件路径（含扩展名，相对根节点）
+     * @returns {Promise<number | null>} 字节数；读取失败为 null
+     */
+    private async getFileSize(path: string): Promise<number | null> {
+        const key = this.toSheetKey(path);
+        if (!key) return null;
+        try {
+            const raw = await this.settingsDb.getValue(key);
+            let bytes = 0;
+            if (typeof raw === 'string') {
+                // `'{}'` 是 getValue 对「无记录」的返回值，不应计作文件内容
+                bytes = raw === '{}' ? 0 : new TextEncoder().encode(raw).byteLength;
+            } else if (raw !== null && raw !== undefined) {
+                bytes = new TextEncoder().encode(JSON.stringify(raw)).byteLength;
+            }
+            const images = await this.settingsDb.getImages(key);
+            for (const image of images) {
+                const data = (image as { data?: unknown } | null)?.data;
+                if (data instanceof Uint8Array) bytes += data.byteLength;
+            }
+            return bytes;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * 创建 `.grid` 文件 → xlsx 的转换作业（「另存为xlsx」对话框的真实转换）
+     *
+     * 存档键与文件大小列同源（见 {@link App.toSheetKey}）：当前主页面正在编辑的文件
+     * 直接取内存快照（含尚未触发自动保存的改动），其余文件读 IndexedDB 里的存档。
+     * 返回的作业由对话框按时间片驱动（单飞队列），因此这里只负责取数据，不做转换。
+     * @param path - 文件路径（含扩展名，相对根节点）
+     * @param name - 文件名（用于工作表名）
+     * @returns {Promise<XlsxTask>} 可暂停 / 可续传的转换作业
+     */
+    private async convertGridToXlsx(path: string, name: string): Promise<XlsxTask> {
+        const key = this.toSheetKey(path);
+        if (!key) throw new Error('无效的文件路径');
+        const raw = key === this.data.activedSheetName
+            ? this.data.toSnapshot()
+            : await this.settingsDb.getValue(key);
+        return createXlsxTask(raw, stripExtension(name));
     }
 
     /**

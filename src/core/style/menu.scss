@@ -61,6 +61,14 @@
     color: #217346; /* Excel green color */
 }
 
+/* 置灰项（暂未实现的功能）：不响应 hover 高亮，光标保持默认 */
+.menu-item.is-disabled,
+.menu-item.is-disabled:hover {
+    color: #adb5bd;
+    background-color: transparent;
+    cursor: default;
+}
+
 .menu-item i {
     font-size: 16px;
     width: 16px;

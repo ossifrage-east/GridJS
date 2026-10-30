@@ -181,11 +181,30 @@ export class Menu extends EventEmitter {
 }
 
 /**
+ * 单个菜单项的配置
+ */
+export type MenuItemOptions = {
+    /** 点击时回传的动作标识 */
+    todo?: string;
+    /** 图标类名 */
+    icon?: string | null;
+    /** 复合图标角标 */
+    badge?: 'T' | 'brush';
+    /** 菜单项文字 */
+    text?: string;
+    /** 是否置灰（暂未实现的功能）：不响应点击与 hover 高亮 */
+    disabled?: boolean;
+};
+
+/** 菜单项：配置对象 / 分隔符 / 自定义元素生成函数 */
+export type MenuItemSpec = MenuItemOptions | 'separator' | (() => HTMLElement);
+
+/**
  * 菜单内容选项接口
  */
 export interface MenuContentOptions {
     /** 菜单项数组或自定义元素生成函数 */
-    items: ({ todo?: string, icon?: string | null, badge?: 'T' | 'brush', text?: string } | 'separator' | (() => HTMLElement))[] | (() => HTMLElement);
+    items: MenuItemSpec[] | (() => HTMLElement);
     /** 点击回调函数 */
     onClick?: (todo: string) => void;
 }
@@ -263,7 +282,7 @@ export class MenuContent extends EventEmitter {
      */
     private addMenuItem(): void {
         (Array.isArray(this.options.items) ? this.options.items : [this.options.items]).forEach(
-            (item: { todo?: string, icon?: string, badge?: 'T' | 'brush', text: string } | 'separator' | (() => HTMLElement)) => {
+            (item: MenuItemSpec | MenuItemOptions) => {
                 const menuItem = document.createElement('div');
                 if (item === 'separator') {
                     menuItem.classList.add(MENU_CLASS_NAMES.LINE);
@@ -292,6 +311,15 @@ export class MenuContent extends EventEmitter {
                     menuItem.appendChild(iconEl);
                 }
                 menuItem.appendChild(text);
+
+                // 置灰项：仅展示，不绑定点击（对应「暂未实现」的功能）
+                if (item.disabled) {
+                    menuItem.classList.add('is-disabled');
+                    menuItem.setAttribute('aria-disabled', 'true');
+                    this.container.appendChild(menuItem);
+                    return;
+                }
+
                 this.container.appendChild(menuItem);
 
                 this.handleClick(menuItem, `${item.todo}`);
