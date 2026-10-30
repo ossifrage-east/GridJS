@@ -21,7 +21,7 @@ import { ColorPicker } from "../../common/colorPicker";
 import { Menu } from "../../common/menu";
 import { Select } from "../../common/select";
 import { CommandBus } from "../../contract/commandBus";
-import { EDIT_STATE_CHANGED } from "../../contract/editHost";
+import { EDIT_STATE_CHANGED, WorkspaceKind } from "../../contract/editHost";
 
 
 /**
@@ -57,6 +57,8 @@ export class SectionFont {
     private menu: Menu;
     /** @type {Record<string, (Select | BtnBase) | undefined>} 工具栏按钮集合 */
     private toolbars: Record<string, (Select | BtnBase) | undefined> = {};
+    /** 当前工作区类型（决定油漆桶的「无颜色」翻译成什么，见 resolvePaintColor） */
+    private kind: WorkspaceKind = 'sheet';
 
     /**
      * 创建 SectionFont 实例
@@ -362,7 +364,7 @@ export class SectionFont {
                             onChange: (color) => {
                                 this.menu.closeMenu();
                                 paintBucketBtn.setSpanColor(color);
-                                this.bus.dispatch('setBackground', { value: color !== 'none' ? color : 'white' });
+                                this.bus.dispatch('setBackground', { value: this.resolvePaintColor(color) });
                             }
                         });
                         return colorPicker.getElements().pickerContainer;
@@ -378,7 +380,7 @@ export class SectionFont {
                 if (!todo.includes('Menu')) {
                     const color = paintBucketBtn.getSpanColor();
                     if (color) {
-                        this.bus.dispatch('setBackground', { value: color !== 'none' ? color : 'white' });
+                        this.bus.dispatch('setBackground', { value: this.resolvePaintColor(color) });
                     }
                 }
             }
@@ -428,8 +430,44 @@ export class SectionFont {
                 }
             }
         });
-        this.toolbars = {fontSelect, fontSizeSelect, boldBtn, italicBtn, underlineBtn, strikethroughBtn, paintBucketBtn, textColorBtn};
+        this.toolbars = {fontSelect, fontSizeSelect, boldBtn, italicBtn, underlineBtn, strikethroughBtn, borderBtn, paintBucketBtn, textColorBtn};
         this.setupStateListeners();
+    }
+
+    /**
+     * 按工作区类型收敛分区内容
+     *
+     * 文档没有「单元格边框」，因此边框按钮在文档工作区下直接隐藏 ——
+     * 而不是靠 `canExecute` 的置灰：一排灰按钮会让人以为是自己选错了对象，
+     * 隐藏才是「这个功能在这里不存在」的正确表达。
+     * 油漆桶保留：在文档里它是「字符高亮」，语义成立。
+     * @param kind - 工作区类型
+     */
+    public setKind(kind: WorkspaceKind): void {
+        this.kind = kind;
+        const doc = kind === 'doc';
+        const border = this.toolbars.borderBtn as BtnBase | undefined;
+        if (border) border.getElements().container.hidden = doc;
+        // 【油漆桶在文档里必须能用】它同样是编辑态置灰策略的受害者：
+        // 文档没有编辑会话，`editing` 常为 true，沿用表格策略会让油漆桶永远灰着。
+        const paint = this.toolbars.paintBucketBtn as BtnBase | undefined;
+        if (paint) paint.setDisabledOnEditting(!doc);
+    }
+
+    /**
+     * 把取色盘给的色值翻译成命令载荷
+     *
+     * 取色盘的「无颜色」是 `'none'`：
+     * - 表格里底色是**单元格属性**，「无填充」等价于白色底（`'white'`）；
+     * - 文档里底色是**字符高亮**，「无高亮」必须翻译成 CSS 的 `transparent`——
+     *   发成白色会变成「刷一层白底」，高亮就再也去不掉了（打印时还是一块白）。
+     * @param color - 取色盘色值
+     * @returns 命令载荷里的色值
+     * @private
+     */
+    private resolvePaintColor(color: string): string {
+        if (color !== 'none') return color;
+        return this.kind === 'doc' ? 'none' : 'white';
     }
 
     /**
@@ -450,7 +488,10 @@ export class SectionFont {
         (this.toolbars.underlineBtn as BtnBase).setActived(!!char.underline);
         (this.toolbars.strikethroughBtn as BtnBase).setActived(!!char.strike);
         (this.toolbars.textColorBtn as BtnBase).setSpanColor(char.color || 'black');
-        if (!state.editing) {
+        // 表格：背景色是单元格属性，编辑会话中无处可挂，跳过刷新。
+        // 文档：`editing` 只是「焦点在不在正文里」，底色照样读得出来 —— 不刷新会让
+        // 油漆桶的色块永远停在初始色，看上去像「点了没生效」。
+        if (!state.editing || this.kind === 'doc') {
             (this.toolbars.paintBucketBtn as BtnBase).setSpanColor(char.background || 'white');
         }
     }

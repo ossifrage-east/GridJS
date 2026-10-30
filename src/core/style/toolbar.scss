@@ -456,3 +456,14 @@
 
 
 
+
+/* ── 工作区档案：按载体隐藏工具 ──
+   档案会隐藏整个根分类页签、分类清单里的同名标签、以及分区内的单个按钮。
+   这些元素的作者样式都写了 display（flex / block / inline-flex），会压过浏览器
+   对 [hidden] 的默认 display:none，因此必须显式补一条 —— 否则「隐藏」只是
+   加了个属性，元素照旧占位。 */
+.toolbar-container {
+    [hidden] {
+        display: none !important;
+    }
+}

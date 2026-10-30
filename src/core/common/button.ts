@@ -22,7 +22,7 @@ import { createDiv, createSpan } from "../../utils/dom";
 import { EventEmitter } from '../../utils/eventEmitter';
 import chevronDown from '../../assets/images/toolbar/chevron-down.svg';
 import { Menu, MenuContent, MenuContentOptions } from "../common/menu";
-import { EditingStateSource } from "../contract/editHost";
+import { EDIT_STATE_CHANGED, EditingStateSource } from "../contract/editHost";
 import { DataEvents } from "../constant";
 
 /**
@@ -81,6 +81,13 @@ export class BtnBase extends EventEmitter {
     private stateSource: EditingStateSource | undefined;
     /** 是否在编辑状态下禁用按钮 */
     private isDisabledOnEditting: boolean = true;
+    /**
+     * 当前是否正被「编辑态置灰」压着
+     *
+     * 解禁时只能回滚**自己**压上去的那一次：撤销 / 重做这类按钮的置灰另有原因
+     * （`setToolbarsState` 按快照设的），一刀切 `setDisabled(false)` 会把它们也误放开。
+     */
+    private disabledByEditting: boolean = false;
     /** 菜单实例 */
     private menu: Menu;
     /** 图标元素 */
@@ -185,8 +192,15 @@ export class BtnBase extends EventEmitter {
         if (!this.options.separate) {
             this.addEventer(this.container);
         } else {
-            this.addEventer(this.iconElement);
-            this.addEventer(this.textElement);
+            // 【`separate` 只是呈现策略，不是存在性保证】`textElement` 只在
+            // `tshow: true` 时由 `_setText()` 创建；无条件 `addEventer(undefined)`
+            // 会在**构造期**抛 TypeError，进而中断工具栏后续所有分区的装配
+            // （症状是「页面显示不完全」而不是「某个按钮点了没反应」）。
+            const parts: HTMLElement[] = [];
+            if (this.iconElement) parts.push(this.iconElement);
+            if (this.textElement) parts.push(this.textElement);
+            if (parts.length === 0) this.addEventer(this.container);
+            else parts.forEach((element) => this.addEventer(element));
         }
 
         if (this.options.menuContent) {
@@ -222,7 +236,12 @@ export class BtnBase extends EventEmitter {
                     this.todo(`${this.options.toDo}`);
                 }
             } else {
-                if (this.iconElement.contains(e.target as Node)) {
+                // 同 init：缺文字区时 `textElement` 是 undefined，直接 `.contains` 会抛错。
+                // 没有文字区就把容器留白也当图标区，否则点在图标边缘会毫无反应。
+                const inIcon = this.iconElement
+                    ? this.iconElement.contains(e.target as Node)
+                    : !this.textElement || !this.textElement.contains(e.target as Node);
+                if (inIcon) {
                     if (this.options.ashow && this.isOpen) {
                         // 点图标 = 执行动作并顺手收起菜单（不再弹回菜单）
                         this.isOpen = false;
@@ -230,11 +249,14 @@ export class BtnBase extends EventEmitter {
                         this.todo(`${this.options.toDo}MenuClose`);
                     }
                     this.todo(`${this.options.toDo}`);
-                } else if (this.textElement.contains(e.target as Node)) {
+                } else if (this.textElement && this.textElement.contains(e.target as Node)) {
                     if (this.options.ashow) {
                         this.isOpen = !this.isOpen;
                         if (!this.isOpen) this.menu.closeMenu();
                         this.todo(`${this.options.toDo}${this.isOpen ? 'MenuOpen' : 'MenuClose'}`);
+                    } else {
+                        // 菜单被 {@link setMenuEnabled} 运行时关闭：文字区不再是死区，直接执行动作
+                        this.todo(`${this.options.toDo}`);
                     }
                 }
             }
@@ -246,6 +268,8 @@ export class BtnBase extends EventEmitter {
             this.todo(`${this.options.toDo}`);
             this.emit('dblclick', `${this.options.toDo}`);
         });
+
+        this.bindEdittingGuard();
 }
 
     /**
@@ -393,6 +417,58 @@ export class BtnBase extends EventEmitter {
     }
 
     /**
+     * 运行时关闭 / 恢复下拉菜单
+     *
+     * 用于「同一个按钮在另一类工作区里没有菜单」的场景。收掉后**文字区域也会执行
+     * 动作**（原本 `separate` 按钮的文字区只负责展开菜单，收掉菜单后它就成了死区）。
+     * @param enabled - 是否保留菜单
+     */
+    public setMenuEnabled(enabled: boolean): void {
+        if (!this.options.menuContent) return;
+        this.options.ashow = enabled;
+        if (!enabled) {
+            this.isOpen = false;
+            this.menu.closeMenu();
+        }
+        if (this.arrowElement) this.arrowElement.hidden = !enabled;
+    }
+
+    /**
+     * 运行时切换「编辑态置灰」策略
+     *
+     * 表格里「编辑会话中不改段落属性」是合理的（编辑的是字符，不是单元格属性）；
+     * 但文档**没有编辑会话**这个概念 —— 正文一获得焦点 `editing` 就是 true，
+     * 若照搬表格策略，对齐 / 油漆桶这类按钮在文档里会**永远**是灰的。
+     * 因此置灰策略必须能按工作区在运行期切换，而不是写死在构造参数里。
+     * @param enabled - true 表示编辑态置灰（表格口径）
+     */
+    public setDisabledOnEditting(enabled: boolean): void {
+        this.isDisabledOnEditting = enabled;
+        // 关掉策略时要立刻解除：置灰状态不会因为策略变了而自动回溯
+        if (!enabled) this.releaseEdittingGuard();
+    }
+
+    /**
+     * 运行时替换下拉菜单的菜单项
+     *
+     * 同一个按钮在两类工作区里的语义可以完全不同（粘贴：表格是「值 / 格式」、
+     * 文档是「文字 / 格式」），但按钮本身是同一个实例 —— 与其建两个按钮再互相藏，
+     * 不如换菜单内容。`MenuContent` 在构造期就把 DOM 建好了，所以只能整体重建。
+     * @param items - 新的菜单项
+     */
+    public setMenuItems(items: MenuContentOptions['items']): void {
+        if (!this.options.menuContent || !this.menuContent) return;
+        this.options.menuContent.items = items;
+        const previous = this.menuContainer;
+        this.isOpen = false;
+        this.setMenuContent();
+        // 老容器可能正挂在某个父节点下（Menu.openMenu 会把它搬进浮层），就地替换
+        if (previous && previous.parentElement && this.menuContainer) {
+            previous.parentElement.replaceChild(this.menuContainer, previous);
+        }
+    }
+
+    /**
      * 设置箭头
      */
     private _setArrow() {
@@ -454,13 +530,58 @@ export class BtnBase extends EventEmitter {
             e.stopPropagation();
             element.style.background = 'rgba(0, 0, 0, 0.1)';
         });
-        // 编辑态变化 → 按需置灰。未提供事件源时静默跳过（不再像改造前那样
-        // 因为漏传 `data` 而在构造期抛 TypeError）
-        this.stateSource?.on(DataEvents.IS_EDITTING_CHANGED, (_, isEditting: boolean) => {
-            if (this.isDisabledOnEditting) {
-                this.setDisabled(isEditting);
+    }
+
+    /**
+     * 「编辑态置灰」是否生效
+     *
+     * 两条收敛规则：
+     * - 按钮自己声明 `isDisabledOnEditting: false` → 不生效；
+     * - **文档载体整体豁免**：正文一获得焦点 `editing` 就是 true，若照搬表格口径，
+     *   打印 / 缩进这类按钮在文档里会**永远**是灰的（用户实测：鼠标一进编辑区就全灰）。
+     *
+     * 之所以放在这里而不是让每个分区逐个调 {@link setDisabledOnEditting}：
+     * 逐个关是**补漏**式的，漏一个就是一个 bug；这里是按载体一刀切，新增按钮自动生效。
+     */
+    private get edittingGuardOn(): boolean {
+        return this.isDisabledOnEditting && this.stateSource?.kind !== 'doc';
+    }
+
+    /**
+     * 订阅置灰所需的两个事件（构造期绑定一次）
+     *
+     * 早先这段写在 `addEventer` 里，而 `separate` 按钮会对图标区、文字区各调一次 →
+     * 同一个按钮订阅两遍，一次编辑态变化 `setDisabled` 两次（目前无副作用，但监听表翻倍）。
+     * @private
+     */
+    private bindEdittingGuard(): void {
+        const source = this.stateSource;
+        // 未提供事件源时静默跳过（不再像改造前那样因漏传 `data` 在构造期抛 TypeError）
+        if (!source) return;
+        source.on(DataEvents.IS_EDITTING_CHANGED, (_: unknown, isEditting: boolean) => {
+            if (!this.edittingGuardOn) {
+                this.releaseEdittingGuard();
+                return;
             }
+            this.disabledByEditting = isEditting;
+            this.setDisabled(isEditting);
         });
+        // 载体切换（表格 ⇄ 文档）时策略会从「开」变「关」，而已经压上去的置灰不会自动回溯。
+        // 总线的 `bind` 会广播一次 EDIT_STATE_CHANGED，这里借它兜底解禁。
+        source.on(EDIT_STATE_CHANGED, () => {
+            if (this.edittingGuardOn) return;
+            this.releaseEdittingGuard();
+        });
+    }
+
+    /**
+     * 撤销「编辑态置灰」（只撤自己压上去的那一次）
+     * @private
+     */
+    private releaseEdittingGuard(): void {
+        if (!this.disabledByEditting) return;
+        this.disabledByEditting = false;
+        this.setDisabled(false);
     }
 
     /**

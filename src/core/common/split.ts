@@ -122,6 +122,15 @@ export class Split {
     /** 布局加载完成的 Promise（从 IndexDB 读取位置完成） */
     public positionLoaded: Promise<void>;
     private _positionLoadedResolve!: () => void;
+    /** 是否已尝试过从 IndexDB 恢复位置（未恢复前不把默认位置写回库，避免覆盖存档） */
+    private positionRestored: boolean = false;
+    /**
+     * 待应用的分割位置
+     *
+     * 容器隐藏（尺寸为 0）时量不到尺寸，读回的存档位置先挂在这里；
+     * 容器重新可见后由 {@link refreshLayout}（或 ResizeObserver）应用。
+     */
+    private pendingPosition: number | null = null;
 
     /**
      * 默认配置选项
@@ -212,6 +221,9 @@ export class Split {
         }).catch(() => {
             // 加载失败则保持默认位置不变
         }).finally(() => {
+            // 读完（无论有没有存档）之后才允许把布局位置写回库：
+            // 读回是异步的，构造时先写默认位置会把旧存档覆盖掉
+            this.positionRestored = true;
             this._positionLoadedResolve();
         });
     }
@@ -234,8 +246,11 @@ export class Split {
             const containerSize = getContainerSize(this.elements.container, this.options.horizontal);
 
             if (isNaN(parsedPosition) ||
-                parsedPosition < (minSize as MinSize).prev ||
-                parsedPosition > containerSize - (minSize as MinSize).next) {
+                parsedPosition < (minSize as MinSize).prev) {
+                return null;
+            }
+            // 容器隐藏（尺寸为 0）时算不出上界：先收下，等重新可见后再用真实尺寸收敛
+            if (containerSize > 0 && parsedPosition > containerSize - (minSize as MinSize).next) {
                 return null;
             }
 
@@ -276,12 +291,20 @@ export class Split {
         const { container, splitPrev, split, splitNext } = this.elements;
 
         const containerSize = getContainerSize(container, horizontal);
+        // 容器隐藏（尺寸为 0）时不做布局：异步读回保存位置可能恰好发生在隐藏期间，
+        // 此时按 0 计算会把分割位置压成最小值，切回来就恢复不了。
+        // 先把目标位置挂起，容器重新可见时由 refreshLayout 应用
+        if (!containerSize) {
+            this.pendingPosition = position;
+            return;
+        }
+        this.pendingPosition = null;
         const constrainedPosition = this.constrainPosition(position, containerSize);
 
         this.applyLayoutStyles(constrainedPosition, containerSize);
         this.currentPosition = constrainedPosition;
 
-        if (rememberSize) {
+        if (rememberSize && this.positionRestored) {
             this.db.setSetting(storageKey, constrainedPosition, 'split-position').catch(() => {});
         }
     }
@@ -437,6 +460,18 @@ export class Split {
         const { container, splitNext } = this.elements;
 
         const containerSize = getContainerSize(container, horizontal);
+        // 容器被隐藏（display:none，尺寸为 0）时不要重排：否则会把分割位置算成
+        // 最小尺寸、把后侧面板压成 0 宽，切回来时又因「旧总长为 0」判定为无效而永远恢复不了
+        if (!containerSize) return;
+
+        // 隐藏期间读回 / 设置过的位置先落地：容器重新可见时用它，而不是按比例重算
+        if (this.pendingPosition !== null) {
+            const pending = this.pendingPosition;
+            this.pendingPosition = null;
+            this.updateLayout(pending);
+            return;
+        }
+
         const oldNextSize = parseInt(horizontal
             ? splitNext.style.width || '0'
             : splitNext.style.height || '0', 10);
@@ -451,6 +486,16 @@ export class Split {
         );
 
         this.updateLayout(newPosition);
+    }
+
+    /**
+     * 重新应用布局
+     *
+     * 容器从隐藏（尺寸为 0）重新可见后调用：把隐藏期间挂起的 {@link pendingPosition}
+     * 立刻落地，不必等 ResizeObserver 的防抖回调。
+     */
+    public refreshLayout(): void {
+        this.handleContainerResize();
     }
 
     /**

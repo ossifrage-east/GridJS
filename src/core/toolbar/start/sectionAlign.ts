@@ -19,7 +19,7 @@ import { TOOLBAR_CLASS_NAME } from "../../constant";
 import { BtnBase } from "../../common/button";
 import { Menu } from "../../common/menu";
 import { CommandBus } from "../../contract/commandBus";
-import { EDIT_STATE_CHANGED } from "../../contract/editHost";
+import { EDIT_STATE_CHANGED, WorkspaceKind } from "../../contract/editHost";
 
 /**
  * SectionAlign 构造选项接口
@@ -52,10 +52,31 @@ export class SectionAlign {
     private top: HTMLDivElement;
     /** @type {HTMLDivElement} 水平对齐按钮容器 */
     private bottom: HTMLDivElement;
+    /**
+     * @type {HTMLDivElement} 上下两行的容器（上行：垂直对齐 + 缩进；下行：水平对齐 / 缩进）
+     *
+     * 提升为字段而不是构造期的局部变量：`setKind` 要把缩进那一行在两个父节点之间搬，
+     * 局部变量出了构造函数就取不到了。
+     */
+    private column: HTMLDivElement;
     /** @type {HTMLDivElement} 换行和合并按钮容器 */
     private right: HTMLDivElement;
+    /**
+     * @type {HTMLDivElement} 缩进按钮所在的一行
+     *
+     * 用户要的是「对齐一组、缩进一组，上下两行」。两个缩进按钮原先住在「段落样式」分区里，
+     * 与列表按钮挤在同一行，找起来要横向扫一遍；搬进对齐分区并独占一行后，
+     * 一眼就能看出它们与「段落整体位置」是同一类动作。
+     *
+     * 这一行**在两类工作区里挂的位置不同**（见 {@link setKind}）：
+     * 表格里它并入垂直对齐那一行（表格的缩进是单元格内容缩进，与垂直对齐同级），
+     * 文档里它单独成行，落在四个对齐按钮下面。
+     */
+    private indentRow: HTMLDivElement;
     /** @type {Record<string, BtnBase | undefined>} 工具栏按钮集合 */
     private toolbars: Record<string, BtnBase | undefined> = {};
+    /** 当前工作区类型（决定「编辑态要不要跳过刷新」与置灰策略，见 setToolbarsState / setKind） */
+    private kind: WorkspaceKind = 'sheet';
 
     /**
      * 创建 SectionAlign 实例
@@ -81,7 +102,7 @@ export class SectionAlign {
             }
         });
 
-        const _div = createDiv({
+        this.column = createDiv({
             style: { 
                 display: 'flex',
                 flexDirection: 'column', 
@@ -97,12 +118,20 @@ export class SectionAlign {
             }
         });
 
+        this.indentRow = createDiv({
+            style: { 
+                display: 'flex',
+                flexDirection: 'row', 
+                gap: '4px' 
+            }
+        });
+
         
         const line = createDiv({
             className: TOOLBAR_CLASS_NAME.SECTION_LINE, 
         });
         this.sectionAlign.append(line, div);
-        div.append(_div, this.right);
+        div.append(this.column, this.right);
 
         
         this.top = createDiv({
@@ -123,7 +152,9 @@ export class SectionAlign {
             }
         });
 
-        _div.append(this.top, this.bottom);
+        this.column.append(this.top, this.bottom);
+        // 默认挂在垂直对齐那一行里（表格口径）；文档下由 setKind 挪到对齐按钮下面单独成行
+        this.top.append(this.indentRow);
 
         this.init();
     }    
@@ -190,7 +221,7 @@ export class SectionAlign {
         });
 
         const indentIncreaseBtn = new BtnBase({
-            parentElement: this.top,
+            parentElement: this.indentRow,
             stateSource: this.bus,
             menu: this.menu,
             toDo: 'indentIncrease',
@@ -206,7 +237,7 @@ export class SectionAlign {
         });
 
         const indentDecreaseBtn = new BtnBase({
-            parentElement: this.top,
+            parentElement: this.indentRow,
             stateSource: this.bus,
             menu: this.menu,
             toDo: 'indentDecrease',
@@ -220,6 +251,15 @@ export class SectionAlign {
             }
         }); 
         
+        /** 段落对齐是单选：点中谁就只亮谁（分散对齐也在这组里） */
+        const markAlign = (active: BtnBase): void => {
+            const bars = this.toolbars;
+            bars.leftBtn?.setActived(bars.leftBtn === active);
+            bars.centerBtn?.setActived(bars.centerBtn === active);
+            bars.rightBtn?.setActived(bars.rightBtn === active);
+            bars.justifyBtn?.setActived(bars.justifyBtn === active);
+        };
+
         const leftBtn = new BtnBase({
             parentElement: this.bottom,
             stateSource: this.bus,
@@ -232,10 +272,7 @@ export class SectionAlign {
             layout: 'vertical',
             onClick: (todo) => {
                 this.bus.dispatch('setAlign', { value: 'left' });
-                leftBtn.setActived(true);
-                centerBtn.setActived(false);
-                rightBtn.setActived(false);
-                justifyBtn.setActived(false);
+                markAlign(leftBtn);
             }
         });
         
@@ -251,10 +288,7 @@ export class SectionAlign {
             layout: 'vertical',
             onClick: (todo) => {
                 this.bus.dispatch('setAlign', { value: 'center' });
-                leftBtn.setActived(false);
-                centerBtn.setActived(true);
-                rightBtn.setActived(false);
-                justifyBtn.setActived(false);
+                markAlign(centerBtn);
             }
         });
 
@@ -270,29 +304,28 @@ export class SectionAlign {
             layout: 'vertical',
             onClick: (todo) => {
                 this.bus.dispatch('setAlign', { value: 'right' });
-                leftBtn.setActived(false);
-                centerBtn.setActived(false);
-                rightBtn.setActived(true);
-                justifyBtn.setActived(false);
+                markAlign(rightBtn);
             }
         });
 
+        // 【第四个图标就是「分散对齐」】图标字体里 `icon-justify`（U+E902）画的是
+        // **四行全部撑满版心**——最后一行也拉满，那正是分散对齐的字形；
+        // 而 Word 的「两端对齐」图标最后一行是短的。既然字形与命名不一致，
+        // 以用户看到的字形为准：这个按钮派发 `distribute`，不再另加一个文字按钮。
         const justifyBtn = new BtnBase({
             parentElement: this.bottom,
             stateSource: this.bus,
             menu: this.menu,
             toDo: 'justify',
             icon: 'icon-justify font15',
-            title: '两端对齐',
+            text: '分散对齐',
+            title: '分散对齐',
             ishow: true,
             tshow: false,
             layout: 'vertical',
             onClick: (todo) => {
-                this.bus.dispatch('setAlign', { value: 'justify' });
-                leftBtn.setActived(false);
-                centerBtn.setActived(false);
-                rightBtn.setActived(false);
-                justifyBtn.setActived(true);
+                this.bus.dispatch('setAlign', { value: 'distribute' });
+                markAlign(justifyBtn);
             }
         });
 
@@ -343,7 +376,10 @@ export class SectionAlign {
             }
         });
 
-        this.toolbars = { topBtn, middleBtn, bottomBtn, leftBtn, centerBtn, rightBtn, justifyBtn, lineBreakBtn, mergeBtn };
+        this.toolbars = {
+            topBtn, middleBtn, bottomBtn, leftBtn, centerBtn, rightBtn, justifyBtn, lineBreakBtn, mergeBtn,
+            indentIncreaseBtn, indentDecreaseBtn,
+        };
         this.setupStateListeners();
     }
     
@@ -367,6 +403,34 @@ export class SectionAlign {
     }
 
     /**
+     * 按工作区类型收敛分区内容
+     *
+     * 文档没有「垂直对齐 / 合并单元格」，整行（top + right）直接隐藏；
+     * 横向对齐四件在文档里还要解除「编辑态置灰」——文档没有编辑会话，
+     * `editing` 常为 true，沿用表格策略会让这四个按钮永远点不动。
+     * @param kind - 工作区类型
+     */
+    public setKind(kind: WorkspaceKind): void {
+        this.kind = kind;
+        const doc = kind === 'doc';
+        this.top.hidden = doc;
+        this.right.hidden = doc;
+        // 【缩进按钮整行搬家】文档里「垂直对齐 / 换行 / 合并」那一行是隐藏的，
+        // 若不动这一行，缩进按钮会跟着 `top` 一起消失 —— 但文档恰恰是**最需要缩进**的载体。
+        // append 会自动把它从原父节点摘下，不需要先 remove（重复套用也幂等）。
+        if (doc) this.column.append(this.indentRow);
+        else this.top.append(this.indentRow);
+        const bars = this.toolbars;
+        const alignButtons = [bars.leftBtn, bars.centerBtn, bars.rightBtn, bars.justifyBtn];
+        for (let i = 0; i < alignButtons.length; i++) {
+            alignButtons[i]?.setDisabledOnEditting(!doc);
+        }
+        // 换到文档后补齐一次状态：表格下 `editing` 为真时是不刷新的（见 setToolbarsState），
+        // 切过来那一刻可能正处在编辑态，不补刷会停在上一个载体的高亮
+        this.setToolbarsState();
+    }
+
+    /**
      * 按当前宿主状态刷新按钮高亮
      *
      * 编辑会话中不刷新：段落级样式在字符编辑时不会变，刷了反而会在退出编辑的瞬间闪一下。
@@ -374,7 +438,13 @@ export class SectionAlign {
      */
     private setToolbarsState() {
         const state = this.bus.snapshot();
-        if (state.editing) return;
+        // 表格：编辑会话中段落级样式不会变，跳过刷新（避免退出编辑的瞬间闪一下）。
+        // 文档：光标在不同段落间移动时**段落样式确实会变**，不能跳过 ——
+        // 否则对齐按钮会一直停在上一个块的高亮上。
+        // 【只有表格能在编辑态跳过刷新】文档没有编辑会话：正文一获得焦点 `editing` 就恒为
+        // true，若这里无差别 return，缩进 / 对齐按钮会**永远停在进入编辑区那一刻**的状态
+        // （表现为「鼠标一进编辑区，减少缩进就再也亮不起来」）。
+        if (state.editing && this.kind === 'sheet') return;
         const para = state.para;
         this.toolbars.topBtn.setActived(para.valign === 'top');
         this.toolbars.middleBtn.setActived(para.valign === 'middle' || para.valign === undefined);
@@ -382,8 +452,13 @@ export class SectionAlign {
         this.toolbars.leftBtn.setActived(para.align === 'left');
         this.toolbars.centerBtn.setActived(para.align === 'center' || para.align === undefined);
         this.toolbars.rightBtn.setActived(para.align === 'right');
-        this.toolbars.justifyBtn.setActived(para.align === 'justify');
+        // 第四个按钮派发的是 distribute（字形与命名的取舍见 init 里的注释）
+        this.toolbars.justifyBtn.setActived(para.align === 'distribute');
         this.toolbars.lineBreakBtn.setActived(!!para.wrap);
+        // 「减少缩进」到头后置灰：缩进级数已经是 0 时再点也不会有变化，
+        // 灰掉比「点了没反应」更容易理解（表格侧 indent 是像素累计值，同样适用）
+        const decrease = this.toolbars.indentDecreaseBtn;
+        if (decrease) decrease.setDisabled(!((para.indent ?? 0) > 0));
     }
 
     /**
@@ -409,7 +484,7 @@ export class SectionAlign {
      * @returns {{sectionAlign: HTMLDivElement, top: HTMLDivElement, bottom: HTMLDivElement, right: HTMLDivElement}} 工具栏元素对象
      * @public
      */
-    public getElements(): {sectionAlign: HTMLDivElement, top: HTMLDivElement, bottom: HTMLDivElement, right: HTMLDivElement} {
-        return {sectionAlign: this.sectionAlign, top: this.top, bottom: this.bottom, right: this.right};
+    public getElements(): {sectionAlign: HTMLDivElement, top: HTMLDivElement, bottom: HTMLDivElement, right: HTMLDivElement, indentRow: HTMLDivElement} {
+        return {sectionAlign: this.sectionAlign, top: this.top, bottom: this.bottom, right: this.right, indentRow: this.indentRow};
     }
 }

@@ -41,13 +41,31 @@ import { Slider } from "./common/slider";
 import { Toolbar } from "./toolbar/toolbar";
 import { Menu } from "./common/menu";
 import { QuickAccess } from "./toolbar/quickAccess";
-import { stripExtension, toArchiveKey } from "../utils/fileName";
+import { extractExtension, stripExtension, toArchiveKey } from "../utils/fileName";
 import { createXlsxTask, type XlsxTask } from "../utils/parser/xlsxWriter";
 import { getSharedPrinter } from "../utils/printer";
 import { CommandBus } from "./contract/commandBus";
 import { SheetEditHost } from "./sheets/sheetEditHost";
 import { openFindReplace } from "./toolbar/start/searchDialog";
+import { DocWorkspace, downloadBlob } from "./document/docWorkspace";
+import { WorkspaceRouter } from "./workspace/workspaceRouter";
+import { createBlankSnapshot, type DocSnapshot } from "./document/blockTree";
+import { snapshotToDocx } from "./document/converter/docxCodec";
 import favicon from "../assets/images/favicon.ico";
+
+/**
+ * 判定一个文件是否由**文档工作区**承载
+ *
+ * 应用只有三种原生后缀（见 `utils/fileName` 的 `NATIVE_EXTENSIONS`）：
+ * `.grid` 表格、`.text` 文档、`.demo` 演示文稿。
+ * `.md` 也按文档打开 —— 它本来就是 Markdown 源码，落在文档工作区的源码视图里正合适。
+ * @param path - 文件路径（含扩展名）
+ * @returns 是否走文档工作区
+ */
+function isDocPath(path: string): boolean {
+    const extension = extractExtension(path);
+    return extension === 'text' || extension === 'md';
+}
 
 /** 导航内容区宽度在 IndexDB 中的键前缀（完整键 = 前缀 + 导航项文本） */
 const NAV_WIDTH_KEY_PREFIX = 'nav-content-width:';
@@ -117,6 +135,15 @@ export class App {
      */
     private sheetEditHost!: SheetEditHost;
     private menu!: Menu;
+    /**
+     * 文档工作区（块树 + DOM 视图 + Markdown 源码视图）
+     *
+     * 与表格工作区并列存在、靠显隐切换：两者都在 DOM 里，切换时不重建，
+     * 因此「切过去再切回来」不会丢掉未落库的编辑状态与撤销栈。
+     */
+    private docWorkspace!: DocWorkspace;
+    /** 工作区路由：显隐 + 命令总线换绑，切换副作用全部收在里面 */
+    private workspaceRouter!: WorkspaceRouter;
     private navigator!: Navigator;
     private fileTree!: FileTree;
     private fileOpener!: FileOpener;
@@ -166,6 +193,7 @@ export class App {
         this.initMenu();
         this.initToolbar();
         this.initSheets();
+        this.initDocWorkspace();   // 依赖 initSheets（路由要拿表格容器）与 initToolbar（总线）
         this.initbottomToolsSplit();
         this.initSelectionCalc();   // 依赖 bottomToolsSplit 的 split-pre，必须在其之后
         this.initRightToolsSplit();
@@ -220,20 +248,38 @@ export class App {
             menu: this.menu,
             printer: getSharedPrinter(this.data),
             onTabContentShow: (width: number, height: number) => {
-                const rect = this.sheets.getElements().sheets.parentElement.getBoundingClientRect();
-                // this.sheets.getElements().sheets.style.width = `${rect.width - width}px`;
-                this.sheets.getElements().sheets.style.height = `${rect.height - height}px`;
+                // 表格与文档两个工作区共用同一条尺寸规则（见 applyWorkspaceHeight）
+                this.applyWorkspaceHeight(height);
             },
             // 计算菜单点选 → 把该项结果写入空白的活动单元格（实例稍后创建，回调按需取用）
             onCalculate: (label: string) => this.selectionCalc?.applyToActivedCell(label),
             // 查询 / 替换是对话框而非一次编辑动作，需要数据源全表扫描，因此由装配层注入
             onFindReplace: (mode: 'find' | 'replace') => openFindReplace(this.data, mode),
+            // 视图切换同理：它是「工作区怎么显示」，不是一次编辑动作。文档工作区在
+            // initDocWorkspace 里才创建（晚于工具栏），因此用闭包延迟取用。
+            onToggleMarkdown: () => this.docWorkspace?.toggleMode(),
+            isMarkdownActive: () => this.docWorkspace?.isMarkdown ?? false,
+            // 页面设置同理属于「纸怎么摆」：读回与打印都延迟取文档工作区（它晚于工具栏创建）
+            getDocPageSetup: () => {
+                const setup = this.docWorkspace?.pageSetup;
+                return {
+                    orientation: setup?.orientation ?? 'portrait',
+                    paperSize: setup?.paperSize ?? 'A4',
+                    marginPreset: setup?.marginPreset ?? 'normal',
+                    scaleMode: setup?.scaleMode ?? 'none',
+                };
+            },
+            onChangeDocPage: (key, value) => this.docWorkspace?.setPageSetup(key, value),
+            onPrintDoc: () => this.docWorkspace?.print(),
         });
         const quickAccess = new QuickAccess({  // 快速访问分区
             parentElement: this.toolbar.getElements().tabs,
-            data: this.data,
+            bus: this.commandBus,
             menu: this.menu,
-            title: '快速访问'
+            printer: getSharedPrinter(this.data),
+            // 文档工作区晚于快速访问栏创建（见 initDocWorkspace），同样用闭包延迟取用
+            onPrintDoc: () => this.docWorkspace?.print(),
+            onPrintPreviewDoc: () => this.docWorkspace?.printPreview(),
         });
         // 快速访问区是构造完工具栏之后才挂进页签行的：页签行凭空多了一截宽度，
         // 但内容区尺寸没变（ResizeObserver 不会触发），得主动重排一次，
@@ -268,6 +314,34 @@ export class App {
         await this.initFileTree(navigator);
         this.initPyEditor(navigator);
         this.initZoomSlider();   // 缩放滑块须在导航面板之后挂载：DOM 顺序即视觉顺序（面板在上、滑块在下）
+    }
+
+    /**
+     * 把导航面板交给文档工作区（切到文档时调用）
+     *
+     * 两个工作区不会同时显示，因此**共用同一个 `Navigator` 实例**：面板元素在
+     * 两条右侧工具线之间搬动，导航内容区（`containerSplit.splitNext`）不动。
+     * 这样不会产生两个同 id 的面板，也不会出现两份互相覆盖的选中状态。
+     */
+    private moveNavPanelToDoc(): void {
+        if (!this.navigator || !this.docWorkspace) return;
+        this.docWorkspace.attachNavPanel(this.navigator.getElements().panel);
+    }
+
+    /**
+     * 把导航面板搬回表格工作区（切回表格时调用）
+     *
+     * 面板要插在表格缩放滑块**之前**：与初始挂载时的 DOM 顺序保持一致
+     * （导航面板在上、缩放滑块在下）。
+     */
+    private moveNavPanelToSheet(): void {
+        if (!this.navigator) return;
+        this.docWorkspace?.detachNavPanel();
+        const panel = this.navigator.getElements().panel;
+        const prev = this.rightToolsSplit.getElements().splitPrev;
+        const slider = this.zoomSlider.getElements().container;
+        if (slider.parentElement === prev) prev.insertBefore(panel, slider);
+        else prev.appendChild(panel);
     }
 
     /**
@@ -418,6 +492,9 @@ export class App {
                 this.data.messageBox.success(`已打开 ${fileName}`);
             },
             onError: (message: string) => this.data.messageBox.error(message),
+            // 文档类文件（docx / doc / md / txt）落到文档工作区：解析结果是块树，
+            // 先写进 docs 仓再装载，使「刚打开的文件」与「刷新后恢复的文件」走同一条路
+            onDocument: (fileName: string, snapshot: DocSnapshot) => this.openParsedDocument(fileName, snapshot),
         });
         document.body.appendChild(this.fileOpener.getFileInput());
 
@@ -446,6 +523,8 @@ export class App {
             fileSize: (path: string) => this.getFileSize(path),
             // 「另存为xlsx」的真实转换：读存档 → 生成 xlsx Blob（下载 / 打包下载直接写盘）
             convertXlsx: (path: string, name: string) => this.convertGridToXlsx(path, name),
+            // 「导出为 Word」：读 docs 仓的块树 → 编成 docx → 下载
+            exportWord: (paths: string[]) => this.exportWordFiles(paths),
         });
         navigator.navContentItemMount(NAV_PANEL[0], this.fileTree.getElements().container);   // NAV_PANEL[0] 即「文件」
         // 「定位」的目标是「主页面正在显示的那个文件」。
@@ -509,11 +588,9 @@ export class App {
             // 先对账（含存量键迁移与补建）再装载：否则历史遗留键的文件会被读成空表
             await this.reconcileValueStore();
 
-            const sheetName = this.toSheetKey(displayName);
-            if (sheetName && sheetName !== this.data.activedSheetName) {
-                // 上次打开的是别的文件：装载其内容（无存档时按空表处理）
-                await this.data.switchToSheet(sheetName);
-            }
+            // 上次打开的是别的文件：按后缀路由到对应工作区装载（无存档时按空文件处理）。
+            // 刷新恢复不弹「已打开」提示，否则每次刷新都会闪一条消息。
+            await this.openPath(displayName, false);
             this.fileTree.showActivedFile(displayName);
             this.persistActivedFile(displayName);
             this.rememberOpenedFile(displayName);
@@ -544,24 +621,104 @@ export class App {
     }
 
     /**
-     * 双击树节点：把该文件内容装载到主页面
+     * 双击树节点：把该文件内容装载到主页面（按后缀路由到对应工作区）
      *
-     * 主页面已显示该文件时 {@link DataCollection.switchToSheet} 返回 false，
-     * 此时直接返回：内容保持原样（不重绘、不重载），登记 / 高亮 / 记忆也都已就位，
-     * 因此「重复双击同一个文件」不产生任何副作用。
+     * `isDocPath` 为真走文档工作区，否则走表格工作区。两条路都保证：
+     * 内容装载 → 切换工作区 → 树中高亮 → 记忆「当前文件」→ 记入打开历史。
      * @param path - 文件路径（含扩展名，相对根节点）
      */
     private async activateFile(path: string): Promise<void> {
+        await this.openPath(path, true);
+    }
+
+    /**
+     * 按后缀打开文件（唯一的文件打开入口）
+     * @param path - 文件路径（含扩展名）
+     * @param announce - 是否弹「已打开」提示（刷新恢复时不弹）
+     */
+    private async openPath(path: string, announce: boolean): Promise<void> {
+        if (!path) return;
+        if (isDocPath(path)) {
+            await this.openDocFile(path, announce);
+            return;
+        }
+        // `.demo` 没有工作区：明确降级为表格模式并提示，不静默
+        if (extractExtension(path) === 'demo') {
+            if (announce) this.data.messageBox.info('演示文稿暂不支持编辑，已按表格打开');
+        }
+        await this.openSheetFile(path, announce);
+    }
+
+    /**
+     * 在表格工作区打开文件
+     * @param path - 文件路径
+     * @param announce - 是否弹提示
+     */
+    private async openSheetFile(path: string, announce: boolean): Promise<void> {
         const sheetName = this.toSheetKey(path);
         if (!sheetName) return;
 
+        // 离开文档前先落库：文档的自动保存是防抖的，切走时窗口内可能还有改动
+        await this.docWorkspace?.flush();
+        this.workspaceRouter?.showSheet();
+
         const switched = await this.data.switchToSheet(sheetName);
-        if (!switched) return;   // 已在主页面显示当前文件 → 内容无变化
+        if (!switched) {
+            // 已在主页面显示当前文件 → 内容无变化（但工作区可能刚从文档切回来）
+            this.fileTree.showActivedFile(path);
+            return;
+        }
 
         this.fileTree.showActivedFile(path);
         this.persistActivedFile(path);
         this.rememberOpenedFile(path);
-        this.data.messageBox.success(`已打开 ${this.baseNameOf(path)}`);
+        if (announce) this.data.messageBox.success(`已打开 ${this.baseNameOf(path)}`);
+    }
+
+    /**
+     * 在文档工作区打开文件
+     *
+     * 与表格侧的差别是「同文件不重载」：`DocStore.switchTo` 在键相同时返回 false，
+     * 此时只切工作区，不重建 DOM —— 重复双击同一个文档不会丢光标与撤销栈。
+     * @param path - 文件路径
+     * @param announce - 是否弹提示
+     */
+    private async openDocFile(path: string, announce: boolean): Promise<void> {
+        const key = this.toSheetKey(path);
+        if (!key) return;
+        this.workspaceRouter?.showDoc();
+        await this.docWorkspace.open(key, this.docTitleOf(path));
+        this.fileTree.showActivedFile(path);
+        this.persistActivedFile(path);
+        this.rememberOpenedFile(path);
+        if (announce) this.data.messageBox.success(`已打开 ${this.baseNameOf(path)}`);
+    }
+
+    /**
+     * 取文档标题（末段去后缀）
+     * @param path - 文件路径
+     * @returns 标题
+     */
+    private docTitleOf(path: string): string {
+        return stripExtension(this.baseNameOf(path));
+    }
+
+    /**
+     * 装载「刚从本机打开」的文档
+     *
+     * 先落库再装载：`docs` 仓是文档的唯一来源，这条顺序让「导入」与「刷新后恢复」
+     * 走完全相同的读取路径，避免导入的内容只活在内存里、刷新即失。
+     * @param fileName - 原生文件名（如 `说明.text`）
+     * @param snapshot - 解析出的存档
+     */
+    private async openParsedDocument(fileName: string, snapshot: DocSnapshot): Promise<void> {
+        const key = this.toSheetKey(fileName);
+        if (!key) return;
+        const store = this.docWorkspace.docStore;
+        await store.writeSnapshot(key, snapshot);
+        this.workspaceRouter.showDoc();
+        await this.docWorkspace.open(key, this.docTitleOf(fileName));
+        this.docWorkspace.render();
     }
 
     /**
@@ -624,6 +781,16 @@ export class App {
     private async getFileSize(path: string): Promise<number | null> {
         const key = this.toSheetKey(path);
         if (!key) return null;
+        // 文档：块树的结构化克隆体量，直接按 JSON 文本长度估算（与表格侧同口径）
+        if (isDocPath(path)) {
+            try {
+                const snapshot = await this.docWorkspace?.docStore.readSnapshot(key);
+                if (!snapshot) return 0;
+                return new TextEncoder().encode(JSON.stringify(snapshot)).byteLength;
+            } catch {
+                return null;
+            }
+        }
         try {
             const raw = await this.settingsDb.getValue(key);
             let bytes = 0;
@@ -661,6 +828,45 @@ export class App {
             ? this.data.toSnapshot()
             : await this.settingsDb.getValue(key);
         return createXlsxTask(raw, stripExtension(name));
+    }
+
+    /**
+     * 把文档导出为 Word（`.docx`）并下载
+     *
+     * 与 {@link convertGridToXlsx} 同一套路：树只给路径，装配层按路径取内容。
+     * 差别是文档的「内容」不在 `values` 仓而在 `docs` 仓，且**当前打开的文档**
+     * 可能还停在防抖窗口里（`DocStore` 500ms 才落库），因此必须先 `flush()`
+     * 再读，否则导出的是上一次的内容。
+     *
+     * 多选时逐个下载并留 300ms 间隔：浏览器会丢弃「同一个用户手势里发起的第二个下载」。
+     * @param paths - 待导出的文件路径（仅含 `.text`）
+     */
+    private async exportWordFiles(paths: string[]): Promise<void> {
+        const list = (paths ?? []).filter(Boolean);
+        if (list.length === 0) return;
+        const store = this.docWorkspace?.docStore;
+        if (!store) {
+            this.data.messageBox.error('文档功能尚未就绪');
+            return;
+        }
+        await store.flush();
+
+        let done = 0;
+        for (const path of list) {
+            const key = this.toSheetKey(path);
+            if (!key) continue;
+            const snapshot = await store.readSnapshot(key);
+            // 没有存档 = 这个文件从来没被编辑过（空文档）：仍导出一份空白 Word，
+            // 比「点了没反应」更符合「导出这个文件」的预期
+            const source = snapshot ?? createBlankSnapshot(this.docTitleOf(path));
+            const name = stripExtension(this.baseNameOf(path) || source.meta.title || 'document');
+            downloadBlob(snapshotToDocx(source), `${name}.docx`);
+            done += 1;
+            if (list.length > 1) {
+                await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
+            }
+        }
+        if (done > 0) this.data.messageBox.success(`已导出 ${done} 个 Word 文档`);
     }
 
     /**
@@ -702,6 +908,16 @@ export class App {
                 const from = this.toSheetKey(plan.from);
                 const to = this.toSheetKey(plan.to);
                 if (!from || !to || from === to) continue;
+
+                // 文档：复制块树（源为空文档时写一份空白存档，与表格侧「空表也占位」同口径）
+                if (isDocPath(plan.from) || isDocPath(plan.to)) {
+                    const store = this.docWorkspace?.docStore;
+                    if (!store) continue;
+                    const snapshot = await store.readSnapshot(from);
+                    await store.writeSnapshot(to, snapshot ?? createBlankSnapshot(this.docTitleOf(plan.to)));
+                    continue;
+                }
+
                 const raw = await this.settingsDb.getValue(from);
                 // 源为空表时也写入空白存档（而不是删掉目标键）：目标文件同样是
                 // 「树里有文件、库里就得有存档」，同时顺带清掉目标键上可能存在的旧内容
@@ -737,6 +953,22 @@ export class App {
                     // 注意这与历史实现的判断不同 —— 路径键下「剪切到别的目录」确实
                     // 改变存档键（`a/x.xlsx` → `b/x.xlsx`），必须搬迁，
                     // 只有「同一目录内名字也没变」才是真正的空操作。
+                    continue;
+                }
+
+                // 文档：搬运块树（先落库再读，避免搬走的是防抖窗口里的旧版本）
+                if (isDocPath(plan.from) || isDocPath(plan.to)) {
+                    const store = this.docWorkspace?.docStore;
+                    if (!store) continue;
+                    if (from === store.docKey) await store.flush();
+                    const snapshot = await store.readSnapshot(from);
+                    await store.writeSnapshot(to, snapshot ?? createBlankSnapshot(this.docTitleOf(plan.to)));
+                    await store.deleteSnapshot(from);
+                    // 改名/移动的正是当前文档：后续自动保存要写到新键
+                    if (from === store.docKey) {
+                        this.docWorkspace.render();
+                    }
+                    this.rememberRenamedFile(plan.from, plan.to);
                     continue;
                 }
 
@@ -798,14 +1030,22 @@ export class App {
             let fallback: string | null = null;
             if (removingActived) {
                 fallback = this.pickFallbackFile(keys);
-                if (fallback) await this.data.switchToSheet(this.toSheetKey(fallback));
-                else this.data.clearCurrentSheet();
+                if (fallback) await this.openPath(fallback, false);
+                else {
+                    // 一个文件都不剩：先把文档工作区关掉，再清空表格
+                    await this.docWorkspace?.close();
+                    this.workspaceRouter?.showSheet();
+                    this.data.clearCurrentSheet();
+                }
             }
 
             // 落库/切换完成后才真正清理存档
             for (const key of keys) {
                 await this.settingsDb.deleteValue(key);
                 await this.settingsDb.deleteImages(key);
+                // 文档仓同键：路径键与 values 库同源，删文件时两库一起清，
+                // 否则删掉 .text 后 docs 里会留一份孤儿存档（刷新后可能被对账复活）
+                await this.docWorkspace?.docStore.deleteSnapshot(key);
             }
 
             if (removingActived) {
@@ -872,6 +1112,13 @@ export class App {
             for (const path of paths) {
                 const key = this.toSheetKey(path);
                 if (!key) continue;
+                // 文档文件补的是 docs 仓的空白存档，不是表格的空白快照：
+                // 往 values 库写一份「空表」会让这个键同时被两个库认领，
+                // 删除时容易只清一边而留下孤儿
+                if (isDocPath(path)) {
+                    await this.docWorkspace?.docStore.ensureSnapshot(key, this.docTitleOf(path));
+                    continue;
+                }
                 const existing = await this.settingsDb.getValue(key);
                 if (existing && existing !== '{}') continue;   // 已有存档：保持原样
                 await this.settingsDb.setValue(key, this.data.blankSnapshot());
@@ -948,6 +1195,9 @@ export class App {
                 if (!key || owned.has(key.toLowerCase())) continue;
                 await this.settingsDb.deleteImages(key);
             }
+
+            // 文档仓同口径对账：**只删空文档**，非空的一律留着（宁可留孤儿，也不误删内容）
+            await this.docWorkspace?.docStore.pruneOrphans(owned);
         } catch {
             // 存档不可用（IndexDB 被禁用等）时跳过对账，不影响使用
         }
@@ -1076,6 +1326,52 @@ export class App {
         });
     }
 
+    /**
+     * 同步表格 / 文档两个工作区的高度
+     *
+     * 两者都挂在 `containerSplit.splitPrev` 里、排在工具栏之下，而工具栏高度随窗口宽度
+     * 变化（紧凑模式会变矮）。若沿用 `height: 100%`，工作区会多占工具栏那一截，
+     * 底部工具线就被顶出可视区（文档滚动条「位置不对」正是这个原因）。
+     * 因此与 `.sheet-workspace` 一致：按「分隔容器高度 − 工具栏高度」写成内联像素值。
+     * @param toolbarHeight - 工具栏高度（px，由 `tabContentShow` 事件给出）
+     */
+    private applyWorkspaceHeight(toolbarHeight: number): void {
+        const { splitPrev } = this.containerSplit.getElements();
+        const available = Math.max(0, Math.round(splitPrev.getBoundingClientRect().height - toolbarHeight));
+        if (this.sheets) this.sheets.getElements().sheets.style.height = `${available}px`;
+        this.docWorkspace?.setHostHeight(available);
+    }
+
+    /**
+     * 初始化文档工作区
+     *
+     * 挂载点与表格相同（`containerSplit.splitPrev`）：工具栏在两者之上，
+     * 切换工作区时工具栏不动，只换它下面显示谁 —— 这正是「一套 UI 挂两种载体」的形态。
+     */
+    private initDocWorkspace() {
+        this.docWorkspace = new DocWorkspace({
+            parentElement: this.containerSplit.getElements().splitPrev,
+            bus: this.commandBus,
+        });
+        // 工作区晚于工具栏创建：补一次尺寸（`tabContentShow` 首次触发时它还不存在）
+        this.applyWorkspaceHeight(this.toolbar.getElements().container.getBoundingClientRect().height);
+        this.workspaceRouter = new WorkspaceRouter({
+            bus: this.commandBus,
+            sheetHost: this.sheetEditHost,
+            sheetContainer: this.sheets.getElements().sheets,
+            doc: this.docWorkspace,
+            // 切回表格要主动补一次重排：表格容器在文档显示期间是 display:none，
+            // 那一帧量到的尺寸是 0，画布会停在切换前的旧尺寸上；
+            // 同时把导航面板从文档的右侧工具线搬回表格这边
+            onShowSheet: () => {
+                this.moveNavPanelToSheet();
+                this.sheets.refreshLayout();
+            },
+            onShowDoc: () => this.moveNavPanelToDoc(),
+        });
+        this.workspaceRouter.mountSheet();
+    }
+
     private initScroller() {
         // 滚轮监听统一挂到工作表容器：滚动条实例只负责各自方向的分量，
         // 使 sheetCanvas/editCanvas/textarea 激活时滚轮也能滚动主页面滚动条
@@ -1180,9 +1476,14 @@ export class App {
         // 自动保存已从「每帧落库」改为「变更后防抖落库」，因此关闭/隐藏页面时必须补一次
         // 立即固化，否则防抖窗口内的最后一次改动会随页面一起丢失。
         // pagehide 覆盖关闭/刷新/前进后退；visibilitychange 覆盖切到后台（移动端可能不触发 pagehide）。
-        window.addEventListener('pagehide', () => this.data.flushPendingSave());
+        window.addEventListener('pagehide', () => {
+            this.data.flushPendingSave();
+            void this.docWorkspace?.flush();
+        });
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'hidden') this.data.flushPendingSave();
+            if (document.visibilityState !== 'hidden') return;
+            this.data.flushPendingSave();
+            void this.docWorkspace?.flush();
         });
     }
 }

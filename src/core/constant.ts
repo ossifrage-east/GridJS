@@ -9,7 +9,7 @@
 // 常量定义
 export const EDIT_CANVAS = 'editCanvas';
 export const SHEETS_NAME = {
-    SHEETS: 'sheets',
+    SHEETS: 'sheet-workspace',
     ALL_SELECT: 'allSelect',
     COL_HEADER: 'colHeaderCanvas',
     ROW_HEADER: 'rowHeaderCanvas',

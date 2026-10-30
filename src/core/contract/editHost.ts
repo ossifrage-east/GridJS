@@ -28,7 +28,7 @@ export type WorkspaceKind = 'sheet' | 'doc';
  * 刻意在此处独立声明、而非从 `dataArchitecture/cell` 引入 `TextAlign`：
  * 契约层不能依赖表格的数据模型。二者是结构等价的可选值集合，赋值时无需转换。
  */
-export type TextAlignValue = 'left' | 'center' | 'right' | 'justify';
+export type TextAlignValue = 'left' | 'center' | 'right' | 'justify' | 'distribute';
 
 /**
  * 垂直对齐取值
@@ -61,6 +61,9 @@ export type BrushMode = 'single' | 'continuous' | null;
  * - **段落级**：`setAlign` … `toggleWrap`，作用于整段/整格
  * - **剪贴板**：`copy` / `cut` / `paste` 三个变体
  * - **格式刷**：`brushClick` / `brushDoubleClick`（保留原始「单击 = 单次、双击 = 连续」的手势语义）
+ * - **历史**：`undo` / `redo`（快速访问区的两个按钮；两种载体各有自己的撤销栈）
+ * - **段落样式（文档）**：`setParaStyle` / `toggleList` —— 表格没有「段落」概念，
+ *   表格宿主的 {@link EditHost.canExecute} 对它们返回 `false`
  * - **表格专属**：`setBorder` / `toggleMergeCells` / `toggleFilter` / `sortUp` / `sortDown`
  *   —— 文档宿主对这些命令的 {@link EditHost.canExecute} 返回 `false`，按钮自动置灰
  *
@@ -95,12 +98,39 @@ export type CommandId =
     // ── 格式刷 ──
     | 'brushClick'
     | 'brushDoubleClick'
+    // ── 历史 ──
+    | 'undo'
+    | 'redo'
+    // ── 段落样式（文档专属）──
+    | 'setParaStyle'
+    | 'toggleList'
     // ── 表格专属 ──
     | 'setBorder'
     | 'toggleMergeCells'
     | 'toggleFilter'
     | 'sortUp'
     | 'sortDown';
+
+/**
+ * 段落样式标识（文档专属）
+ *
+ * 与 Word 的「样式」下拉同构：正文 / 标题 1–6 / 引用 / 代码块。
+ * 刻意用**扁平字符串**而不是「块类型 + 级别」二元组：菜单项、按钮文字、
+ * 快照字段三处都要用它，二元组会让每一处都得拆一次包。
+ */
+export type ParaStyleId =
+    | 'paragraph'
+    | 'h1'
+    | 'h2'
+    | 'h3'
+    | 'h4'
+    | 'h5'
+    | 'h6'
+    | 'quote'
+    | 'code';
+
+/** 列表风格（文档专属） */
+export type DocListKind = 'bullet' | 'ordered';
 
 /**
  * 命令载荷
@@ -160,6 +190,10 @@ export interface ParaStyleState {
     wrap?: boolean;
     /** 缩进级数/像素（表格侧为像素累计值） */
     indent?: number;
+    /** 段落样式（文档专属；表格恒为 `undefined`） */
+    paraStyle?: ParaStyleId;
+    /** 当前列表风格（文档专属；不在列表里为 `null`，表格恒为 `undefined`） */
+    list?: DocListKind | null;
 }
 
 /**
@@ -188,6 +222,16 @@ export interface EditStateSnapshot {
     filterActive: boolean;
     /** 当前格式刷模式 */
     brushMode: BrushMode;
+    /**
+     * 撤销栈是否还有可撤销的一步
+     *
+     * 快速访问区的两个按钮据此置灰。放进快照而不是让 UI 直接问 `undoManager`：
+     * 两种载体的撤销栈类型完全不同（表格是 `UndoManager`，文档是块树快照栈），
+     * 快照把它们归一化成一个布尔值，UI 就不再认识任何一种栈。
+     */
+    undoable: boolean;
+    /** 重做栈是否还有可重做的一步 */
+    redoable: boolean;
 }
 
 /**
@@ -213,6 +257,14 @@ export interface EditingStateSource {
      * @returns 事件源自身（便于链式调用）
      */
     off(event: string, handler?: (...args: any[]) => void): unknown;
+    /**
+     * 载体类型（可选）
+     *
+     * `CommandBus` 有这个 getter；直接传 `DataCollection` 的老调用点没有。
+     * 按钮据此决定「编辑态置灰」要不要生效 —— 见
+     * {@link BtnBase.edittingGuardOn}：文档没有编辑会话概念，一律豁免。
+     */
+    readonly kind?: WorkspaceKind;
 }
 
 /**
@@ -298,4 +350,6 @@ export const EMPTY_EDIT_STATE: Readonly<EditStateSnapshot> = Object.freeze({
     para: Object.freeze({}) as ParaStyleState,
     filterActive: false,
     brushMode: null,
+    undoable: false,
+    redoable: false,
 }) as Readonly<EditStateSnapshot>;

@@ -199,6 +199,15 @@ export interface FileTreeOptions {
      * @param name - 文件名（用于工作表名）
      */
     convertXlsx?: (path: string, name: string) => Promise<XlsxTask>;
+    /**
+     * 把 `.text` 文档导出为 Word（`.docx`）并触发下载（可选）
+     *
+     * 文档的块树存在 IndexedDB 的 `docs` 仓里，而「怎么把块树编成 docx」
+     * 属于文档域的知识 —— 树只认识路径，因此由外部按路径读取并编码。
+     * 不传时菜单项置灰。
+     * @param paths - 待导出的文件路径集合（仅含 `.text`）
+     */
+    exportWord?: (paths: string[]) => void | Promise<void>;
 }
 
 /**
@@ -1137,6 +1146,13 @@ export class FileTree {
                 { todo: 'open', icon: 'icon-open', text: '打开' },
                 // 另存为：hover 展开「另存为xlsx / docx / pptx / pdf」
                 () => this.createSaveAsSubmenuItem(),
+                // 导出 Word：只对文档（.text）有意义；选中里一个文档都没有时置灰
+                {
+                    todo: 'exportWord',
+                    icon: 'icon-file',
+                    text: '导出为 Word',
+                    disabled: !this.hasTextTarget(view),
+                },
                 'separator',
                 { todo: 'cut', icon: 'icon-scissors', text: '剪切' },
                 { todo: 'copy', icon: 'icon-copy', text: '复制' },
@@ -1177,15 +1193,55 @@ export class FileTree {
      * @returns {HTMLElement} 菜单项元素
      */
     private createSaveAsSubmenuItem(): HTMLElement {
+        const hasText = this.collectSelectedTextFiles().length > 0;
         const items: MenuItemSpec[] = [
             { todo: 'saveAsXlsx', text: '另存为xlsx' },
-            { todo: 'saveAsDocx', text: '另存为docx', disabled: true },
+            // 文档 → docx：选中里没有 `.text` 时置灰（与「导出为 Word」同一实现）
+            { todo: 'saveAsDocx', text: '另存为docx', disabled: !hasText },
             { todo: 'saveAsPptx', text: '另存为pptx', disabled: true },
             { todo: 'saveAsPdf', text: '另存为pdf', disabled: true },
         ];
         return this.createHoverSubmenuItem('icon-file', '另存为', items, (todo: string) => {
             if (todo === 'saveAsXlsx') this.showSaveAsXlsxDialog();
+            if (todo === 'saveAsDocx') this.exportWordBySelection();
         });
+    }
+
+    /**
+     * 选中项里是否有可导出的文档（`.text`）
+     * @param view - 右键的节点（可能是文件、文件夹、或不在选区里的行）
+     * @returns 是否有导出目标
+     * @private
+     */
+    private hasTextTarget(view: TreeNodeView): boolean {
+        if (!view.isFolder && extractExtension(view.label.textContent ?? '') === 'text') return true;
+        return this.collectSelectedTextFiles().length > 0;
+    }
+
+    /**
+     * 收集选中的文档文件（`.text`）
+     *
+     * 与 {@link collectSelectedGridFiles} 同构：只认「已选中且不是文件夹」的行。
+     * @returns 路径与显示名
+     * @private
+     */
+    private collectSelectedTextFiles(): Array<{ path: string; name: string }> {
+        return this.visibleRows()
+            .filter((view) => this.highlighted.has(view) && !view.isFolder)
+            .map((view) => ({ path: this.pathWithSelf(view), name: view.label.textContent ?? '' }))
+            .filter((file) => extractExtension(file.name) === 'text');
+    }
+
+    /**
+     * 把选中的文档导出为 Word
+     *
+     * 没有选中任何文档时静默返回（菜单项此时本就是置灰的）。
+     * @private
+     */
+    private exportWordBySelection(): void {
+        const files = this.collectSelectedTextFiles();
+        if (files.length === 0) return;
+        void this.options.exportWord?.(files.map((file) => file.path));
     }
 
     /**
@@ -1935,6 +1991,14 @@ export class FileTree {
             case 'open':
                 // 「打开」由外部接管（弹出文件选择对话框并装载）
                 this.options.onOpen?.();
+                break;
+            case 'exportWord':
+                // 右键的是文档就只导它；右键在文件夹上则导出选区里的全部文档
+                if (!view.isFolder && extractExtension(view.label.textContent ?? '') === 'text') {
+                    void this.options.exportWord?.([this.pathWithSelf(view)]);
+                } else {
+                    this.exportWordBySelection();
+                }
                 break;
             case 'cut':
                 this.clipboard = this.serializeNodes([view]);

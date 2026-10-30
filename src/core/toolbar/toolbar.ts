@@ -21,13 +21,18 @@ import { SectionBrush } from "./start/sectionBrush";
 import { SectionFont } from "./start/sectionFont";
 import { SectionAlign } from "./start/sectionAlign";
 import { SectionProcess } from "./start/sectionProcess";
+import { SectionParagraph } from "./start/sectionParagraph";
 import { BtnBase } from "../common/button";
 import { Select } from "../common/select";
 import { needsCompact } from '../../utils/fitWidth';
 import '../style/toolbar.scss';
 import { SectionPrint } from "./pages/sectionPrint";
+import { SectionDocView } from "./pages/sectionDocView";
+import { SectionDocPage, DocPageKey, DocPageSetupView } from "./pages/sectionDocPage";
 import { CommandBus } from "../contract/commandBus";
+import { EDIT_STATE_CHANGED, WorkspaceKind } from "../contract/editHost";
 import { Printer } from "../../utils/printer";
+import { buildProfiles, ToolbarProfile, ToolbarSections } from "./profile";
 
 
 export interface ToolbarOptions {
@@ -52,6 +57,26 @@ export interface ToolbarOptions {
      * （详见 core/contract/editHost.ts 的 CommandId 注释）。
      */
     onFindReplace?: (mode: 'find' | 'replace') => void;
+    /**
+     * 切换「富文本 ⇄ Markdown 源码」视图
+     *
+     * 与 `onFindReplace` 同类：这是**工作区怎么显示**，不是一次编辑动作，
+     * 因此同样走注入回调而不是命令派发。装配层用闭包延迟取文档工作区
+     * （工具栏构造早于文档工作区）。
+     */
+    onToggleMarkdown?: () => void;
+    /** 当前是否处于 Markdown 源码视图（供「视图」页签的按钮回读高亮） */
+    isMarkdownActive?: () => boolean;
+    /**
+     * 文档页面设置回读（「页面」页签打开下拉时标记当前项）
+     *
+     * 与 Markdown 开关同类：属于「纸怎么摆」，不是一次编辑动作，走注入回调。
+     */
+    getDocPageSetup?: () => DocPageSetupView;
+    /** 改一项文档页面设置（装配层写回文档元数据并重排纸张） */
+    onChangeDocPage?: (key: DocPageKey, value: string) => void;
+    /** 打印当前文档 */
+    onPrintDoc?: () => void;
 }
 
 /** 分区描述：元素 + 菜单里显示的名字（紧凑模式下作为「一级菜单」的标签） */
@@ -112,6 +137,33 @@ export class Toolbar extends EventEmitter {
     private readonly onCalculate?: (label: string) => void;
     /** 「查询 / 替换」菜单点选回调（转给数据处理分区） */
     private readonly onFindReplace?: (mode: 'find' | 'replace') => void;
+    /** 切换 Markdown 视图的回调（转给「视图」页签的分区） */
+    private readonly onToggleMarkdown?: () => void;
+    /** 是否处于 Markdown 源码视图 */
+    private readonly isMarkdownActive?: () => boolean;
+    /** 文档页面设置回读 */
+    private readonly getDocPageSetup?: () => DocPageSetupView;
+    /** 文档页面设置变更 */
+    private readonly onChangeDocPage?: (key: DocPageKey, value: string) => void;
+    /** 打印文档 */
+    private readonly onPrintDoc?: () => void;
+    /**
+     * 根分类名 → 页签元素 / 分类清单标签
+     *
+     * 「哪个分类在这个工作区里该消失」需要同时改三处 DOM（页签、浮层标签、分组），
+     * 靠名字现算 hash 三遍既慢又容易漏一处，因此建表时一次记全。
+     */
+    private tabEls: Map<string, HTMLDivElement> = new Map();
+    private tabChips: Map<string, HTMLDivElement> = new Map();
+
+    /** 各工作区的档案（「哪类工作区看到哪些工具」的唯一定义处，见 profile.ts） */
+    private profiles: Record<WorkspaceKind, ToolbarProfile> | null = null;
+
+    /** 已经套用的工作区档案；`null` 表示还没套过（首帧） */
+    private appliedKind: WorkspaceKind | null = null;
+
+    /** 分区实例（档案切换时要回调它们的 setKind） */
+    private sections: ToolbarSections | null = null;
 
     constructor(options: ToolbarOptions) {
         super();
@@ -120,6 +172,11 @@ export class Toolbar extends EventEmitter {
         }
         this.onCalculate = options.onCalculate;
         this.onFindReplace = options.onFindReplace;
+        this.onToggleMarkdown = options.onToggleMarkdown;
+        this.isMarkdownActive = options.isMarkdownActive;
+        this.getDocPageSetup = options.getDocPageSetup;
+        this.onChangeDocPage = options.onChangeDocPage;
+        this.onPrintDoc = options.onPrintDoc;
         this.container = createDiv({className: TOOLBAR_CLASS_NAME.CONTAINER});
         options.parentElement.appendChild(this.container);
 
@@ -147,7 +204,7 @@ export class Toolbar extends EventEmitter {
 
     public init() {
         this.setTabs();
-        const sectionBrush = new SectionBrush({ // 格式刷分区
+        const sectionBrush = new SectionBrush({ // 格式刷 / 剪贴板分区
             bus: this.bus,
             menu: this.menu,
             title: '格式刷'
@@ -180,39 +237,136 @@ export class Toolbar extends EventEmitter {
             title: '打印设置'
         });
 
-        this.mountSections(sectionBrush, sectionFont, sectionAlign, sectionProcess, sectionPrint);
+        const sectionParagraph = new SectionParagraph({  // 段落分区（文档）
+            bus: this.bus,
+            menu: this.menu,
+            title: '段落样式'
+        });
+
+        const sectionDocView = new SectionDocView({  // 文档视图分区（文档）
+            bus: this.bus,
+            menu: this.menu,
+            onToggle: () => this.onToggleMarkdown?.(),
+            isActive: () => !!this.isMarkdownActive?.(),
+        });
+
+        const sectionDocPage = new SectionDocPage({  // 文档页面设置分区（文档「页面」页签）
+            bus: this.bus,
+            menu: this.menu,
+            getSetup: () => this.getDocPageSetup?.() ?? { orientation: 'portrait', paperSize: 'A4', marginPreset: 'normal', scaleMode: 'none' },
+            onChange: (key, value) => this.onChangeDocPage?.(key, value),
+            onPrint: () => this.onPrintDoc?.(),
+        });
+
+        this.sections = {
+            brush: sectionBrush,
+            font: sectionFont,
+            align: sectionAlign,
+            process: sectionProcess,
+            print: sectionPrint,
+            para: sectionParagraph,
+            docView: sectionDocView,
+            docPage: sectionDocPage,
+        };
+        this.profiles = buildProfiles(this.sections);
+
+        // 先按当前宿主套一次档案（构造时总线多半已绑定表格宿主），
+        // 之后每次「换了宿主」都由总线广播触发，见 {@link watchKind}
+        this.applyKind(this.bus.kind ?? 'sheet', true);
+        this.watchKind();
         // 首屏就可能已经是窄屏：init 末尾按当前宽度定一次模式
         this.updateCompact();
     }
 
     /**
-     * 把分区挂进各自的根分类
+     * 订阅总线，跟随工作区切换换档案
      *
-     * 与 {@link init} 分开是为了**切换工作区时只重挂、不重建**：
-     * 重建分区会重新订阅总线、重新绑定一批 DOM 监听，切几次就积几层。
-     * @param sectionBrush - 格式刷分区
-     * @param sectionFont - 字体样式分区
-     * @param sectionAlign - 对齐方式分区
-     * @param sectionProcess - 数据处理分区
-     * @param sectionPrint - 打印设置分区
+     * 不新增事件：`CommandBus.bind` 在换宿主时本来就会广播一次
+     * {@link EDIT_STATE_CHANGED}，而 {@link applyKind} 开头做了「同一种就返回」的
+     * 短路，因此这条监听在每次按键（状态广播）时只花一次字符串比较。
      * @private
      */
-    private mountSections(
-        sectionBrush: SectionBrush,
-        sectionFont: SectionFont,
-        sectionAlign: SectionAlign,
-        sectionProcess: SectionProcess,
-        sectionPrint: SectionPrint,
-    ): void {
-        this.setTabContent(TOOLBAR_TABS.START, [
-            { el: sectionBrush.getElements().sectionBrush, title: '格式刷' },
-            { el: sectionFont.getElements().sectionFont, title: '字体样式' },
-            { el: sectionAlign.getElements().sectionAlign, title: '对齐方式' },
-            { el: sectionProcess.getElement().sectionProcess, title: '数据处理' },
-        ]);
-        this.setTabContent(TOOLBAR_TABS.PAGE, [
-            { el: sectionPrint.getElements().sectionPrint, title: '打印设置' },
-        ]);
+    private watchKind(): void {
+        this.bus.on(EDIT_STATE_CHANGED, () => {
+            this.applyKind(this.bus.kind ?? 'sheet');
+        });
+    }
+
+    /**
+     * 套用某个工作区的档案
+     *
+     * 「哪类工作区看到哪些工具」整张表在 `profile.ts` 里，这里只负责按表重挂分区：
+     * - 档案里有的根分类 → 挂上它列出的分区（没列出的分区自然被摘下来）；
+     * - 档案里没有的根分类 → 清空并隐藏页签（连分类清单里的同名标签一起隐藏）；
+     * - 分区内部还要按类型收敛一次（边框 / 垂直对齐 / 合并 / 格式刷在文档里没有）。
+     *
+     * **可重入且幂等**：`setTabContent` 本来就先清空再挂，重复套用只是原地替换，
+     * 分区元素与其内部监听都不会重建。
+     * @param kind - 工作区类型
+     * @param force - 强制重套（首帧用；`appliedKind` 还没建立时也需要）
+     */
+    public applyKind(kind: WorkspaceKind, force: boolean = false): void {
+        if (!this.profiles || !this.sections) return;
+        if (!force && this.appliedKind === kind) return;
+        this.appliedKind = kind;
+
+        const profile = this.profiles[kind];
+        const hadActive = this.activeTabText() !== null;
+        const used = new Set<string>();
+        profile.forEach((item) => {
+            used.add(item.tab);
+            this.setTabContent(item.tab, item.sections);
+        });
+        Object.values(TOOLBAR_TABS).forEach((tabText) => {
+            if (used.has(tabText)) {
+                this.setTabVisible(tabText, true);
+                return;
+            }
+            // 清空再隐藏：留着上一类工作区的分区元素在 DOM 里，窄屏下一级菜单仍会列出它们
+            this.setTabContent(tabText, []);
+            this.setTabVisible(tabText, false);
+        });
+
+        // 原来亮着的分类被这一套档案藏掉了（如表格里正开着「页面」，切到文档后没有打印设置）：
+        // 把新档案的第一个可见分类点亮。否则工具区会整片空白 —— 看起来像「工具栏坏了」。
+        // 首屏不动：一开始就没有活动分类是既有行为，改了会让窄屏下的定模式逻辑跟着变。
+        if (hadActive && this.activeTabText() === null) {
+            const first = this.rootTabs.filter((item) => !item.hidden)[0];
+            if (first) this.activateTab(first);
+        }
+
+        // 分区内部收敛（每个分区自己知道哪些按钮在另一类载体里没有意义）
+        this.sections.brush.setKind(kind);
+        this.sections.font.setKind(kind);
+        this.sections.align.setKind(kind);
+    }
+
+    /**
+     * 显示 / 隐藏一个根分类
+     *
+     * 三处要一起改：页签、分类清单浮层里的同名标签、以及它自己的分组。
+     * 正在展开的分类被隐藏时必须顺手取消激活，否则「工具区显示着一批按钮，
+     * 页签却全都不亮」—— 用户会以为界面坏了。
+     * @param tabText - 根分类名
+     * @param visible - 是否显示
+     * @private
+     */
+    private setTabVisible(tabText: string, visible: boolean): void {
+        const tab = this.tabEls.get(tabText);
+        const chip = this.tabChips.get(tabText);
+        const id = tab?.dataset.targetId;
+        const group = id !== undefined ? this.groups.get(id) : undefined;
+        if (tab) tab.hidden = !visible;
+        if (chip) chip.hidden = !visible;
+        if (group) group.hidden = !visible;
+        if (visible) return;
+
+        if (tab?.classList.contains('active')) {
+            tab.classList.remove('active');
+            tab.classList.remove(TOOLBAR_CLASS_NAME.TAB_ROOT);
+        }
+        group?.classList.remove('active');
+        this.setRootOpen(false);
     }
 
     public setTabs() { // 设置工具栏标签
@@ -233,6 +387,7 @@ export class Toolbar extends EventEmitter {
             tab.dataset.targetId = tabId;
             this.tabs.appendChild(tab);
             this.rootTabs.push(tab);
+            this.tabEls.set(tabText, tab);
 
             // 分类清单里的同名标签
             const chip = createDiv({
@@ -243,6 +398,7 @@ export class Toolbar extends EventEmitter {
             chip.dataset.targetId = tabId;
             chip.addEventListener('click', () => this.activateTab(tab));
             this.tabsNav.appendChild(chip);
+            this.tabChips.set(tabText, chip);
 
             const group = createDiv({className: TOOLBAR_CLASS_NAME.GROUP, id: tabId});
             this.content.appendChild(group);
@@ -320,8 +476,11 @@ export class Toolbar extends EventEmitter {
      * @private
      */
     private syncRootTab(): void {
-        const active = this.rootTabs.filter((item) => item.classList.contains('active'))[0];
-        const shown = active ?? this.rootTabs[0];
+        // 只看**可见**的页签：档案可能把前几个分类都藏了起来（如文档里没有「插入 / 页面」），
+        // 若取 `rootTabs[0]` 就会选中一个 `display:none` 的标签，页签行整片空白。
+        const visible = this.rootTabs.filter((item) => !item.hidden);
+        const active = visible.filter((item) => item.classList.contains('active'))[0];
+        const shown = active ?? visible[0] ?? null;
         this.rootTabs.forEach((item) => {
             item.classList.toggle(TOOLBAR_CLASS_NAME.TAB_ROOT, item === shown);
         });
@@ -399,6 +558,19 @@ export class Toolbar extends EventEmitter {
             });
         }
         group.dataset.activeSection = String(index);
+    }
+
+    /**
+     * 当前激活的根分类名
+     * @returns 分类名；一个都没激活时为 null
+     * @private
+     */
+    private activeTabText(): string | null {
+        let found: string | null = null;
+        this.tabEls.forEach((el, text) => {
+            if (found === null && el.classList.contains('active')) found = text;
+        });
+        return found;
     }
 
     /**

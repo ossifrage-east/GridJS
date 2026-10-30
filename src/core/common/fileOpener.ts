@@ -12,10 +12,13 @@ import { Char } from "../dataArchitecture/char";
 import { ColHeader, RowHeader } from "../dataArchitecture/header";
 import { DataCollection } from "../dataArchitecture/dataCollection";
 import { DataEvents, DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH } from "../constant";
-import { toArchiveKey, toNativeFileName } from "../../utils/fileName";
+import { stripExtension, toArchiveKey, toNativeFileName } from "../../utils/fileName";
 import { parseWorkbook } from "../../utils/parser/parserClient";
 import type { ExtractedImage } from "../../utils/parser/sheetParser";
 import { DocumentParser } from "../../utils/parser/documentParser";
+import { createBlankSnapshot, type DocSnapshot } from "../document/blockTree";
+import { docxToSnapshot } from "../document/converter/docxCodec";
+import { textToBlocks } from "../document/converter/textCodec";
 import '../style/fileOpener.scss';
 
 /**
@@ -24,10 +27,24 @@ import '../style/fileOpener.scss';
  * 打开后统一换算为应用的原生后缀（见 {@link toNativeFileName}）：
  * `xls/xlsx → grid`、`doc/docx → text`、`ppt/pptx → demo`。
  */
-export const SUPPORTED_EXTENSIONS = ['xlsx', 'xls', 'docx', 'doc', 'pptx', 'ppt'] as const;
+export const SUPPORTED_EXTENSIONS = [
+    'xlsx', 'xls',
+    'docx', 'doc',
+    'md', 'txt',
+    'pptx', 'ppt',
+] as const;
 
 /** 支持的文件扩展名联合类型 */
 export type SupportedExtension = typeof SUPPORTED_EXTENSIONS[number];
+
+/**
+ * 判定扩展名是否属于「文档」类（走块树，而不是单元格）
+ * @param extension - 文件扩展名
+ * @returns 是否文档类
+ */
+function isDocumentExtension(extension: SupportedExtension): boolean {
+    return extension === 'docx' || extension === 'doc' || extension === 'md' || extension === 'txt';
+}
 
 /**
  * 解析结果：与项目数据格式一致的待装载数据
@@ -66,6 +83,16 @@ export interface FileOpenerOptions {
      * @returns {string} 当前目录内不冲突的文件名
      */
     resolveName?: (nativeName: string) => string;
+    /**
+     * 文档类文件的落点（提供时，docx / doc / md / txt 走**文档工作区**）
+     *
+     * 不提供时保持历史行为：提取纯文本逐行铺到表格 A 列。
+     * 之所以用回调而不是直接依赖文档工作区：打开器是通用组件，
+     * 不该知道「文档存在哪个工作区」。
+     * @param fileName - 原生文件名（如 `说明.text`）
+     * @param snapshot - 解析好的文档存档
+     */
+    onDocument?: (fileName: string, snapshot: DocSnapshot) => void | Promise<void>;
 }
 
 /**
@@ -229,6 +256,15 @@ export class FileOpener {
         // 导入进来的内容仍会被写回该文件名对应的存档键，只是不再阻塞打开动作。
         // 而「切换 / 改名 / 复制」这类必须先把旧表无条件固化再操作的流程，
         // 仍由 syncValuesToDB() 强制落库兜底。
+        // 文档类文件：交给文档工作区（块树），不再「提取纯文本铺到 A 列」
+        if (this.options.onDocument && isDocumentExtension(extension)) {
+            this.openAsDocument(file, extension, nativeName).catch((error: unknown) => {
+                const reason = error instanceof Error ? error.message : String(error);
+                this.options.onError?.(`打开「${file.name}」失败：${reason}`);
+            });
+            return;
+        }
+
         this.parse(file, extension)
             .then((document) => {
                 const finalName = this.options.resolveName?.(nativeName) ?? nativeName;
@@ -239,6 +275,42 @@ export class FileOpener {
                 const reason = error instanceof Error ? error.message : String(error);
                 this.options.onError?.(`打开「${file.name}」失败：${reason}`);
             });
+    }
+
+    /**
+     * 以「文档」形式打开（docx / doc / md / txt）
+     *
+     * 与表格路径的关键差别：**不经过 `DataCollection`**，解析结果直接是一棵块树，
+     * 由外部（装配层）写进 `docs` 仓并切到文档工作区。
+     * @param file - 待打开的文件
+     * @param extension - 真实扩展名
+     * @param nativeName - 换算后的原生文件名（如 `说明.text`）
+     */
+    private async openAsDocument(
+        file: File,
+        extension: SupportedExtension,
+        nativeName: string
+    ): Promise<void> {
+        const title = stripExtension(nativeName);
+        let snapshot: DocSnapshot;
+        if (extension === 'docx') {
+            const buffer = new Uint8Array(await file.arrayBuffer());
+            // 走流式 XML 扫描（`xmlScanner`），不用 DOMParser：
+            // 大文档不会把整棵 DOM 驻留内存，也为将来搬进 Worker 留好路
+            snapshot = await docxToSnapshot(buffer, title);
+        } else {
+            // doc（二进制）/ md / txt：都没有可靠的富文本结构，按纯文本还原段落
+            const result = extension === 'doc'
+                ? await new DocumentParser().parse(file)
+                : { lines: (await file.text()).replace(/\r\n?/g, '\n').split('\n'), title };
+            snapshot = createBlankSnapshot(title);
+            snapshot.blocks = textToBlocks(result.lines.join('\n'));
+            // `.md` 保留源码形态：直接落进块的文本，Markdown 视图里仍是原文
+            if (extension === 'md') snapshot.meta.view = 'markdown';
+        }
+        const finalName = this.options.resolveName?.(nativeName) ?? nativeName;
+        await this.options.onDocument?.(finalName, snapshot);
+        this.options.onOpened?.(finalName);
     }
 
     /**

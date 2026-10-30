@@ -1,25 +1,45 @@
 /*  # web 表格顶部快速访问工具栏 TS 文件
+    # 项目名称: silkspaces（藕丝空间）
+    # 项目目标: 撤销 / 重做 / 打印三组「跨载体」的快捷入口，固定在工具栏最左侧。
+    # 本文件职责: 只建按钮、发命令、按快照置灰。**不认识任何数据层**。
+    # 依赖方向: contract/commandBus + utils/printer（打印实例由装配层注入）。
+    #           改造前本文件直接持有 `DataCollection` 并调 `data.undo()` / `data.undoManager`，
+    #           于是「通用快捷栏」被迫认识表格数据集合；现在撤销/重做走命令总线，
+    #           可用状态读快照的 `undoable` / `redoable`，两种载体共用同一份 UI。
     # author: 东方鹗
     # B站: https://space.bilibili.com/194359739
     # 知乎: https://www.zhihu.com/people/eastossifrage
     # CSDN: https://blog.csdn.net/os373
+    # 项目许可证: MIT 许可证
 */
 
 import { createDiv } from "../../utils/dom";
-import { UNDO_STACK_CHANGED } from "../../utils/undoManager";
-import { TOOLBAR_CLASS_NAME, DataEvents } from "../constant";
+import { TOOLBAR_CLASS_NAME } from "../constant";
 import { BtnBase } from "../common/button";
 import { Menu } from "../common/menu";
-import { DataCollection } from "../dataArchitecture/dataCollection";
-import { getSharedPrinter } from "../../utils/printer";
+import { CommandBus } from "../contract/commandBus";
+import { EDIT_STATE_CHANGED } from "../contract/editHost";
+import { Printer } from "../../utils/printer";
 import favicon from "../../assets/images/favicon.png";
 import '../style/brand.scss'
 
 
 export interface QuickAccessOptions {
     parentElement: HTMLElement;
-    data: DataCollection;
+    /** 命令总线：撤销 / 重做走「发命令」，可用状态走「读快照」 */
+    bus: CommandBus;
     menu: Menu;
+    /** 共享打印实例（装配层注入，与「页面」页签的打印设置共用） */
+    printer: Printer;
+    /**
+     * 打印当前**文档**（文档工作区用）
+     *
+     * 与 `printer` 的关系：共享打印器只认表格（它的分页是按单元格网格算的），
+     * 文档有自己的一套（按纸张分页 + iframe 打印），因此走注入回调而不是实例。
+     */
+    onPrintDoc?: () => void;
+    /** 打印预览当前文档（文档工作区用） */
+    onPrintPreviewDoc?: () => void;
     title?: string;
 }
 
@@ -28,8 +48,24 @@ export class QuickAccess {
     private quickAccess: HTMLDivElement;
     /** 撤销/重做/打印/打印预览的容器：窄屏时整组收进浮层 */
     private panel: HTMLDivElement;
-    private data: DataCollection;
+    private bus: CommandBus;
     private menu: Menu;
+    private printer: Printer;
+    /** 打印文档的回调（文档工作区注入） */
+    private readonly onPrintDoc?: () => void;
+    /** 打印预览文档的回调（文档工作区注入） */
+    private readonly onPrintPreviewDoc?: () => void;
+    /** 撤销 / 重做按钮（按快照置灰） */
+    private backBtn!: BtnBase;
+    private forwardBtn!: BtnBase;
+    /**
+     * 打印 / 打印预览按钮
+     *
+     * 两个载体**都显示**：Word 与 Excel 的快速访问栏里都有这两个按钮，
+     * 按工作区换的是背后的实现（表格走共享打印器，文档走注入回调），不是显隐。
+     */
+    private printBtn!: BtnBase;
+    private printViewBtn!: BtnBase;
     constructor(options: QuickAccessOptions) {
         this.quickAccess = createDiv({
             className: TOOLBAR_CLASS_NAME.QUICK_ACCESS,
@@ -37,8 +73,11 @@ export class QuickAccess {
         if (options.parentElement) {
             options.parentElement.append(this.quickAccess);
         }
-        this.data = options.data;  
+        this.bus = options.bus;
         this.menu = options.menu;
+        this.printer = options.printer;
+        this.onPrintDoc = options.onPrintDoc;
+        this.onPrintPreviewDoc = options.onPrintPreviewDoc;
         this.init();
 
         // 点空白处收起浮层（根折叠时按钮组是浮层，不点它就会一直挂着）
@@ -70,10 +109,10 @@ export class QuickAccess {
         this.panel = createDiv({ className: TOOLBAR_CLASS_NAME.QUICK_PANEL });
         this.quickAccess.append(this.panel);
 
-        const backBtn = new BtnBase(  // 撤销按钮
+        this.backBtn = new BtnBase(  // 撤销按钮
             {
                 parentElement: this.panel, 
-                stateSource: this.data,
+                stateSource: this.bus,
                 isDisabledOnEditting: false,
                 menu: this.menu,
                 toDo: 'back',
@@ -81,16 +120,14 @@ export class QuickAccess {
                 text: '撤销 Ctrl + Z',
                 ishow: true,
                 layout: 'vertical',
-                onClick: (todo) => {
-                    this.data.undo();
-                }
+                onClick: () => this.bus.dispatch('undo'),
             }
         );
 
-        const forwardBtn = new BtnBase(  // 恢复按钮
+        this.forwardBtn = new BtnBase(  // 恢复按钮
             {
                 parentElement: this.panel,
-                stateSource: this.data,
+                stateSource: this.bus,
                 isDisabledOnEditting: false,
                 menu: this.menu,
                 toDo: 'forward',
@@ -98,58 +135,60 @@ export class QuickAccess {
                 text: '恢复 Ctrl + Y',
                 ishow: true,
                 layout: 'vertical',
-                onClick: (todo) => {
-                    this.data.redo();
-                }
+                onClick: () => this.bus.dispatch('redo'),
             }
         );
 
-        // 撤销/重做按钮可用状态监控：撤销栈/重做栈为空时按钮置灰不可点
-        const updateUndoRedoState = () => {
-            backBtn.setDisabled(!this.data.undoManager.canUndo());
-            forwardBtn.setDisabled(!this.data.undoManager.canRedo());
-        };
-        updateUndoRedoState();
-        this.data.undoManager.on(UNDO_STACK_CHANGED, updateUndoRedoState);
-        // 编辑期间按钮服务于编辑内逐字撤销，状态保持不变；编辑结束后按文档栈重新同步
-        this.data.on(DataEvents.IS_EDITTING_CHANGED, (_, isEditting: boolean) => {
-            if (!isEditting) updateUndoRedoState();
-        });
-
-        // 打印组件：「页面」分区的打印设置按钮与打印/打印预览共用同一共享实例，设置互通
-        const printer = getSharedPrinter(this.data);
-
-        const printBtn = new BtnBase(  // 打印按钮
+        this.printBtn = new BtnBase(  // 打印按钮
             {
                 parentElement: this.panel,
-                stateSource: this.data,
+                stateSource: this.bus,
                 menu: this.menu,
                 toDo: 'print',
                 icon: 'icon-printer',
                 text: '打印',
                 ishow: true,
                 layout: 'vertical',
-                onClick: (todo) => {
-                    printer.print();
-                }
+                onClick: () => {
+                    if (this.bus.kind === 'doc') this.onPrintDoc?.();
+                    else this.printer.print();
+                },
             }
         );
 
-        const printViewBtn = new BtnBase(  // 打印预览按钮
+        this.printViewBtn = new BtnBase(  // 打印预览按钮
             {
                 parentElement: this.panel,
-                stateSource: this.data,
+                stateSource: this.bus,
                 menu: this.menu,
                 toDo: 'printView',
                 icon: 'icon-printer-view',
                 text: '打印预览',
                 ishow: true,
                 layout: 'vertical',
-                onClick: (todo) => {
-                    printer.printPreview();
-                }
+                onClick: () => {
+                    if (this.bus.kind === 'doc') this.onPrintPreviewDoc?.();
+                    else this.printer.printPreview();
+                },
             },
         );
+
+        this.setToolbarsState();
+        this.bus.on(EDIT_STATE_CHANGED, () => this.setToolbarsState());
+    }
+
+    /**
+     * 按快照刷新按钮可用性
+     *
+     * 撤销 / 重做是否可点由宿主回答（两种载体的撤销栈类型不同，快照里已归一化为布尔值）。
+     * 打印两个按钮**不再按工作区隐藏**：两类工作区都能打印，只是走不同的实现
+     * （表格走共享打印器，文档走注入回调，见 init 里的两个 onClick）。
+     * @private
+     */
+    private setToolbarsState(): void {
+        const state = this.bus.snapshot();
+        this.backBtn.setDisabled(!state.undoable);
+        this.forwardBtn.setDisabled(!state.redoable);
     }
 
     public getElements() {

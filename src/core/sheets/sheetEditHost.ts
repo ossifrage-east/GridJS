@@ -61,6 +61,44 @@ const STATE_EVENTS: readonly string[] = [
 ];
 
 /**
+ * 表格宿主能执行的命令
+ *
+ * 与文档宿主的 {@link DocEditHost} 的 `SUPPORTED` 互为补集 —— 两边合起来等于
+ * {@link CommandId} 全集。任何新增命令都必须在这里或那里出现一次，
+ * 否则两个宿主都说「不可执行」，按钮会永远灰着（这一条比「漏实现」更容易发现）。
+ *
+ * 文档专属而表格没有的命令：`setParaStyle` / `toggleList`。
+ */
+const SHEET_COMMANDS: CommandId[] = [
+    'setFontFamily',
+    'setFontSize',
+    'toggleBold',
+    'toggleItalic',
+    'toggleUnderline',
+    'toggleStrike',
+    'setTextColor',
+    'setBackground',
+    'setAlign',
+    'setVAlign',
+    'toggleWrap',
+    'indentStep',
+    'copy',
+    'cut',
+    'paste',
+    'pasteValue',
+    'pasteStyle',
+    'brushClick',
+    'brushDoubleClick',
+    'undo',
+    'redo',
+    'setBorder',
+    'toggleMergeCells',
+    'toggleFilter',
+    'sortUp',
+    'sortDown',
+];
+
+/**
  * 表格编辑宿主
  *
  * 把 {@link DataCollection} 的全部「编辑语义」翻译成 {@link CommandId}，供工具栏外壳调用。
@@ -137,14 +175,15 @@ export class SheetEditHost extends EventEmitter implements EditHost {
     /**
      * 该命令在当前宿主下是否可执行
      *
-     * 表格宿主实现了命令全集，因此恒为 `true`。
-     * 文档宿主将在此对 `setBorder` / `toggleMergeCells` / `toggleFilter` / `sortUp` / `sortDown`
-     * 返回 `false`，对应按钮自动置灰 —— 这是「一套 UI 挂两种载体」的收敛机制。
-     * @param cmd - 命令名（形参保留以对齐接口，当前未使用）
-     * @returns 恒为 true
+     * 表格宿主只认「表格有意义的命令」：{@link SHEET_COMMANDS} 之外的（段落样式 /
+     * 列表 / Markdown 视图这类文档专属）一律 `false`，对应按钮自动置灰。
+     * 改造前这里恒返回 `true`，靠「文档命令恰好还没进命令集」侥幸成立 ——
+     * 一旦新增文档命令，表格侧会静默走 `switch` 的 default 分支，看起来像「点了没反应」。
+     * @param cmd - 命令名
+     * @returns 是否可执行
      */
     public canExecute(cmd: CommandId): boolean {
-        return true;
+        return SHEET_COMMANDS.indexOf(cmd) >= 0;
     }
 
     /**
@@ -304,6 +343,19 @@ export class SheetEditHost extends EventEmitter implements EditHost {
             case 'sortDown':
                 this.data.sortDown();
                 break;
+            /* ── 历史 ── */
+            case 'undo':
+                this.data.undo();
+                break;
+            case 'redo':
+                this.data.redo();
+                break;
+            /* ── 文档专属：表格没有「段落样式 / 列表」概念 ── */
+            case 'setParaStyle':
+            case 'toggleList':
+                // 已在 canExecute 挡掉，走到这里说明有入口绕过了总线校验（如快捷键），
+                // 静默忽略即可 —— 表格里「把活动格变成标题 1」没有任何合理语义
+                break;
             default:
                 // 穷尽性检查：新增命令而此处未补分支时，编译期在这里报错
                 this.assertNever(cmd);
@@ -334,6 +386,9 @@ export class SheetEditHost extends EventEmitter implements EditHost {
             para: this.readParaStyle(cell),
             filterActive: this.filterActiveCache,
             brushMode: this.data.brushMode as BrushMode,
+            // 两个栈的可用性都由 `UndoManager` 回答（O(1)），快速访问区据此置灰
+            undoable: this.data.undoManager.canUndo(),
+            redoable: this.data.undoManager.canRedo(),
         };
     }
 

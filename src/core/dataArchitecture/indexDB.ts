@@ -1,7 +1,7 @@
 /**
  * IndexDB 数据库操作类
  * 使用浏览器原生 IndexDB API 实现数据持久化存储
- * 支持 3 种对象存储：settings, values, images
+ * 支持 4 种对象存储：settings, values, images, docs
  * 
  * @class IndexDB
  * @example
@@ -11,7 +11,6 @@
  * 
  * // settings: 键值对存储 (key, value, type)
  * await db.setSetting('theme', 'dark');
- * await db.setSetting('language', 'zh-CN');
  * const theme = await db.getSetting('theme');
  * 
  * // values: 工作表值存储 (sheetName, value)
@@ -21,6 +20,10 @@
  * // images: 工作表图片存储 (sheetName, images)，结构化克隆直存 Uint8Array
  * await db.setImages('Sheet1', images);
  * const images = await db.getImages('Sheet1');
+ *
+ * // docs: 文档块树存储 (docKey, snapshot)，结构化克隆直存 DocSnapshot
+ * await db.setDoc('说明.text', snapshot);
+ * const snapshot = await db.getDoc('说明.text');
  */
 
 /** 对象存储名称常量 */
@@ -28,6 +31,7 @@ const STORE_NAMES = {
     SETTINGS: 'settings',
     VALUES: 'values',
     IMAGES: 'images',
+    DOCS: 'docs',
 } as const;
 
 /** 对象存储名称类型 */
@@ -38,6 +42,7 @@ const OBJECT_STORE_CONFIG: Record<StoreName, IDBObjectStoreParameters> = {
     [STORE_NAMES.SETTINGS]: { keyPath: 'key', autoIncrement: false },
     [STORE_NAMES.VALUES]: { keyPath: 'sheetName', autoIncrement: false },
     [STORE_NAMES.IMAGES]: { keyPath: 'sheetName', autoIncrement: false },
+    [STORE_NAMES.DOCS]: { keyPath: 'docKey', autoIncrement: false },
 };
 
 /** 对象存储索引配置 */
@@ -51,6 +56,9 @@ const OBJECT_STORE_INDEXES: Record<StoreName, Array<{ name: string; keyPath: str
     ],
     [STORE_NAMES.IMAGES]: [
         { name: 'sheetName', keyPath: 'sheetName', unique: true },
+    ],
+    [STORE_NAMES.DOCS]: [
+        { name: 'docKey', keyPath: 'docKey', unique: true },
     ],
 };
 
@@ -90,6 +98,20 @@ export interface ImageRecord {
     images: unknown[];
 }
 
+/**
+ * Docs 存储记录接口
+ *
+ * 键与 `values` 库同源（都来自 `toArchiveKey(path)`），但**分库存储**：
+ * 同一个文件的表格内容与文档内容不可能同时存在（后缀不同即两个文件），
+ * 分库只是为了让「表格存档 v4 的分片逻辑」与「文档的块树」各自演化，互不牵制。
+ */
+export interface DocRecord {
+    /** 文档存档键（= `toArchiveKey(路径)`，如 `说明.text`） */
+    docKey: string;
+    /** 文档存档（`DocSnapshot`；结构化克隆直存，**读回时原型会丢**，见块树的 restoreBlocks） */
+    snapshot: unknown;
+}
+
 export class IndexDB {
     /** 数据库实例 */
     private db: IDBDatabase | null = null;
@@ -99,9 +121,11 @@ export class IndexDB {
      * 数据库版本号
      *
      * v2 起新增 `images` 对象存储（图片与单元格值分开存，见 {@link ImageRecord}）。
-     * `onupgradeneeded` 里的建表逻辑是「缺哪个建哪个」，因此升级不会被旧库结构卡住。
+     * v3 起新增 `docs` 对象存储（文档块树，见 {@link DocRecord}）。
+     * `onupgradeneeded` 里的建表逻辑是「缺哪个建哪个」，因此升级不会被旧库结构卡住，
+     * **存量表格存档零迁移**。
      */
-    private readonly DB_VERSION: number = 2;
+    private readonly DB_VERSION: number = 3;
     /** 是否已初始化 */
     private initialized: boolean = false;
 
@@ -155,6 +179,7 @@ export class IndexDB {
             STORE_NAMES.SETTINGS,
             STORE_NAMES.VALUES,
             STORE_NAMES.IMAGES,
+            STORE_NAMES.DOCS,
         ];
 
         storeNames.forEach(storeName => {
@@ -445,6 +470,87 @@ export class IndexDB {
         return keys.map((key) => String(key));
     }
 
+    // ==================== Docs 相关方法 ====================
+
+    /**
+     * 写入文档存档（已存在则整条替换）
+     *
+     * 走结构化克隆：块树里含 `Char` 实例，直接 put 即可（**不要 JSON.stringify**，
+     * 那会把稀疏的字符样式全部物化成显式 `null` 字段，读回后体积翻倍）。
+     * @param docKey - 文档存档键（`toArchiveKey(路径)`，如 `说明.text`）
+     * @param snapshot - 文档存档（`DocSnapshot`）
+     * @returns {Promise<void>} 操作成功的 Promise
+     */
+    public async setDoc(docKey: string, snapshot: unknown): Promise<void> {
+        await this.ensureInitialized();
+        const transaction = this.getTransaction('readwrite', STORE_NAMES.DOCS);
+        const store = this.getObjectStore(transaction, STORE_NAMES.DOCS);
+
+        return this.wrapRequest<void>(store.put({ docKey, snapshot }));
+    }
+
+    /**
+     * 读取文档存档
+     *
+     * 返回的是**结构化克隆后的普通对象**：`Char` 已丢原型，调用方必须先
+     * `restoreBlocks()` 再使用（`DocStore` 负责这件事）。
+     * @param docKey - 文档存档键
+     * @returns {Promise<unknown | null>} 存档；无记录时为 null（与 `getValue` 的 `'{}'` 约定不同：
+     *          文档没有「空存档」的历史包袱，用 null 更直白）
+     */
+    public async getDoc(docKey: string): Promise<unknown | null> {
+        await this.ensureInitialized();
+        const transaction = this.getTransaction('readonly', STORE_NAMES.DOCS);
+        const store = this.getObjectStore(transaction, STORE_NAMES.DOCS);
+
+        const result = await this.wrapRequest<DocRecord | undefined>(store.get(docKey));
+        return result ? result.snapshot ?? null : null;
+    }
+
+    /**
+     * 删除文档存档
+     * @param docKey - 文档存档键
+     * @returns {Promise<void>} 操作成功的 Promise
+     */
+    public async deleteDoc(docKey: string): Promise<void> {
+        await this.ensureInitialized();
+        const transaction = this.getTransaction('readwrite', STORE_NAMES.DOCS);
+        const store = this.getObjectStore(transaction, STORE_NAMES.DOCS);
+
+        return this.wrapRequest<void>(store.delete(docKey));
+    }
+
+    /**
+     * 取出所有文档存档键（不读内容）
+     *
+     * 与 {@link getAllSheetNames} 同理：启动对账只需要「哪些键有文档」，
+     * 用 `getAll()` 会把每份块树一起读进内存。
+     * @returns {Promise<string[]>} 文档存档键列表
+     */
+    public async getAllDocKeys(): Promise<string[]> {
+        await this.ensureInitialized();
+        const transaction = this.getTransaction('readonly', STORE_NAMES.DOCS);
+        const store = this.getObjectStore(transaction, STORE_NAMES.DOCS);
+
+        const keys = await this.wrapRequest<IDBValidKey[]>(store.getAllKeys());
+        return keys.map((key) => String(key));
+    }
+
+    /**
+     * 读取全部文档存档（含内容）
+     *
+     * 仅用于「对账时要判断空/非空」这类必须看内容的场合；启动路径请优先用
+     * {@link getAllDocKeys}。
+     * @returns {Promise<DocRecord[]>} 全部文档记录
+     */
+    public async getAllDocs(): Promise<DocRecord[]> {
+        await this.ensureInitialized();
+        const transaction = this.getTransaction('readonly', STORE_NAMES.DOCS);
+        const store = this.getObjectStore(transaction, STORE_NAMES.DOCS);
+
+        return this.wrapRequest<DocRecord[]>(store.getAll());
+    }
+
     // ==================== 通用方法 ====================
 
     /**
@@ -469,6 +575,7 @@ export class IndexDB {
             STORE_NAMES.SETTINGS,
             STORE_NAMES.VALUES,
             STORE_NAMES.IMAGES,
+            STORE_NAMES.DOCS,
         ];
 
         for (const storeName of storeNames) {

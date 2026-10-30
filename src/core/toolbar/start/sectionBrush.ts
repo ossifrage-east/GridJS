@@ -15,10 +15,37 @@
 
 import { createDiv } from "../../../utils/dom";
 import { TOOLBAR_CLASS_NAME } from "../../constant";
-import { Menu } from "../../common/menu";
+import { Menu, MenuItemSpec } from "../../common/menu";
 import { BtnBase } from "../../common/button";
 import { CommandBus } from "../../contract/commandBus";
-import { EDIT_STATE_CHANGED } from "../../contract/editHost";
+import { EDIT_STATE_CHANGED, WorkspaceKind } from "../../contract/editHost";
+
+/**
+ * 表格工作区的粘贴菜单
+ *
+ * 表格的「只粘值 / 只粘格式」是单元格语义，用角标图标（T / 格式刷）区分，
+ * 与文字标签相比更省横向空间。
+ */
+const SHEET_PASTE_ITEMS: MenuItemSpec[] = [
+    { todo: 'paste', icon: 'icon-paste', text: '粘贴' },
+    'separator',
+    { todo: 'paste-value', icon: 'icon-paste', badge: 'T' as const, text: '值' },
+    { todo: 'paste-style', icon: 'icon-paste', badge: 'brush' as const, text: '格式' },
+];
+
+/**
+ * 文档工作区的粘贴菜单
+ *
+ * 文档里没有「值」这个概念，照 Word 的措辞写「粘贴文字 / 粘贴格式」。
+ * 两条命令与表格复用同一组 `CommandId`（`pasteValue` / `pasteStyle`）：
+ * 「只保留文本」和「只保留格式」在两种载体里是同一件事，没必要再造两个动词。
+ */
+const DOC_PASTE_ITEMS: MenuItemSpec[] = [
+    { todo: 'paste', icon: 'icon-paste', text: '粘贴' },
+    'separator',
+    { todo: 'paste-value', icon: 'icon-paste', text: '粘贴文字' },
+    { todo: 'paste-style', icon: 'icon-paste', text: '粘贴格式' },
+];
 
 /**
  * SectionBrush 构造选项接口
@@ -49,6 +76,8 @@ export class SectionBrush {
     private menu: Menu;
     /** 格式刷按钮（状态刷新时需要单独回写高亮） */
     private brushBtn!: BtnBase;
+    /** 粘贴按钮（文档工作区要换一套菜单项，见 setKind） */
+    private pasteBtn!: BtnBase;
 
     /**
      * 创建 SectionBrush 实例
@@ -140,14 +169,7 @@ export class SectionBrush {
             layout: 'vertical',
             separate: true,
             ashow: true,
-            menuContent: {
-                items: [
-                    { todo: 'paste', icon: 'icon-paste', text: '粘贴'},
-                    'separator',
-                    { todo: 'paste-value', icon: 'icon-paste', badge: 'T' as const, text: '值'},
-                    { todo: 'paste-style', icon: 'icon-paste', badge: 'brush' as const, text: '格式'}
-                ]
-            },
+            menuContent: { items: SHEET_PASTE_ITEMS },
             onClick: (todo: string) => {
                 if (todo.includes('MenuOpen')) {
                     this.menu.openMenu(pasteBtn.getElements().container);
@@ -159,7 +181,26 @@ export class SectionBrush {
         });
 
         this.brushBtn = brushBtn;
+        this.pasteBtn = pasteBtn;
         this.setupStateListeners();
+    }
+
+    /**
+     * 按工作区类型收敛分区内容
+     *
+     * 文档里这个分区是「剪贴板 + 格式刷」：
+     * - 格式刷**保留**：文档宿主实现了 `brushClick` / `brushDoubleClick`
+     *   （抄字符样式 → 刷到下一次选区），与表格同一套手势（单击单次、双击连续）；
+     * - 粘贴**保留**下拉菜单：Word 的粘贴同样有「只粘文字 / 只粘格式」两项，
+     *   收成普通按钮反而让人以为功能缺失（早期版本就是这么做的，被当成 bug 报回来）。
+     * @param kind - 工作区类型
+     */
+    public setKind(kind: WorkspaceKind): void {
+        const doc = kind === 'doc';
+        // 粘贴按钮在两类工作区里都保留下拉菜单（形状一致才不会让人以为功能缺失），
+        // 只是菜单项按载体换一套措辞：表格是「值 / 格式」，文档是「文字 / 格式」。
+        this.pasteBtn.setMenuEnabled(true);
+        this.pasteBtn.setMenuItems(doc ? DOC_PASTE_ITEMS : SHEET_PASTE_ITEMS);
     }
 
     /**

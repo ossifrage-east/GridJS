@@ -357,6 +357,20 @@ export class Sheets extends EventEmitter {
     }
 
     /**
+     * 主动按当前容器尺寸重排一次
+     *
+     * 供「容器从隐藏变可见」时调用（表格 ⇄ 文档切换）：`display:none` 期间量到的
+     * `getBoundingClientRect()` 全是 0，那一帧算出来的画布尺寸是错的；
+     * 而 `ResizeObserver` 在**尺寸没变**时不会补一次回调（切走时容器是 0×0，
+     * 切回来时才恢复 —— 若恢复后的尺寸恰好与切走前相同，观察器认为「没变化」，
+     * 于是画布就停在切换前那一次的结果上，表现为「表格区域与内容对不上」）。
+     * 与其赌观察器的时机，不如由切换的那一方主动补一次。
+     */
+    public refreshLayout(): void {
+        this.relayout();
+    }
+
+    /**
      * 初始化可见视图
      */
     public initVisibleView(): void {        

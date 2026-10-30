@@ -48,10 +48,12 @@ export const NATIVE_EXTENSIONS = ['grid', 'text', 'demo'] as const;
  * - `xls` / `xlsx` → `grid`
  * - `doc` / `docx` → `text`
  * - `ppt` / `pptx` → `demo`
+ * - `md` / `txt` → `text`（Markdown 与纯文本本就是文档载体，直接落进原生文档格式）
  */
 export const EXTENSION_TO_NATIVE: Record<string, typeof NATIVE_EXTENSIONS[number]> = {
     xls: 'grid', xlsx: 'grid',
     doc: 'text', docx: 'text',
+    md: 'text', txt: 'text',
     ppt: 'demo', pptx: 'demo',
 };
 

@@ -2394,14 +2394,14 @@ div {
   padding: 0;
 }
 
-.sheets canvas {
+.sheet-workspace canvas {
   text-rendering: optimizeLegibility;
   image-rendering: crisp-edges;
 }
-.sheets canvas:focus {
+.sheet-workspace canvas:focus {
   outline: none;
 }
-.sheets #allSelect {
+.sheet-workspace #allSelect {
   position: absolute;
   top: 0;
   left: 0;
@@ -2409,7 +2409,7 @@ div {
   box-sizing: border-box;
   border: 1px solid #cccccc;
 }
-.sheets #allSelect::after {
+.sheet-workspace #allSelect::after {
   content: "";
   position: absolute;
   right: 0;
@@ -2419,26 +2419,26 @@ div {
   border-right: 5px solid #cccccc;
   border-bottom: 5px solid #cccccc;
 }
-.sheets #colHeaderCanvas {
+.sheet-workspace #colHeaderCanvas {
   position: absolute;
   border-bottom: 1px solid #cccccc;
   z-index: 4;
 }
-.sheets #rowHeaderCanvas {
+.sheet-workspace #rowHeaderCanvas {
   position: absolute;
   border-right: 1px solid #cccccc;
   z-index: 4;
 }
-.sheets #sheetCanvas {
+.sheet-workspace #sheetCanvas {
   position: absolute;
   z-index: 2;
 }
-.sheets #editCanvas {
+.sheet-workspace #editCanvas {
   position: absolute;
   display: none;
   z-index: 3;
 }
-.sheets #editCursor {
+.sheet-workspace #editCursor {
   position: absolute;
   width: 2px;
   background: #007acc;
@@ -2466,7 +2466,7 @@ div {
     opacity: 0;
   }
 }
-.sheets #hiddenTextarea {
+.sheet-workspace #hiddenTextarea {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -2482,7 +2482,7 @@ div {
   pointer-events: none; /* 通常不可点击，但我们需要能够聚焦，所以单独处理聚焦时机 */
   z-index: 0;
 }
-.sheets #bottomTools {
+.sheet-workspace #bottomTools {
   width: 100%;
   height: 26px;
   background-color: rgb(236, 236, 236);
@@ -2491,7 +2491,7 @@ div {
   bottom: 0;
   /* 选区即时计算栏（求和 / 平均 / 计数 / 最大 / 最小），挂在左侧分栏内部 */
 }
-.sheets #bottomTools .selection-calc {
+.sheet-workspace #bottomTools .selection-calc {
   display: -webkit-box;
   display: -webkit-flex;
   display: -ms-flexbox;
@@ -2513,7 +2513,7 @@ div {
           user-select: none;
   /* 单项 = 项名 + 值：项名只作标识（不可点、不参与复制） */
 }
-.sheets #bottomTools .selection-calc__item {
+.sheet-workspace #bottomTools .selection-calc__item {
   display: -webkit-inline-box;
   display: -webkit-inline-flex;
   display: -ms-inline-flexbox;
@@ -2524,21 +2524,21 @@ div {
           align-items: baseline;
   gap: 4px;
 }
-.sheets #bottomTools .selection-calc__label {
+.sheet-workspace #bottomTools .selection-calc__label {
   color: #444;
 }
-.sheets #bottomTools .selection-calc {
+.sheet-workspace #bottomTools .selection-calc {
   /* 值：只有鼠标移到值上才变色，也只有值可点击复制 */
 }
-.sheets #bottomTools .selection-calc__value {
+.sheet-workspace #bottomTools .selection-calc__value {
   cursor: pointer;
   -webkit-transition: color 0.12s;
   transition: color 0.12s;
 }
-.sheets #bottomTools .selection-calc__value:hover {
+.sheet-workspace #bottomTools .selection-calc__value:hover {
   color: #1a73e8;
 }
-.sheets #rightTools {
+.sheet-workspace #rightTools {
   width: 26px;
   height: -webkit-calc(100% - 26px);
   height: calc(100% - 26px);
@@ -2550,7 +2550,7 @@ div {
   border-bottom: 1px solid #ccc;
   /* 上侧面板改为纵向 flex：导航面板占满剩余空间，缩放滑块贴底固定 */
 }
-.sheets #rightTools .split-pre {
+.sheet-workspace #rightTools .split-pre {
   display: -webkit-box;
   display: -webkit-flex;
   display: -ms-flexbox;
@@ -2561,7 +2561,7 @@ div {
       -ms-flex-direction: column;
           flex-direction: column;
 }
-.sheets #rightTools .split-pre > .nav-panel {
+.sheet-workspace #rightTools .split-pre > .nav-panel {
   -webkit-box-flex: 1;
   -webkit-flex: 1 1 auto;
       -ms-flex: 1 1 auto;
@@ -2569,10 +2569,10 @@ div {
   min-height: 0;
   height: auto;
 }
-.sheets #rightTools .split-pre {
+.sheet-workspace #rightTools .split-pre {
   /* 缩放控件：垂直细线滑块 + 下方数值框，固定高度、不参与伸缩 */
 }
-.sheets #rightTools .split-pre > .slider {
+.sheet-workspace #rightTools .split-pre > .slider {
   -webkit-box-flex: 0;
   -webkit-flex: 0 0 auto;
       -ms-flex: 0 0 auto;
@@ -3524,6 +3524,15 @@ div {
 #fontSize .toolbar-select-icon {
   width: 16px;
 }
+
+/* ── 工作区档案：按载体隐藏工具 ──
+   档案会隐藏整个根分类页签、分类清单里的同名标签、以及分区内的单个按钮。
+   这些元素的作者样式都写了 display（flex / block / inline-flex），会压过浏览器
+   对 [hidden] 的默认 display:none，因此必须显式补一条 —— 否则「隐藏」只是
+   加了个属性，元素照旧占位。 */
+.toolbar-container [hidden] {
+  display: none !important;
+}
 /*!******************************************************************************************************************************************************************************************!*\
   !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/brand.scss ***!
   \******************************************************************************************************************************************************************************************/
@@ -3578,4 +3587,658 @@ div {
   to {
     right: 4vw;
   }
+}
+/*!*********************************************************************************************************************************************************************************************!*\
+  !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/document.scss ***!
+  \*********************************************************************************************************************************************************************************************/
+@charset "UTF-8";
+/*  # 文档工作区 SCSS 文件
+    # 项目名称: silkspaces（藕丝空间）
+    # 本文件职责: 文档工作区的全部样式 —— 工作区容器、纸张、块级排版、列表标记、
+    #             表格块、Markdown 源码视图（pre + textarea 叠层）。
+    # 约定: 纸张宽度/页边距与 docx 导出的 sectPr 保持一致（A4 11906×16838 twips，
+    #       页边距 1440 twips = 1 英寸），使「屏幕上看到的行宽」与「Word 里打印」
+    #       尽量接近；不一致时用户会在导出后重新调版。
+    # author: 东方鹗
+    # B站: https://space.bilibili.com/194359739
+    # 知乎: https://www.zhihu.com/people/eastossifrage
+    # CSDN: https://blog.csdn.net/os373
+    # 项目许可证: MIT 许可证
+*/
+/* A4 宽度 210mm，左右各 25.4mm 页边距 → 正文宽 159.2mm≈602px（96dpi） */
+/* 标尺厚度（横尺高 / 竖尺宽）：两把尺必须与滚动区让出的边距用同一个数，
+   否则纸会被标尺压掉一截 */
+/* 滚动区的上内边距：纸顶到滚动区顶的距离。竖尺的刻度条要空出同样的距离，
+   否则刻度零点和纸的第一行对不上 */
+.doc-workspace {
+  /* 与 .sheet-workspace 同一做法：相对定位的工作区 + overflow hidden，
+     高度由外壳按「分隔容器高度 − 工具栏高度」写成内联像素值（见 DocWorkspace.setHostHeight），
+     正文与工具线都在它内部绝对定位 */
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: #f3f3f3;
+  overflow: hidden;
+  /* 工作区切换用 hidden 属性：显式补 display:none（避免被后续 display 规则盖掉） */
+}
+.doc-workspace[hidden] {
+  display: none !important;
+}
+
+/* ————— 正文区：位置与表格的画布区一致，右 / 下各让出 26px 的工具线 —————
+   工具线是工作区内的绝对定位子元素（与表格的 #rightTools / #bottomTools 同位同形），
+   因此正文也必须绝对定位，否则工具线会被正文挤出可视区 */
+.doc-body {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 26px;
+  bottom: 26px;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  /* 纸比视口窄时居中（auto 吸收剩余空间）；比视口宽时靠滚动区自身的
+     `margin: 0 auto` 让左半边滚得到 */
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Markdown 源码视图收起右侧工具线时，正文同步让回那 26px */
+.doc-workspace.doc-source-mode .doc-body {
+  right: 0;
+}
+
+/* ————— 工具线：严格照搬表格的 #rightTools / #bottomTools —————
+   表格的两条工具线都是 **Split 组件**（#bottomTools 水平、#rightTools 垂直）：
+   状态内容挂前侧（split-pre）、滚动条挂后侧（split-next）。
+   这里用类名而不是 id：两个工作区同时在 DOM 里（一个 hidden），用 id 会撞重复 id */
+.bottomTools {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+  height: 26px;
+  box-sizing: border-box;
+  background-color: rgb(236, 236, 236);
+  z-index: 4;
+  /* 前侧（左半）：与表格一样是「选区即时计算」栏 */
+}
+.bottomTools .split-pre {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  overflow: hidden;
+}
+.bottomTools {
+  /* 选区即时计算栏（求和 / 平均 / 计数 / 最大 / 最小）：规则照搬 sheets.scss */
+}
+.bottomTools .selection-calc {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  gap: 14px;
+  height: 100%;
+  padding: 0 8px;
+  box-sizing: border-box;
+  font-size: 13px;
+  color: #444444;
+  white-space: nowrap;
+  overflow: hidden;
+  -webkit-user-select: none;
+      -ms-user-select: none;
+          user-select: none;
+  /* 单项 = 项名 + 值：项名只作标识（不可点、不参与复制） */
+}
+.bottomTools .selection-calc__item {
+  display: -webkit-inline-box;
+  display: -webkit-inline-flex;
+  display: -ms-inline-flexbox;
+  display: inline-flex;
+  -webkit-box-align: baseline;
+  -webkit-align-items: baseline;
+      -ms-flex-align: baseline;
+          align-items: baseline;
+  gap: 4px;
+}
+.bottomTools .selection-calc__label {
+  color: #444444;
+}
+.bottomTools .selection-calc {
+  /* 值：文档这边只做展示，不提供「点击复制」 */
+}
+.bottomTools .selection-calc__value {
+  color: #444444;
+}
+
+.rightTools {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 26px;
+  height: -webkit-calc(100% - 26px);
+  height: calc(100% - 26px);
+  box-sizing: border-box;
+  background-color: rgb(236, 236, 236);
+  border-bottom: 1px solid #cccccc;
+  z-index: 4;
+  /* 前侧（上半）：导航面板占满剩余空间，缩放滑块贴底固定（与表格右侧同构） */
+}
+.rightTools .split-pre {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: vertical;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: column;
+      -ms-flex-direction: column;
+          flex-direction: column;
+}
+.rightTools .split-pre > .nav-panel {
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  min-height: 0;
+  height: auto; /* 覆盖全局 .nav-panel 的 height:100%，改由 flex 分配 */
+}
+.rightTools .split-pre {
+  /* 缩放控件：垂直细线滑块 + 下方数值框，固定高度、不参与伸缩 */
+}
+.rightTools .split-pre > .slider {
+  -webkit-box-flex: 0;
+  -webkit-flex: 0 0 auto;
+      -ms-flex: 0 0 auto;
+          flex: 0 0 auto;
+  height: 152px;
+  width: 100%;
+  padding: 6px 0 10px;
+  box-sizing: border-box;
+}
+.rightTools {
+  /* 本工具线在 Markdown 源码视图里收起：那两列是 flex/display:flex，必须显式补 */
+}
+.rightTools[hidden] {
+  display: none !important;
+}
+
+/* 滚动条是 display:flex，[hidden] 的默认样式盖不住它 —— 两个方向都显式补一条
+   （滚动条现在挂在 split-next 里，不再直接是工具线的子元素） */
+.bottomTools .split-next > .scroll-horizontal[hidden],
+.rightTools .split-next > .scroll-vertical[hidden] {
+  display: none !important;
+}
+
+/* ————— 滚动区 ————— */
+.doc-scroller {
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  /* 显式补 display:none：本元素设了 display:flex，会盖掉浏览器对 [hidden] 的默认样式 */
+}
+.doc-scroller[hidden] {
+  display: none !important;
+}
+.doc-scroller {
+  min-height: 0;
+  overflow: auto;
+  /* 自定义滚动条已经挂在工具线上：原生的那两条必须藏起来，否则一个方向两套条 */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.doc-scroller::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+.doc-scroller {
+  padding: 24px 0 80px;
+  /* 给贴在正文上边 / 左边的两把标尺让位（标尺是 body 的绝对定位子元素，不占布局） */
+  margin: 18px 0 0 18px;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  /* 【不能用 justify-content: center】纸比视口宽时，居中产生的左溢出**滚不到**
+     （scrollLeft 只能往右走），加了横向滚动条之后这个洞就露出来了。
+     居中交给槽位的 `margin: 0 auto`：内容超出时 auto 归零，左半边才滚得到。 */
+  -webkit-box-pack: start;
+  -webkit-justify-content: flex-start;
+      -ms-flex-pack: start;
+          justify-content: flex-start;
+  -webkit-box-align: start;
+  -webkit-align-items: flex-start;
+      -ms-flex-align: start;
+          align-items: flex-start;
+}
+
+/* ————— 标尺：钉在正文（.doc-body）的上边与左边 ————— */
+/* 标尺**不是**滚动区的子元素：跟着纸滚走就失去了参照物意义。
+   它们与滚动区同为 body 的子元素，靠 DocView 监听 scroll 反向平移内部刻度条跟随内容 */
+.doc-ruler {
+  position: absolute;
+  box-sizing: border-box;
+  background: #fafafa;
+  border: 1px solid #e0e0e0;
+  overflow: hidden;
+  -webkit-user-select: none;
+      -ms-user-select: none;
+          user-select: none;
+  z-index: 2;
+  /* 本元素是 absolute，作者样式虽未写 display，仍显式补一条防后续被覆盖 */
+}
+.doc-ruler[hidden] {
+  display: none !important;
+}
+
+.doc-ruler-h {
+  top: 0;
+  left: 18px;
+  right: 0;
+  height: 18px;
+  border-left: none;
+}
+
+.doc-ruler-v {
+  top: 18px;
+  left: 0;
+  bottom: 0;
+  width: 18px;
+  border-top: none;
+}
+
+/* 刻度条：尺寸由 buildRuler 按「纸 × 缩放」写在内联样式上；
+   纸居中时它靠 margin auto 同步居中，纸比视口宽时靠 translate 跟着滚动走 */
+.doc-ruler-inner {
+  position: relative;
+  margin: 0 auto;
+}
+
+/* 【横向刻度必须撑满尺子高度】刻度是绝对定位在刻度条**底边**的（bottom: 0），
+   而刻度条的子元素全是绝对定位、自身高度为 0 —— 不撑高就会把刻度顶到尺子上边界之外，
+   被 overflow: hidden 裁掉，表现为「横向标尺只有数字没有刻度」。 */
+.doc-ruler-h .doc-ruler-inner {
+  height: 100%;
+}
+
+.doc-ruler-v .doc-ruler-inner {
+  /* 与滚动区的上内边距同值：零点要落在纸的第一行上 */
+  margin-top: 24px;
+}
+
+.doc-ruler-tick {
+  position: absolute;
+  background: #9a9a9a;
+}
+
+.doc-ruler-h .doc-ruler-tick {
+  bottom: 0;
+  width: 1px;
+  height: 4px;
+}
+
+.doc-ruler-h .doc-ruler-tick.doc-ruler-major {
+  height: 8px;
+}
+
+.doc-ruler-v .doc-ruler-tick {
+  right: 0;
+  height: 1px;
+  width: 4px;
+}
+
+.doc-ruler-v .doc-ruler-tick.doc-ruler-major {
+  width: 8px;
+}
+
+/* 数字：横向平铺在尺子上半部（8px 高，与下半部 8px 的主刻度不打架） */
+.doc-ruler-label {
+  position: absolute;
+  top: 0;
+  font-size: 8px;
+  line-height: 8px;
+  color: #8a8a8a;
+  -webkit-transform: translateX(1px);
+          transform: translateX(1px);
+}
+
+/* 纵向数字旋转 90°：18px 的窄条横着放不下两位数以上的厘米值。
+   左右各让开右侧的刻度（right: 8px），旋转后占位仍是 8px 宽，与刻度不重叠。 */
+.doc-ruler-v .doc-ruler-label {
+  left: 0;
+  right: 8px;
+  -webkit-transform: rotate(-90deg);
+          transform: rotate(-90deg);
+}
+
+/* 纸张槽：纸被 transform 缩放后不占布局，由槽位按「纸 × 缩放」替它占位 */
+.doc-page-slot {
+  position: relative;
+  -webkit-box-flex: 0;
+  -webkit-flex: 0 0 auto;
+      -ms-flex: 0 0 auto;
+          flex: 0 0 auto;
+  /* 纸比视口窄时居中（auto 吸收剩余空间）；比视口宽时 auto 归零，左半边才滚得到 */
+  margin: 0 auto;
+}
+
+/* ————— 纸张 ————— */
+.doc-page {
+  width: 794px;
+  min-height: 1123px;
+  padding: 96px 64px;
+  box-sizing: border-box;
+  background: #ffffff;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.16);
+  color: #333333;
+  font-family: "HarmonyOS Sans SC Regular", "Microsoft YaHei", sans-serif;
+  font-size: 16px;
+  line-height: 1.7;
+}
+
+.doc-blocks {
+  outline: none;
+  min-height: 400px;
+}
+.doc-blocks:focus {
+  outline: none;
+}
+.doc-blocks {
+  /* 格式刷已拿起：光标变刷子，否则无法区分「点了没生效」与「正在等下一次选择」 */
+}
+.doc-blocks.doc-brushing {
+  cursor: crosshair;
+}
+
+/* 分页留白：把下一段顶到下一页的正文起点。
+   分页线用 ::before 画在**上一页纸的底边**（留白顶端往上 margin 处）——
+   用 border 会多占 1px 把内容顶偏，用绝对定位的背景线不影响任何布局。 */
+.doc-page-gap {
+  position: relative;
+}
+.doc-page-gap::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -webkit-calc(-1 * var(--doc-break-offset, 0px));
+  top: calc(-1 * var(--doc-break-offset, 0px));
+  border-top: 1px dashed #b0b0b0;
+}
+
+.doc-block {
+  position: relative;
+  min-height: 1.7em;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.doc-block[data-type=heading] {
+  font-weight: bold;
+  line-height: 1.35;
+  margin: 0.6em 0 0.3em;
+}
+.doc-block[data-type=heading][data-level="1"] {
+  font-size: 28px;
+}
+.doc-block[data-type=heading][data-level="2"] {
+  font-size: 24px;
+}
+.doc-block[data-type=heading][data-level="3"] {
+  font-size: 20px;
+}
+.doc-block[data-type=heading][data-level="4"] {
+  font-size: 18px;
+}
+.doc-block[data-type=heading][data-level="5"] {
+  font-size: 16px;
+}
+.doc-block[data-type=heading][data-level="6"] {
+  font-size: 14px;
+  color: #666666;
+}
+.doc-block {
+  /* 列表标记由 CSS 生成：绝不把「•」写进正文，否则导出 Markdown / docx
+     会把符号当正文，往返一次多一串圆点 */
+}
+.doc-block[data-type=listItem][data-list=bullet]::before {
+  content: "•";
+  position: absolute;
+  left: 8px;
+  color: #333333;
+}
+.doc-block[data-type=listItem][data-list=ordered]::before {
+  content: counter(doc-li) ".";
+  position: absolute;
+  left: 4px;
+  color: #333333;
+  counter-increment: doc-li;
+}
+.doc-block[data-type=quote] {
+  border-left: 3px solid #d0d0d0;
+  padding-left: 12px;
+  color: #666666;
+  font-style: italic;
+  margin: 0.4em 0;
+}
+.doc-block[data-type=code] {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 14px;
+  background: #f6f8fa;
+  border: 1px solid #eaecef;
+  border-radius: 3px;
+  padding: 8px 12px;
+  margin: 0.5em 0;
+  white-space: pre-wrap;
+}
+.doc-block[data-type=image] {
+  color: #666666;
+  text-align: center;
+  padding: 12px;
+  border: 1px dashed #e0e0e0;
+}
+
+/* 有序列表计数器：每个列表项自增，缩进层级不重置（够用，不做多级嵌套计数） */
+.doc-blocks {
+  counter-reset: doc-li;
+}
+
+.doc-hr {
+  padding: 8px 0;
+}
+.doc-hr .doc-hr-line {
+  border-top: 1px solid #c0c0c0;
+}
+
+/* ————— 表格块 ————— */
+.doc-table {
+  margin: 0.6em 0;
+  overflow-x: auto;
+}
+.doc-table table {
+  border-collapse: collapse;
+  width: 100%;
+}
+.doc-table td {
+  border: 1px solid #c0c0c0;
+  padding: 4px 8px;
+  vertical-align: top;
+  min-width: 60px;
+}
+.doc-table .doc-cell-line {
+  min-height: 1.4em;
+}
+
+/* ————— Markdown 源码视图（pre 高亮层 + textarea 输入层叠放） ————— */
+.doc-markdown {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  width: 794px;
+  min-height: 1123px;
+  box-sizing: border-box;
+  background: #ffffff;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.16);
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 14px;
+  line-height: 1.7;
+}
+.doc-markdown[hidden] {
+  display: none !important;
+}
+
+.doc-markdown-gutter {
+  -webkit-box-flex: 0;
+  -webkit-flex: 0 0 44px;
+      -ms-flex: 0 0 44px;
+          flex: 0 0 44px;
+  padding: 24px 8px 24px 0;
+  text-align: right;
+  color: #b0b0b0;
+  border-right: 1px solid #e0e0e0;
+  -webkit-user-select: none;
+      -ms-user-select: none;
+          user-select: none;
+  overflow: hidden;
+  white-space: pre;
+}
+
+.doc-markdown-stage {
+  position: relative;
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  min-width: 0;
+  padding: 24px;
+  /* 两层必须**逐像素重合**：字体、字号、行高、padding、换行策略任一不同，
+     高亮层就会与输入层错位（表现为「打字时文字重影」） */
+}
+.doc-markdown-stage .doc-markdown-highlight,
+.doc-markdown-stage .doc-markdown-input {
+  position: absolute;
+  top: 24px;
+  left: 24px;
+  right: 24px;
+  bottom: 24px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font: inherit;
+  line-height: inherit;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+}
+.doc-markdown-stage .doc-markdown-highlight {
+  color: #333333;
+  pointer-events: none;
+}
+.doc-markdown-stage .doc-markdown-highlight .md-heading {
+  color: #1a4d9e;
+  font-weight: bold;
+}
+.doc-markdown-stage .doc-markdown-highlight .md-strong {
+  font-weight: bold;
+}
+.doc-markdown-stage .doc-markdown-highlight .md-em {
+  font-style: italic;
+}
+.doc-markdown-stage .doc-markdown-highlight .md-code {
+  color: #a31515;
+}
+.doc-markdown-stage .doc-markdown-highlight .md-link {
+  color: #1a73e8;
+  text-decoration: underline;
+}
+.doc-markdown-stage .doc-markdown-highlight .md-quote {
+  color: #666666;
+}
+.doc-markdown-stage .doc-markdown-highlight .md-marker {
+  color: #999999;
+}
+.doc-markdown-stage .doc-markdown-input {
+  color: transparent;
+  background: transparent;
+  caret-color: #000000;
+  resize: none;
+  outline: none;
+}
+
+/* ————— 打印预览 ————— */
+.doc-preview-stage {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: vertical;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: column;
+      -ms-flex-direction: column;
+          flex-direction: column;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  gap: 16px;
+  padding: 8px;
+  background: #f0f0f0;
+}
+
+.doc-preview-page {
+  box-sizing: border-box;
+  background: #ffffff;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.2);
+  overflow: hidden;
+}
+
+.doc-preview-clip {
+  overflow: hidden;
+}
+
+/* 打印时页边距由每页壳的 padding 画出，引擎不再另加（见 docView.print 的 @page 规则） */
+@media print {
+  .doc-page-gap::before {
+    display: none;
+  }
+}
+/* ————— 状态提示（无文档时的占位） ————— */
+.doc-empty {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  -webkit-box-align: center;
+  -webkit-align-items: center;
+      -ms-flex-align: center;
+          align-items: center;
+  -webkit-box-pack: center;
+  -webkit-justify-content: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  color: #999999;
+  font-size: 14px;
+}
+.doc-empty[hidden] {
+  display: none !important;
 }
