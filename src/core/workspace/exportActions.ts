@@ -6,7 +6,6 @@ import { createXlsxTask, type XlsxTask } from '../../utils/parser/xlsxWriter';
 import type { DocSnapshot } from '../document/blockTree';
 import { createBlankSnapshot } from '../document/blockTree';
 import { snapshotToDocx } from '../document/converter/docxCodec';
-import { downloadBlob } from '../document/docWorkspace';
 import { FileTree, FileNode, FileMovePlan } from '../common/fileTree/fileTree';
 import { FileOpener } from '../common/fileTree/fileOpener';
 import { Navigator } from '../common/navigator';
@@ -18,7 +17,7 @@ import { ContentBridgeBase } from './contentBridge';
  *
  * 位于 workspace 继承链顶端（`App → ExportActions → ContentBridge → OpenRouter → FileSession`），
  * 因此下层能力在这里全部是既成事实，无需再声明抽象成员。
- * 导出动作本身也在本层：它们是文件树的两个选项（`convertXlsx` / `exportWord`）。
+ * 导出动作本身也在本层：它们是文件树的两个选项（`convertXlsx` / `convertDocx`）。
  */
 export abstract class ExportActionsBase extends ContentBridgeBase {
     /**
@@ -82,8 +81,8 @@ export abstract class ExportActionsBase extends ContentBridgeBase {
             fileSize: (path: string) => this.getFileSize(path),
             // 「另存为xlsx」的真实转换：读存档 → 生成 xlsx Blob（下载 / 打包下载直接写盘）
             convertXlsx: (path: string, name: string) => this.convertGridToXlsx(path, name),
-            // 「导出为 Word」：读 docs 仓的块树 → 编成 docx → 下载
-            exportWord: (paths: string[]) => this.exportWordFiles(paths),
+            // 「另存为docx」的真实转换：读 docs 仓的块树 → 编成 docx Blob
+            convertDocx: (path: string) => this.convertTextToDocx(path),
         });
         navigator.navContentItemMount(NAV_PANEL[0], this.fileTree.getElements().container);   // NAV_PANEL[0] 即「文件」
         // 「定位」的目标是「主页面正在显示的那个文件」。
@@ -123,41 +122,41 @@ export abstract class ExportActionsBase extends ContentBridgeBase {
     }
 
     /**
-     * 把文档导出为 Word（`.docx`）并下载
+     * 创建 `.text` 文档 → docx 的转换作业（「另存为docx」对话框的真实转换）
      *
      * 与 {@link ExportActionsBase.convertGridToXlsx} 同一套路：树只给路径，装配层按路径取内容。
      * 差别是文档的「内容」不在 `values` 仓而在 `docs` 仓，且**当前打开的文档**
      * 可能还停在防抖窗口里（`DocStore` 500ms 才落库），因此必须先 `flush()`
-     * 再读，否则导出的是上一次的内容。
+     * 再读，否则读到的是上一次的内容。
      *
-     * 多选时逐个下载并留 300ms 间隔：浏览器会丢弃「同一个用户手势里发起的第二个下载」。
-     * @param paths - 待导出的文件路径（仅含 `.text`）
+     * docx 编码本身是一次同步动作，这里把它包成与 xlsx 同形的作业：
+     * 首次 `step()` 才真正编码，对话框照常按时间片驱动、显示「已完成」并允许下载。
+     * @param path - 文件路径（含扩展名，相对根节点）
+     * @returns {Promise<XlsxTask>} 可暂停 / 可续传的转换作业
      */
-    protected async exportWordFiles(paths: string[]): Promise<void> {
-        const list = (paths ?? []).filter(Boolean);
-        if (list.length === 0) return;
+    protected async convertTextToDocx(path: string): Promise<XlsxTask> {
+        const key = this.toSheetKey(path);
+        if (!key) throw new Error('无效的文件路径');
         const store = this.docWorkspace?.docStore;
-        if (!store) {
-            this.data.messageBox.error('文档功能尚未就绪');
-            return;
-        }
+        if (!store) throw new Error('文档功能尚未就绪');
         await store.flush();
 
-        let done = 0;
-        for (const path of list) {
-            const key = this.toSheetKey(path);
-            if (!key) continue;
-            const snapshot = await store.readSnapshot(key);
-            // 没有存档 = 这个文件从来没被编辑过（空文档）：仍导出一份空白 Word，
-            // 比「点了没反应」更符合「导出这个文件」的预期
-            const source = snapshot ?? createBlankSnapshot(this.docTitleOf(path));
-            const name = stripExtension(this.baseNameOf(path) || source.meta.title || 'document');
-            downloadBlob(snapshotToDocx(source), `${name}.docx`);
-            done += 1;
-            if (list.length > 1) {
-                await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
-            }
-        }
-        if (done > 0) this.data.messageBox.success(`已导出 ${done} 个 Word 文档`);
+        const snapshot = await store.readSnapshot(key);
+        // 没有存档 = 这个文件从来没被编辑过（空文档）：仍导出一份空白 Word，
+        // 比「点了没反应」更符合「导出这个文件」的预期
+        const source = snapshot ?? createBlankSnapshot(this.docTitleOf(path));
+        let blob: Blob | null = null;
+        return {
+            get progress(): number {
+                return blob ? 100 : 0;
+            },
+            get blob(): Blob | null {
+                return blob;
+            },
+            step: (): boolean => {
+                if (!blob) blob = snapshotToDocx(source);
+                return true;
+            },
+        };
     }
 }

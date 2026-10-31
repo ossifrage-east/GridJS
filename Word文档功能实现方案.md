@@ -501,8 +501,8 @@ export interface DocSnapshot {
 
 | 入口 | 实现 |
 | --- | --- |
-| 工具栏 / 快速访问「导出为 Word」 | `App.exportWordFiles()`：先 `flush()` 当前文档 → 读快照 → `snapshotToDocx()` → `downloadBlob()` |
-| 文件树右键「导出为 Word」/「另存为docx」 | `FileTree.exportWord` 回调 → 同一个 `exportWordFiles()`（无存档时导出空白 Word，而不是"点了没反应"） |
+| 文件树右键「另存为docx」 | 与「另存为xlsx」同一套导出清单对话框：列出选中的 `.text` 文件，由用户逐行 / 批量「开始转换」后才生成 |
+| docx 转换作业 | `FileTree.convertDocx` 回调 → `App.convertTextToDocx()`：先 `flush()` 当前文档 → 读快照 → `snapshotToDocx()`（无存档时导出空白 Word）→ 作业产物由面板「下载 / 打包下载」写盘 |
 | Markdown | `DocWorkspace.toMarkdown(standardOnly)` 已提供字符串，**尚无下载入口** |
 
 ***

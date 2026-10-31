@@ -35,7 +35,7 @@ import {
 } from "./fileTreeModel";
 import { createNewFileSubmenuItem, createSaveAsSubmenuItem } from "./saveAsDialog";
 import { showPropertyDialog } from "./propertyDialog";
-import { FileTransferPanel } from "./fileTransferPanel";
+import { FileTransferPanel, type TransferKind } from "./fileTransferPanel";
 
 /**
  * 文件树构造选项接口
@@ -96,14 +96,15 @@ export interface FileTreeOptions {
      */
     convertXlsx?: (path: string, name: string) => Promise<XlsxTask>;
     /**
-     * 把 `.text` 文档导出为 Word（`.docx`）并触发下载（可选）
+     * 为 `.text` 文档创建 docx 转换作业（「另存为docx」对话框的真实转换，可选）
      *
      * 文档的块树存在 IndexedDB 的 `docs` 仓里，而「怎么把块树编成 docx」
      * 属于文档域的知识 —— 树只认识路径，因此由外部按路径读取并编码。
-     * 不传时菜单项置灰。
-     * @param paths - 待导出的文件路径集合（仅含 `.text`）
+     * 作业由对话框按时间片推进（与 xlsx 同一套单飞队列）；不传时转换会报错并回到「待开始」。
+     * @param path - 文件路径（含扩展名）
+     * @param name - 文件名
      */
-    exportWord?: (paths: string[]) => void | Promise<void>;
+    convertDocx?: (path: string, name: string) => Promise<XlsxTask>;
 }
 
 export class FileTreeUi {
@@ -156,7 +157,7 @@ export class FileTreeUi {
     protected dragSources: TreeNodeView[] = [];
     /** 「属性」对话框实例（复用同一实例，避免反复创建 DOM） */
     protected propertyDialog: Dialog | null = null;
-    /** 「另存为xlsx」批量任务面板（懒创建；内部自带对话框与单飞队列） */
+    /** 「另存为」批量任务面板（xlsx / docx 共用；懒创建，内部自带对话框与单飞队列） */
     protected transferPanel: FileTransferPanel | null = null;
 
     /**
@@ -642,13 +643,6 @@ export class FileTreeUi {
                 { todo: 'open', icon: 'icon-open', text: '打开' },
                 // 另存为：hover 展开「另存为xlsx / docx / pptx / pdf」
                 () => this.createSaveAsSubmenuItem(),
-                // 导出 Word：只对文档（.text）有意义；选中里一个文档都没有时置灰
-                {
-                    todo: 'exportWord',
-                    icon: 'icon-file',
-                    text: '导出为 Word',
-                    disabled: !this.hasTextTarget(view),
-                },
                 'separator',
                 { todo: 'cut', icon: 'icon-scissors', text: '剪切' },
                 { todo: 'copy', icon: 'icon-copy', text: '复制' },
@@ -669,77 +663,61 @@ export class FileTreeUi {
 
 
 
-    /**
-     * 选中项里是否有可导出的文档（`.text`）
-     * @param view - 右键的节点（可能是文件、文件夹、或不在选区里的行）
-     * @returns 是否有导出目标
-     * @private
-     */
-    protected hasTextTarget(view: TreeNodeView): boolean {
-        if (!view.isFolder && extractExtension(view.label.textContent ?? '') === 'text') return true;
-        return this.collectSelectedTextFiles().length > 0;
-    }
-
-    /**
-     * 收集选中的文档文件（`.text`）
-     *
-     * 与 {@link collectSelectedGridFiles} 同构：只认「已选中且不是文件夹」的行。
-     * @returns 路径与显示名
-     * @private
-     */
-    protected collectSelectedTextFiles(): Array<{ path: string; name: string }> {
-        return this.visibleRows()
-            .filter((view) => this.highlighted.has(view) && !view.isFolder)
-            .map((view) => ({ path: this.pathWithSelf(view), name: view.label.textContent ?? '' }))
-            .filter((file) => extractExtension(file.name) === 'text');
-    }
-
-    /**
-     * 把选中的文档导出为 Word
-     *
-     * 没有选中任何文档时静默返回（菜单项此时本就是置灰的）。
-     * @private
-     */
-    protected exportWordBySelection(): void {
-        const files = this.collectSelectedTextFiles();
-        if (files.length === 0) return;
-        void this.options.exportWord?.(files.map((file) => file.path));
-    }
-
-
     // ════════════════════════════════════════════════════════════
     //  另存为（导出清单对话框）
     // ════════════════════════════════════════════════════════════
 
     /**
-     * 收集当前选中的 `.grid` 文件（按树中可见顺序，序号即返回顺序）
+     * 收集选中的文件（按树中可见顺序，序号即返回顺序）
+     *
+     * 只认「已选中且不是文件夹」的行，再按原生后缀过滤；
+     * xlsx 取 `.grid`，docx 取 `.text`。
      * @private
+     * @param extension - 原生后缀（`grid` / `text`）
      * @returns {Array<{ path: string; name: string }>} 选中文件
      */
-    protected collectSelectedGridFiles(): Array<{ path: string; name: string }> {
+    protected collectSelectedFiles(extension: string): Array<{ path: string; name: string }> {
         return this.visibleRows()
             .filter((view) => this.highlighted.has(view) && !view.isFolder)
             .map((view) => ({ path: this.pathWithSelf(view), name: view.label.textContent ?? '' }))
-            .filter((file) => extractExtension(file.name) === 'grid');
+            .filter((file) => extractExtension(file.name) === extension);
     }
 
-
     /**
-     * 显示「另存为xlsx」对话框
+     * 显示「另存为」对话框（xlsx / docx 同一套清单）
      *
      * 清单渲染、单飞队列与时间片驱动都在 {@link FileTransferPanel} 内，
-     * 树只负责「收集选中的 .grid 文件」并把转换 / 读大小能力透传过去。
+     * 树只负责「收集选中的源文件」并把转换 / 读大小能力透传过去。
      * @private
+     * @param extension - 源文件原生后缀（`grid` / `text`）
+     * @param kind - 目标格式（`xlsx` / `docx`）
      */
-    protected showSaveAsXlsxDialog(): void {
-        const files = this.collectSelectedGridFiles();
+    protected showSaveAsDialog(extension: string, kind: TransferKind): void {
+        const files = this.collectSelectedFiles(extension);
         if (!this.transferPanel) {
             this.transferPanel = new FileTransferPanel({
                 convertXlsx: this.options.convertXlsx,
+                convertDocx: this.options.convertDocx,
                 fileSize: this.options.fileSize,
             });
         }
-        this.transferPanel.open(files);
+        this.transferPanel.open(files, kind);
+    }
+
+    /**
+     * 显示「另存为xlsx」对话框（列出选中的 `.grid` 文件）
+     * @private
+     */
+    protected showSaveAsXlsxDialog(): void {
+        this.showSaveAsDialog('grid', 'xlsx');
+    }
+
+    /**
+     * 显示「另存为docx」对话框（列出选中的 `.text` 文件）
+     * @private
+     */
+    protected showSaveAsDocxDialog(): void {
+        this.showSaveAsDialog('text', 'docx');
     }
 
     // ════════════════════════════════════════════════════════════
@@ -781,14 +759,7 @@ export class FileTreeUi {
                 // 「打开」由外部接管（弹出文件选择对话框并装载）
                 this.options.onOpen?.();
                 break;
-            case 'exportWord':
-                // 右键的是文档就只导它；右键在文件夹上则导出选区里的全部文档
-                if (!view.isFolder && extractExtension(view.label.textContent ?? '') === 'text') {
-                    void this.options.exportWord?.([this.pathWithSelf(view)]);
-                } else {
-                    this.exportWordBySelection();
-                }
-                break;
+
             case 'cut':
                 this.clipboard = modelSerializeNodes([view]);
                 this.clipboardIsCut = true;
@@ -1413,11 +1384,10 @@ export class FileTreeUi {
     /** 构建「另存为」右键菜单项（含 hover 展开的二级菜单） */
     protected createSaveAsSubmenuItem(): HTMLElement {
         return createSaveAsSubmenuItem(
-            this.collectSelectedTextFiles().length > 0,
             this.options.menu,
             (todo) => {
                 if (todo === 'saveAsXlsx') this.showSaveAsXlsxDialog();
-                if (todo === 'saveAsDocx') this.exportWordBySelection();
+                if (todo === 'saveAsDocx') this.showSaveAsDocxDialog();
             }
         );
     }

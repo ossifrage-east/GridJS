@@ -1,4 +1,4 @@
-/*  # 文件批量任务面板（「另存为xlsx」导出清单）
+/*  # 文件批量任务面板（「另存为」导出清单：xlsx / docx 共用）
     # author: 东方鹗
     # B站: https://space.bilibili.com/194359739
     # 知乎: https://www.zhihu.com/people/eastossifrage
@@ -14,6 +14,16 @@ import { MessageBox } from "../message";
 import { formatFileSize } from "./fileTreeModel";
 
 /**
+ * 导出目标格式（决定对话框标题、产物后缀与可选的转换器）
+ *
+ * 两类文件走同一套清单 / 队列 / 下载流程，只有「源文件后缀 → 目标后缀」不同。
+ */
+export type TransferKind = 'xlsx' | 'docx';
+
+/** 各目标格式对应的源文件后缀（用于「没有可导出文件」的提示文案） */
+const SOURCE_EXTENSION: Record<TransferKind, string> = { xlsx: 'grid', docx: 'text' };
+
+/**
  * 批量任务面板的外部依赖
  *
  * 面板只认识「路径 → 作业 / 大小」的抽象能力，真正的读档与转换由外部注入
@@ -27,6 +37,12 @@ export interface FileTransferPanelOptions {
      * @param name - 文件名（用于工作表名）
      */
     convertXlsx?: (path: string, name: string) => Promise<XlsxTask>;
+    /**
+     * 为 `.text` 文档创建 docx 转换作业
+     * @param path - 文件路径（含扩展名）
+     * @param name - 文件名
+     */
+    convertDocx?: (path: string, name: string) => Promise<XlsxTask>;
     /**
      * 读取文件内容的存档大小（字节），用于「文件大小」列
      * @param path - 文件路径（含扩展名）
@@ -149,7 +165,7 @@ function errorMessage(error: unknown): string {
 }
 
 /**
- * 批量任务面板（「另存为xlsx」导出清单对话框）
+ * 批量任务面板（「另存为」导出清单对话框：xlsx / docx 共用）
  *
  * 正文为六列表格（转换在后台按时间片推进）：
  * 1. 多选框 + 序号（表头多选框全选）
@@ -165,6 +181,8 @@ function errorMessage(error: unknown): string {
 export class FileTransferPanel {
     /** 外部依赖（转换 / 读大小） */
     private readonly options: FileTransferPanelOptions;
+    /** 本次打开的目标格式（决定标题、产物后缀与选用的转换器） */
+    private kind: TransferKind = 'xlsx';
     /** 对话框实例（复用同一实例，避免反复创建 DOM） */
     private dialog: Dialog | null = null;
     /** 清单行集合 */
@@ -198,10 +216,12 @@ export class FileTransferPanel {
     /**
      * 打开导出清单（每次打开都从「待开始」重新来）
      * @param {Array<{ path: string; name: string }>} files - 待导出的文件（按树中可见顺序）
+     * @param {TransferKind} [kind='xlsx'] - 目标格式（xlsx / docx）
      */
-    public open(files: Array<{ path: string; name: string }>): void {
+    public open(files: Array<{ path: string; name: string }>, kind: TransferKind = 'xlsx'): void {
         // 上一次的转换作业不跨次保留
         this.stop();
+        this.kind = kind;
         this.rows = [];
         this.selectAll = null;
         this.downloadAll = null;
@@ -210,7 +230,7 @@ export class FileTransferPanel {
         this.headerRemove = null;
         if (!this.dialog) {
             this.dialog = new Dialog({
-                title: '另存为xlsx',
+                title: `另存为${kind}`,
                 size: 'lg',
                 scrollable: true,
                 buttons: [{ text: '关闭', variant: 'secondary' }],
@@ -218,6 +238,8 @@ export class FileTransferPanel {
             // 关闭后停止转换并释放作业，避免对话框隐藏后仍在后台空转
             this.dialog.on('close', () => this.stop());
         }
+        // 复用同一实例时标题随本次的目标格式切换
+        this.dialog.setTitle(`另存为${kind}`);
 
         const body = createDiv();
         /** 文件大小单元格：异步补全时按行更新 */
@@ -226,7 +248,7 @@ export class FileTransferPanel {
         if (files.length === 0) {
             body.appendChild(createDiv({
                 className: TREE.SAVE_AS_EMPTY,
-                textContent: '没有可导出的文件：请先在文件树中选中 .grid 文件',
+                textContent: this.emptyHint(),
             }));
         } else {
             const table = createElement('table', { className: TREE.SAVE_AS_TABLE });
@@ -243,6 +265,15 @@ export class FileTransferPanel {
         this.dialog.show();
         this.updateHeader();
         void this.fillFileSizes(sizeCells);
+    }
+
+    /**
+     * 「清单为空」时的提示文案（按本次的目标格式指出应选中的源文件后缀）
+     * @private
+     * @returns {string} 提示文案
+     */
+    private emptyHint(): string {
+        return `没有可导出的文件：请先在文件树中选中 .${SOURCE_EXTENSION[this.kind]} 文件`;
     }
 
     /**
@@ -468,8 +499,8 @@ export class FileTransferPanel {
         let task = row.task;
         try {
             if (!task) {
-                const convert = this.options.convertXlsx;
-                if (!convert) throw new Error('未配置 xlsx 转换器');
+                const convert = this.kind === 'docx' ? this.options.convertDocx : this.options.convertXlsx;
+                if (!convert) throw new Error(`未配置 ${this.kind} 转换器`);
                 const created = await convert(row.path, row.name);
                 // 等待读档期间可能被「暂停 → 又开始」：交由新的驱动循环接管
                 if (row.runToken !== token) return;
@@ -561,7 +592,7 @@ export class FileTransferPanel {
             tbody?.parentElement?.remove();
             this.dialog?.getBody().appendChild(createDiv({
                 className: TREE.SAVE_AS_EMPTY,
-                textContent: '没有可导出的文件：请先在文件树中选中 .grid 文件',
+                textContent: this.emptyHint(),
             }));
         } else {
             void this.pumpQueue();
@@ -645,23 +676,23 @@ export class FileTransferPanel {
     }
 
     /**
-     * 下载单行「转换后」的 xlsx（转换完成且拿到 Blob 才生效）
+     * 下载单行「转换后」的产物（转换完成且拿到 Blob 才生效）
      * @private
      * @param {Row} row - 目标行
      */
     private downloadRow(row: Row): void {
         const blob = row.task?.blob;
         if (row.state !== 'done' || !blob) return;
-        triggerDownload(blob, `${stripExtension(row.name)}.xlsx`);
+        triggerDownload(blob, `${stripExtension(row.name)}.${this.kind}`);
     }
 
     /**
-     * 打包下载：把勾选且已完成的 xlsx 打成 zip
+     * 打包下载：把勾选且已完成的产物打成 zip
      *
      * ZIP 内的条目名**保留文件在树中的目录层级**（`归档/销售数据.grid` →
      * `归档/销售数据.xlsx`），因此不同文件夹下的同名文件互不冲突。
      * 同一目录下万一仍有重名，再按 `名称(2).xlsx` 递增去重；
-     * 所有文件都以「存储」方式写入，不重新压缩 xlsx 自身。
+     * 所有文件都以「存储」方式写入，不重新压缩产物自身。
      * @private
      */
     private async downloadChecked(): Promise<void> {
@@ -673,7 +704,7 @@ export class FileTransferPanel {
             for (const row of targets) {
                 const blob = row.task?.blob;
                 if (!blob) continue;
-                // 相对路径（含扩展名）→ zip 条目名：去掉 `.grid`、补 `.xlsx`，分隔符统一为 `/`。
+                // 相对路径（含扩展名）→ zip 条目名：去掉源后缀、补目标后缀，分隔符统一为 `/`。
                 // 只在最后一个 `/` 之后去扩展名，避免目录名里的点被误当作扩展名分隔符。
                 const normalized = (row.path || row.name).replace(/\\/g, '/')
                     .split('/')
@@ -682,15 +713,15 @@ export class FileTransferPanel {
                 const slash = normalized.lastIndexOf('/');
                 const dir = slash >= 0 ? normalized.slice(0, slash + 1) : '';
                 const base = stripExtension(slash >= 0 ? normalized.slice(slash + 1) : normalized);
-                let entryName = `${dir}${base}.xlsx`;
+                let entryName = `${dir}${base}.${this.kind}`;
                 let index = 2;
                 while (used.has(entryName.toLowerCase())) {
-                    entryName = `${dir}${base}(${index++}).xlsx`;
+                    entryName = `${dir}${base}(${index++}).${this.kind}`;
                 }
                 used.add(entryName.toLowerCase());
                 entries.push({ name: entryName, data: new Uint8Array(await blob.arrayBuffer()) });
             }
-            triggerDownload(createZipBlob(entries), 'xlsx打包下载.zip');
+            triggerDownload(createZipBlob(entries), `${this.kind}打包下载.zip`);
         } catch (error) {
             new MessageBox().show(`打包下载失败：${errorMessage(error)}`, { type: 'error' });
         }

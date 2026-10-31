@@ -119,23 +119,20 @@ export function createNewFileSubmenuItem(
 /**
  * 构建「另存为」右键菜单项（含 hover 展开的二级菜单）
  *
- * 后三项（pptx / pdf）暂未实现，置灰不可点；
- * 「另存为xlsx」打开导出清单对话框（列出当前选中的 `.grid` 文件）；
- * 「另存为docx」与「导出为 Word」同一实现。
- * @param {boolean} hasText - 选中里是否含 `.text` 文档（没有则 docx 项置灰）
+ * 后两项（pptx / pdf）暂未实现，置灰不可点；
+ * 「另存为xlsx」与「另存为docx」都打开同一套导出清单对话框
+ * （分别列出当前选中的 `.grid` / `.text` 文件，由用户决定是否开始转换）。
  * @param {Menu | null | undefined} menu - 主菜单实例
  * @param {(todo: string) => void} onPick - 选中项回调
  * @returns {HTMLElement} 菜单项元素
  */
 export function createSaveAsSubmenuItem(
-    hasText: boolean,
     menu: Menu | null | undefined,
     onPick: (todo: string) => void
 ): HTMLElement {
     const items: MenuItemSpec[] = [
         { todo: 'saveAsXlsx', text: '另存为xlsx' },
-        // 文档 → docx：选中里没有 `.text` 时置灰（与「导出为 Word」同一实现）
-        { todo: 'saveAsDocx', text: '另存为docx', disabled: !hasText },
+        { todo: 'saveAsDocx', text: '另存为docx' },
         { todo: 'saveAsPptx', text: '另存为pptx', disabled: true },
         { todo: 'saveAsPdf', text: '另存为pdf', disabled: true },
     ];
