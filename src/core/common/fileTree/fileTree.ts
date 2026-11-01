@@ -43,6 +43,8 @@ export type { FileTreeOptions } from "./fileTreeUi";
  * - 右键菜单：新建文件（hover 展开二级菜单：新建XLSX / 新建DOCX / 新建PPTX）/
  *   新建文件夹 / 打开 / 分割线 / 剪切 / 复制 / 粘贴 / 分割线 / 重命名 / 删除。
  *   右键文件夹时「新建」作用于该文件夹，右键文件时作用于其所在文件夹。
+ *   右键「打开」同理：打开进来的文件落在右键的目标目录里 —— 右键文件夹则在该文件夹内，
+ *   右键文件则与它同目录（登记与存档都用带目录的完整路径）。
  * - 命名规则：新建时**仅当当前目录内同名冲突才递增序号** ——
  *   文件夹无冲突用基础名（`新建文件夹`），冲突时追加序号（`新建文件夹1`…）；
  *   文件基础名自带序号（`sheet1.grid` / `doc1.text` / `ppt1.demo`），
@@ -81,7 +83,7 @@ export type { FileTreeOptions } from "./fileTreeUi";
  *
  * @class FileTree
  * @example
- * const fileTree = new FileTree({ menu, onOpen: () => opener.pickAndOpen() });
+ * const fileTree = new FileTree({ menu, onOpen: (folderPath) => opener.pickAndOpen(folderPath) });
  * navigator.navContentItemMount('文件', fileTree.getElements().container);
  * // 打开文件成功后登记节点，并同步主页面文件名供「定位」使用
  * fileTree.showActivedFile('销售数据.xlsx');
@@ -253,13 +255,24 @@ export class FileTree extends FileTreeUi {
         this.activedFileName = name;
 
         const existing = this.findByName(name);
-        const view = existing && !existing.isFolder ? existing : this.addNode(name);
+        if (existing && !existing.isFolder) {
+            this.refreshActivedHighlight();
+            return existing;
+        }
+
+        // 路径可带目录（右键「打开」落在某个文件夹里时，登记的是 `归档/销售.grid`）：
+        // 先按目录路径找到目标文件夹，再在其中新建节点；找不到目录时按老规矩落到根目录
+        const slash = name.lastIndexOf('/');
+        const folder = slash > 0 ? this.findByName(name.slice(0, slash)) : null;
+        const view = (folder?.isFolder
+            ? this.addNode(name.slice(slash + 1), { parent: folder })
+            : this.addNode(name)) ?? existing;
         this.refreshActivedHighlight();
         return view;
     }
 
     /**
-     * 为「从本机打开的文件」解析一个在根目录内不冲突的文件名
+     * 为「从本机打开的文件」解析一个在**目标目录内**不冲突的文件名
      *
      * 打开时**不同原始后缀可能换算成同一原生名**：`test_sample.xls` 与
      * `test_sample.xlsx` 都换算为 `test_sample.grid`（同理 `doc/docx → .text`、
@@ -274,10 +287,12 @@ export class FileTree extends FileTreeUi {
      * ⚠️ 调用方必须把返回名**同时**用于装载（存档键）与登记（树节点），二者一致
      * 才能保证「一节点一存档」。
      * @param {string} name - 换算后的原生文件名（如 `test_sample.grid`）
-     * @returns {string} 根目录内不冲突的文件名
+     * @param {string} folderPath - 目标目录路径（右键「打开」时由树传入；根目录为空串）
+     * @returns {string} 目标目录内不冲突的文件名
      */
-    public resolveOpenedFileName(name: string): string {
-        const target = this.rootViews[0];
+    public resolveOpenedFileName(name: string, folderPath: string = ''): string {
+        const dir = (folderPath ?? '').trim();
+        const target = dir ? this.findByName(dir) : this.rootViews[0];
         if (!target?.childrenBox) return name;
         return this.uniqueName(target, name);
     }

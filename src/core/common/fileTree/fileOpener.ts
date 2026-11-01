@@ -47,6 +47,17 @@ function isDocumentExtension(extension: SupportedExtension): boolean {
 }
 
 /**
+ * 把目录路径与文件名拼成完整路径
+ * @param folderPath - 目录路径（根目录为空串）
+ * @param fileName - 文件名
+ * @returns 完整路径；根目录下直接返回文件名
+ */
+function joinPath(folderPath: string, fileName: string): string {
+    const dir = (folderPath ?? '').trim();
+    return dir ? `${dir}/${fileName}` : fileName;
+}
+
+/**
  * 解析结果：与项目数据格式一致的待装载数据
  * @interface OpenedDocument
  */
@@ -68,8 +79,8 @@ interface OpenedDocument {
 export interface FileOpenerOptions {
     /** 数据集合：解析结果写入此处 */
     data: DataCollection;
-    /** 文件打开成功回调（参数为文件名），用于在文件树中登记节点 */
-    onOpened?: (fileName: string) => void;
+    /** 文件打开成功回调（参数为**文件路径**），用于在文件树中登记节点 */
+    onOpened?: (filePath: string) => void;
     /** 文件打开失败回调（参数为提示信息） */
     onError?: (message: string) => void;
     /**
@@ -80,19 +91,20 @@ export interface FileOpenerOptions {
      * `ppt/pptx → .demo`）。由外部（文件树）在此检测冲突并给出「当前目录内不冲突」
      * 的名称（冲突时加序号）。缺省（未提供）时原样使用换算后的原生名。
      * @param nativeName - 换算后的原生文件名（如 `test_sample.grid`）
-     * @returns {string} 当前目录内不冲突的文件名
+     * @param folderPath - 打开文件要落入的目录路径（根目录为空串，见 {@link pickAndOpen}）
+     * @returns {string} 该目录内不冲突的文件名
      */
-    resolveName?: (nativeName: string) => string;
+    resolveName?: (nativeName: string, folderPath: string) => string;
     /**
      * 文档类文件的落点（提供时，docx / doc / md / txt 走**文档工作区**）
      *
      * 不提供时保持历史行为：提取纯文本逐行铺到表格 A 列。
      * 之所以用回调而不是直接依赖文档工作区：打开器是通用组件，
      * 不该知道「文档存在哪个工作区」。
-     * @param fileName - 原生文件名（如 `说明.text`）
+     * @param filePath - 文件路径（如 `说明.text`、`归档/说明.text`）
      * @param snapshot - 解析好的文档存档
      */
-    onDocument?: (fileName: string, snapshot: DocSnapshot) => void | Promise<void>;
+    onDocument?: (filePath: string, snapshot: DocSnapshot) => void | Promise<void>;
 }
 
 /**
@@ -142,6 +154,14 @@ export class FileOpener {
     private dropTargets: HTMLElement[] = [];
     /** 正在拖拽的进入计数（子元素冒泡会让 leave/enter 不配对，用计数配平） */
     private dragDepth = 0;
+    /**
+     * 本次「选择文件」要落入的目录路径（根目录为空串）
+     *
+     * 由右键菜单「打开」传入：右键文件夹 → 该文件夹；右键文件 → 与它同目录。
+     * 只在 `pickAndOpen` 与随后的 change 事件之间有效，取用后立即清空，
+     * 避免之后拖拽打开的文件被上一次的目录「粘住」。
+     */
+    private pendingFolder = '';
 
     /**
      * 构造函数
@@ -170,7 +190,9 @@ export class FileOpener {
             const files = Array.from(this.fileInput.files ?? []);
             // 重置以便重复选择同一文件时仍能触发 change
             this.fileInput.value = '';
-            files.forEach((file) => this.openFile(file));
+            const folderPath = this.pendingFolder;
+            this.pendingFolder = '';
+            files.forEach((file) => this.openFile(file, folderPath));
         });
     }
 
@@ -184,8 +206,14 @@ export class FileOpener {
 
     /**
      * 弹出系统文件选择对话框
+     *
+     * **在本机打开的文件只有文件名**（浏览器不暴露所在目录），所以它在文件树中的
+     * 位置由调用方指定：右键「打开」时传入被右键文件夹（或文件所在文件夹）的路径；
+     * 不传时落在根目录。
+     * @param {string} [folderPath=''] - 打开文件要落入的目录路径（根目录为空串）
      */
-    public pickAndOpen(): void {
+    public pickAndOpen(folderPath: string = ''): void {
+        this.pendingFolder = (folderPath ?? '').trim();
         this.fileInput.click();
     }
 
@@ -222,8 +250,9 @@ export class FileOpener {
     /**
      * 打开单个文件（解析 → 装载 → 通知外部登记文件树）
      * @param {File} file - 待打开的文件
+     * @param {string} [folderPath=''] - 登记到文件树中的目录路径（根目录为空串）
      */
-    public openFile(file: File): void {
+    public openFile(file: File, folderPath: string = ''): void {
         if (!FileOpener.isSupported(file)) {
             this.options.onError?.(`不支持的文件格式：${file.name}`);
             return;
@@ -258,7 +287,7 @@ export class FileOpener {
         // 仍由 syncValuesToDB() 强制落库兜底。
         // 文档类文件：交给文档工作区（块树），不再「提取纯文本铺到 A 列」
         if (this.options.onDocument && isDocumentExtension(extension)) {
-            this.openAsDocument(file, extension, nativeName).catch((error: unknown) => {
+            this.openAsDocument(file, extension, nativeName, folderPath).catch((error: unknown) => {
                 const reason = error instanceof Error ? error.message : String(error);
                 this.options.onError?.(`打开「${file.name}」失败：${reason}`);
             });
@@ -267,9 +296,10 @@ export class FileOpener {
 
         this.parse(file, extension)
             .then((document) => {
-                const finalName = this.options.resolveName?.(nativeName) ?? nativeName;
-                this.applyDocument(finalName, document);
-                this.options.onOpened?.(finalName);
+                const finalName = this.options.resolveName?.(nativeName, folderPath) ?? nativeName;
+                const filePath = joinPath(folderPath, finalName);
+                this.applyDocument(filePath, document);
+                this.options.onOpened?.(filePath);
             })
             .catch((error: unknown) => {
                 const reason = error instanceof Error ? error.message : String(error);
@@ -285,11 +315,13 @@ export class FileOpener {
      * @param file - 待打开的文件
      * @param extension - 真实扩展名
      * @param nativeName - 换算后的原生文件名（如 `说明.text`）
+     * @param folderPath - 登记到文件树中的目录路径（根目录为空串）
      */
     private async openAsDocument(
         file: File,
         extension: SupportedExtension,
-        nativeName: string
+        nativeName: string,
+        folderPath: string
     ): Promise<void> {
         const title = stripExtension(nativeName);
         let snapshot: DocSnapshot;
@@ -308,9 +340,11 @@ export class FileOpener {
             // `.md` 保留源码形态：直接落进块的文本，Markdown 视图里仍是原文
             if (extension === 'md') snapshot.meta.view = 'markdown';
         }
-        const finalName = this.options.resolveName?.(nativeName) ?? nativeName;
-        await this.options.onDocument?.(finalName, snapshot);
-        this.options.onOpened?.(finalName);
+        // 与表格路径同一套落点规则：最终名在目标目录内去重，登记的是完整路径
+        const finalName = this.options.resolveName?.(nativeName, folderPath) ?? nativeName;
+        const filePath = joinPath(folderPath, finalName);
+        await this.options.onDocument?.(filePath, snapshot);
+        this.options.onOpened?.(filePath);
     }
 
     /**
@@ -358,19 +392,21 @@ export class FileOpener {
      * 工作表名同步为该文件的**存档键**（见 {@link toArchiveKey}），
      * 作为 IndexedDB 的存储键。
      *
-     * 从本机打开的文件**只有文件名**（浏览器不暴露所在目录），因此它就相当于
-     * 文件树根目录下的文件 —— 存档键由同一个 {@link toArchiveKey} 换算，
+     * 从本机打开的文件**只有文件名**（浏览器不暴露所在目录），所以它的位置由
+     * 右键「打开」的目标目录决定（见 {@link pickAndOpen}）；不指定时落在根目录，
+     * 此时路径 ≡ 文件名。存档键由同一个 {@link toArchiveKey} 换算，
      * 与文件树给出的路径天然一致（不同目录的同名文件才会带上目录前缀）。
      *
      * ⚠️ 这里**不能**用 `stripExtension`：`报表.grid` 与 `报表.text` 去扩展名后都是
      * `报表`，会把两个文件写到同一个存档键上（后打开的覆盖先打开的）。
-     * @param {string} fileName - **原生**文件名（如 `报表.grid`，由 {@link toNativeFileName} 换算）
+     * @param fileName - **原生**文件名或路径（如 `报表.grid`、`归档/报表.grid`，
+     *   由 {@link toNativeFileName} 换算后与目录路径拼接）
      * @param {OpenedDocument} document - 待装载数据
      * @private
      */
-    private applyDocument(fileName: string, document: OpenedDocument): void {
-        const sheetName = toArchiveKey(fileName);
-        this.data.runWithFullStateUndo(`打开 ${fileName}`, () => {
+    private applyDocument(filePath: string, document: OpenedDocument): void {
+        const sheetName = toArchiveKey(filePath);
+        this.data.runWithFullStateUndo(`打开 ${filePath}`, () => {
             this.data.activedSheetName = sheetName;
             this.applyHeaders(document.colHeaders, document.rowHeaders);
             // 图片先于 values 赋值：values setter 会广播 VALUES_CHANGED，

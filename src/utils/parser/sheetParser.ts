@@ -1307,10 +1307,10 @@ export class SheetParser {
                                 fontId: parseInt(attrs['fontId'] || '0', 10),
                                 fillId: parseInt(attrs['fillId'] || '0', 10),
                                 borderId: parseInt(attrs['borderId'] || '0', 10),
-                                applyFont: this.isOn(attrs['applyFont']),
-                                applyFill: this.isOn(attrs['applyFill']),
-                                applyBorder: this.isOn(attrs['applyBorder']),
-                                applyAlignment: this.isOn(attrs['applyAlignment']),
+                                applyFont: this.applyFlag(attrs['applyFont']),
+                                applyFill: this.applyFlag(attrs['applyFill']),
+                                applyBorder: this.applyFlag(attrs['applyBorder']),
+                                applyAlignment: this.applyFlag(attrs['applyAlignment']),
                                 alignment: undefined
                             };
                         }
@@ -1524,7 +1524,8 @@ export class SheetParser {
      *
      * OOXML 中 `<b/>`、`<i/>`、`<u/>`、`<strike/>` 这类布尔元素的 val 属性
      * 缺省即 true（元素出现本身表示开启），只有显式 `val="0"`/`"false"` 才关闭。
-     * 注意与 {@link isOn} 的区别：后者用于 applyFont 等缺省为 false 的属性。
+     * 注意与 {@link isOn} 的区别：后者用于 `val="0"` 表示关闭的开关；
+     * applyFont / applyFill 这类 xf 开关请用 {@link applyFlag}（缺省应视为开启）。
      *
      * @param value - val 属性字符串（可能缺省）
      * @returns 是否开启
@@ -1547,6 +1548,24 @@ export class SheetParser {
     private isOn(value: string | null | undefined): boolean {
         if (value === null || value === undefined) return false;
         return value === '1' || value === 'true' || value === 'on';
+    }
+
+    /**
+     * 解析可缺省的 applyFont / applyFill / applyBorder / applyAlignment 开关
+     *
+     * 关键区别：**缺省要返回 undefined，而不是 false**。OOXML 里这些开关不写表示
+     * 「沿用单元格样式」，而 Excel / WPS 在默认格式上普遍省略它们
+     * （例如 `<xf fontId="0" fillId="0" borderId="1" applyBorder="1"/>` 就没写 applyFont）。
+     * 若把缺省当 false，`xf.applyFont !== false` 的门控会把 fontId 明明有效的单元格
+     * 字体整个丢掉 —— 表现为同一种字体的单元格，一部分正常、另一部分回退到画布默认字体。
+     *
+     * @param value - 属性值（可能缺省）
+     * @returns 显式开关值；属性缺省时 undefined（视为「应用」）
+     * @private
+     */
+    private applyFlag(value: string | null | undefined): boolean | undefined {
+        if (value === null || value === undefined || value === '') return undefined;
+        return this.isOn(value);
     }
 
     /**

@@ -174,7 +174,16 @@ export abstract class ContentBridgeBase extends OpenRouterBase {
             const keys = paths.map((path) => this.toSheetKey(path)).filter(Boolean);
             if (keys.length === 0) return;
 
-            const removingActived = keys.includes(this.data.activedSheetName);
+            // 【按**实际显示**的文件判定】文档工作区显示的是 `docStore.docKey`，表格工作区
+            // 显示的才是 `activedSheetName`。只认后者时，删掉 `.text` / `.md` 这类文档会被
+            // 误判成「删的不是当前文件」：内容区继续显示已删除的文档，自动保存还会把它写回库。
+            // 表格侧仍照旧看 `activedSheetName`（文档显示期间它可能仍是内存里那张表，
+            // 删掉它同样要切走，避免空白存档被自动保存写回被删的键）。
+            const visibleKey = this.workspaceRouter?.active === 'doc'
+                ? this.docWorkspace?.docStore.docKey ?? ''
+                : this.data.activedSheetName;
+            const removingActived = (!!visibleKey && keys.includes(visibleKey))
+                || keys.includes(this.data.activedSheetName);
             let fallback: string | null = null;
             if (removingActived) {
                 fallback = this.pickFallbackFile(keys);

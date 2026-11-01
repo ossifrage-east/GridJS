@@ -20,6 +20,7 @@
 */
 
 import { Char } from '../../dataArchitecture/char';
+import { DEFAULT_DOC_FONT_SIZE } from '../../constant';
 import { scanXml } from '../../../utils/parser/xmlScanner';
 import { ZipParser } from '../../../utils/parser/zip';
 import { createZipBlob, type ZipEntryInput } from '../../../utils/parser/xlsxWriter';
@@ -95,6 +96,16 @@ function parseDocumentXml(xml: string): DocBlock[] {
     let paraAlign: 'left' | 'center' | 'right' | 'justify' | undefined;
     let paraListLevel: number | null = null;
     let paraIndent = 0;
+    /** 首行缩进：`w:firstLineChars`（百分之一字符，200 = 2 字符） */
+    let paraFirstLineChars = 0;
+    /** 首行缩进：`w:firstLine`（twips，字号为未知时按 12pt 折算） */
+    let paraFirstLineTwips = 0;
+    /** 段落标记的字号（pt）：把 `w:firstLine` 的 twips 折算成字符数要用它 */
+    let paraFontPt = 0;
+    /** 是否位于 `w:pPr` 内 */
+    let inParaProps = false;
+    /** 是否位于 `w:pPr/w:rPr` 内（段落标记的字符格式，不是 run 的样式） */
+    let inParaMarkProps = false;
     /** 当前 run 的字符样式 */
     let run: CharStylePatch = {};
     /** 当前 run 的高亮 / 上下标（落 DocSpan） */
@@ -150,11 +161,24 @@ function parseDocumentXml(xml: string): DocBlock[] {
         }
         if (paraAlign) paragraph.align = paraAlign;
         if (paraIndent > 0) paragraph.indent = paraIndent;
+        // 首行缩进：优先用 `w:firstLineChars`（字符数，与字号无关，Word 的「首行缩进 2 字符」
+        // 就写它）；只有 `w:firstLine`（twips）时按段落字号折算 —— 1 字符 = 字号(pt) × 20 twips。
+        const firstLine = paraFirstLineChars > 0
+            ? paraFirstLineChars / 100
+            : paraFirstLineTwips > 0
+                ? paraFirstLineTwips / (20 * (paraFontPt > 0 ? paraFontPt : 12))
+                : 0;
+        if (firstLine > 0) paragraph.firstLineIndent = Math.round(firstLine * 100) / 100;
         paragraph = null;
         paraStyle = '';
         paraAlign = undefined;
         paraListLevel = null;
         paraIndent = 0;
+        paraFirstLineChars = 0;
+        paraFirstLineTwips = 0;
+        paraFontPt = 0;
+        inParaProps = false;
+        inParaMarkProps = false;
     };
 
     scanXml(new TextEncoder().encode(xml), {
@@ -190,6 +214,9 @@ function parseDocumentXml(xml: string): DocBlock[] {
                 case 'pStyle':
                     paraStyle = attrs['w:val'] ?? '';
                     break;
+                case 'pPr':
+                    inParaProps = true;
+                    break;
                 case 'jc': {
                     const value = (attrs['w:val'] ?? '').toLowerCase();
                     if (value === 'center' || value === 'right' || value === 'both' || value === 'left') {
@@ -206,6 +233,12 @@ function parseDocumentXml(xml: string): DocBlock[] {
                 case 'ind': {
                     const left = parseInt(attrs['w:left'] ?? attrs['w:start'] ?? '0', 10) || 0;
                     if (left > 0) paraIndent = Math.round(left / 420);
+                    // 首行缩进与左缩进是两回事，必须各自记：Word 的「首行缩进两字符」
+                    // 通常写成 `w:firstLineChars="200" w:firstLine="640"`，两者并存时以字符数为准。
+                    const chars = parseInt(attrs['w:firstLineChars'] ?? '0', 10) || 0;
+                    if (chars > 0) paraFirstLineChars = chars;
+                    const twips = parseInt(attrs['w:firstLine'] ?? '0', 10) || 0;
+                    if (twips > 0) paraFirstLineTwips = twips;
                     break;
                 }
                 case 'r':
@@ -214,7 +247,10 @@ function parseDocumentXml(xml: string): DocBlock[] {
                     runVertAlign = undefined;
                     break;
                 case 'rPr':
-                    inRunProps = true;
+                    // `w:pPr/w:rPr` 是**段落标记**的字符格式（其中的 `w:sz` 用来折算首行缩进的
+                    // twips），不是某个 run 的样式；照抄成 run 样式会把它错记进第一个字符
+                    if (inParaProps) inParaMarkProps = true;
+                    else inRunProps = true;
                     break;
                 case 'b':
                     if (inRunProps) run.bold = (attrs['w:val'] ?? '1') !== '0';
@@ -240,9 +276,10 @@ function parseDocumentXml(xml: string): DocBlock[] {
                     break;
                 }
                 case 'sz': {
-                    if (inRunProps) {
-                        const half = parseInt(attrs['w:val'] ?? '0', 10);
-                        if (half > 0) run.fontSize = Math.round((half / 2) * 4 / 3);
+                    const half = parseInt(attrs['w:val'] ?? '0', 10);
+                    if (half > 0) {
+                        if (inParaMarkProps) paraFontPt = half / 2;
+                        else if (inRunProps) run.fontSize = Math.round((half / 2) * 4 / 3);
                     }
                     break;
                 }
@@ -295,6 +332,10 @@ function parseDocumentXml(xml: string): DocBlock[] {
                     break;
                 case 'rPr':
                     inRunProps = false;
+                    inParaMarkProps = false;
+                    break;
+                case 'pPr':
+                    inParaProps = false;
                     break;
                 case 'p':
                     finishParagraph();
@@ -445,7 +486,20 @@ function renderParagraph(
         const map: Record<string, string> = { left: 'left', center: 'center', right: 'right', justify: 'both' };
         props += `<w:jc w:val="${map[block.align]}"/>`;
     }
-    if (block.indent) props += `<w:ind w:left="${block.indent * 420}"/>`;
+    if (block.indent || block.firstLineIndent) {
+        const parts: string[] = [];
+        if (block.indent) parts.push(`w:left="${block.indent * 420}"`);
+        if (block.firstLineIndent) {
+            // 首行缩进两种写法都写：Word 认 `firstLineChars`（百分之一字符），
+            // 部分其它阅读器只认 `firstLine`（twips）。twips 按块内首字符字号折算：
+            // 1 字符 = 字号(pt) × 20，而 pt = px × 0.75 → 每字符 px × 15 twips。
+            const sizePx = (block.chars && block.chars.length > 0 && block.chars[0].fontSize)
+                || DEFAULT_DOC_FONT_SIZE;
+            parts.push(`w:firstLineChars="${Math.round(block.firstLineIndent * 100)}"`);
+            parts.push(`w:firstLine="${Math.round(block.firstLineIndent * sizePx * 15)}"`);
+        }
+        props += `<w:ind ${parts.join(' ')}/>`;
+    }
     const paraProps = props ? `<w:pPr>${props}</w:pPr>` : '';
 
     return `<w:p>${paraProps}${renderInline(block, links, options.mono === true)}</w:p>`;

@@ -300,14 +300,34 @@ $doc-scroller-pad-top: 24px;
     margin: 0 auto;
 }
 
+/* 纸张背景层：一页一张白卡，卡与卡之间露出工作区的灰底。
+   卡的位置 / 尺寸由 DocView.syncPageCards 按「纸 × 缩放」逐页写入内联样式，
+   这里只管外观（白纸 + 纸张阴影），与正文的布局完全无关。 */
+.doc-pages {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+}
+
+.doc-page-card {
+    position: absolute;
+    left: 0;
+    background: #ffffff;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.16);
+}
+
 /* ————— 纸张 ————— */
 .doc-page {
+    /* 相对定位 + z-index：背景纸卡是绝对定位的，纸不抬层就会被纸卡盖住 */
+    position: relative;
+    z-index: 1;
     width: $doc-page-width;
     min-height: 1123px;         // A4 高度 297mm @96dpi
     padding: $doc-page-padding 64px;
     box-sizing: border-box;
-    background: #ffffff;
-    box-shadow: 0 1px 6px rgba(0, 0, 0, 0.16);
+    /* 纸本身透明：白底与阴影由下面那一排纸卡（.doc-pages）画出来，
+       这样「一页一张纸」的分页视图才画得出来（见 DocView.syncPageCards） */
+    background: transparent;
     color: $doc-text-color;
     font-family: "HarmonyOS Sans SC Regular", "Microsoft YaHei", sans-serif;
     font-size: 16px;
@@ -317,6 +337,9 @@ $doc-scroller-pad-top: 24px;
 .doc-blocks {
     outline: none;
     min-height: 400px;
+    /* 文字区用自带的黑色 I 型光标：系统 I 型光标在部分主题下是白色，
+       压在白色纸面上几乎看不见（图见 assets/images/cursor/text-black.svg） */
+    cursor: url('../../assets/images/cursor/text-black.svg') 8 12, text;
 
     &:focus {
         outline: none;
@@ -329,19 +352,9 @@ $doc-scroller-pad-top: 24px;
 }
 
 /* 分页留白：把下一段顶到下一页的正文起点。
-   分页线用 ::before 画在**上一页纸的底边**（留白顶端往上 margin 处）——
-   用 border 会多占 1px 把内容顶偏，用绝对定位的背景线不影响任何布局。 */
+   它本身不可见（页与页的灰缝由背景纸卡画出来），只负责把内容推下去。 */
 .doc-page-gap {
     position: relative;
-
-    &::before {
-        content: "";
-        position: absolute;
-        left: 0;
-        right: 0;
-        top: calc(-1 * var(--doc-break-offset, 0px));
-        border-top: 1px dashed #b0b0b0;
-    }
 }
 
 .doc-block {
@@ -497,6 +510,11 @@ $doc-scroller-pad-top: 24px;
         overflow: auto;
     }
 
+    /* 源码输入层与正文区同一支黑色 I 型光标（系统白色 I 型在纸上看不清） */
+    .doc-markdown-input {
+        cursor: url('../../assets/images/cursor/text-black.svg') 8 12, text;
+    }
+
     .doc-markdown-highlight {
         color: $doc-text-color;
         pointer-events: none;
@@ -538,13 +556,6 @@ $doc-scroller-pad-top: 24px;
 
 .doc-preview-clip {
     overflow: hidden;
-}
-
-/* 打印时页边距由每页壳的 padding 画出，引擎不再另加（见 docView.print 的 @page 规则） */
-@media print {
-    .doc-page-gap::before {
-        display: none;
-    }
 }
 
 /* ————— 状态提示（无文档时的占位） ————— */
