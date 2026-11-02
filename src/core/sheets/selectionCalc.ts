@@ -199,9 +199,15 @@ export class SelectionCalc {
         let mixed = false;
         let numberFormat: string | undefined;
 
+        const colHeaders = data.colHeaders;
+        const rowHeaders = data.rowHeaders;
         for (let col = startCol; col <= endCol; col++) {
+            // 隐藏列不参与即时计算（与「选区只统计看得见的格子」一致）
+            if (colHeaders.getAt(col - 1)?.isHidden === true) continue;
             const colName = data.getColName(col);
             for (let row = startRow; row <= endRow; row++) {
+                // 隐藏行（手动隐藏或筛选隐藏）同样跳过
+                if (rowHeaders.getAt(row - 1)?.isHidden === true) continue;
                 const cell = data.getCellByName(`${colName}${row}`);
                 if (!cell) continue;
                 const text = cell.getText();
@@ -226,13 +232,18 @@ export class SelectionCalc {
             }
         }
 
+        // 筛选生效时额外展示「筛选处 可见行/筛选前总行」，与其它项一起输出
+        const filterItem = this.buildFilterCountItem();
+
         // 选区里没有任何有内容单元格：仍然显示，只是计数为 0
         if (count === 0 || type === null) {
+            const items: SelectionCalcItem[] = [{ label: '计数', value: '0' }];
+            if (filterItem) items.push(filterItem);
             this.update({
                 count: 0,
                 comparable: false,
                 type: null,
-                items: [{ label: '计数', value: '0' }],
+                items,
             });
             return;
         }
@@ -252,6 +263,7 @@ export class SelectionCalc {
         } else {
             items.push({ label: '计数', value: String(count) });
         }
+        if (filterItem) items.push(filterItem);
 
         this.update({
             count,
@@ -259,6 +271,60 @@ export class SelectionCalc {
             type: resultType,
             items,
         });
+    }
+
+    /**
+     * 构建「筛选出 row/allRow」展示项
+     *
+     * 仅在筛选操作后（筛选条件注册表非空）返回，其它操作一律不显示：
+     * - 统计范围从「筛选按钮所在行的下一行」开始，按 1 计数 ——
+     *   即第一条数据行记为第 1 行，筛选行本身不计入；
+     * - allRow：筛选前表格的总行数（`dataStart..dataEnd`）。上界取「内容范围最后一行」
+     *   （{@link DataCollection.getContentBounds}），不把为铺满视口而补足的空白行
+     *   算进表格；「不包含隐藏」指不计入手动隐藏的行（`hidden \ filterHidden`），
+     *   筛选本身隐藏的行仍算在总数里；
+     * - row：筛选后可见的行数（既未被手动隐藏、也未被筛选隐藏）。
+     *
+     * 多列筛选时以最上面的筛选行为界（其下方才是可被筛选的数据行）。
+     * 复杂度只与「已隐藏的行数 + 按条件重放」有关，与表格总行数无关。
+     * @returns {SelectionCalcItem | null} 展示项；无筛选操作时为 null
+     * @private
+     */
+    private buildFilterCountItem(): SelectionCalcItem | null {
+        const { data } = this;
+        const order = data.getFilterOrder();
+        if (order.length === 0) return null;
+        // 筛选按钮所在行：多列筛选取最上面的一行，下一行才是数据起始行
+        let firstAnchor = Infinity;
+        for (const col of order) {
+            const cond = data.getFilterCondition(col);
+            if (cond && cond.anchorRow < firstAnchor) firstAnchor = cond.anchorRow;
+        }
+        if (!Number.isFinite(firstAnchor)) return null;
+
+        const dataStart = firstAnchor + 1;  // 筛选行以下，从 1 开始计数
+        const dataEnd = Math.min(data.rowHeaders.length, data.getContentBounds().maxRow);
+        if (dataEnd < dataStart) {
+            return { label: '筛选出', value: '0/0' };
+        }
+        const totalRows = dataEnd - dataStart + 1;
+        const hiddenRows = data.getHiddenRowsSet();
+        const filterHiddenRows = data.computeFilterHiddenRows();
+
+        // 手动隐藏 = 已隐藏但并非筛选所致；不计入「筛选前总行数」
+        let manualHidden = 0;
+        hiddenRows.forEach((row) => {
+            if (row >= dataStart && row <= dataEnd && !filterHiddenRows.has(row)) manualHidden++;
+        });
+        // 因筛选而隐藏（且当前确实隐藏）的行：从筛选前总行数中扣除即得可见行数
+        let hiddenByFilter = 0;
+        filterHiddenRows.forEach((row) => {
+            if (row >= dataStart && row <= dataEnd && hiddenRows.has(row)) hiddenByFilter++;
+        });
+
+        const allRow = Math.max(0, totalRows - manualHidden);
+        const row = Math.max(0, allRow - hiddenByFilter);
+        return { label: '筛选出', value: `${row}/${allRow}` };
     }
 
     /**
