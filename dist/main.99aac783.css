@@ -1313,12 +1313,69 @@ html, body {
   background-color: rgba(0, 0, 0, 0.1);
 }
 
+/* 面板容器：填满下拉菜单（拖拽调整尺寸后，内容随宽高一起伸展）。
+   弹性列布局让「输入框 / 清单 / 按钮」各就各位，清单负责吃掉多余高度 */
 .filter-container {
   position: relative;
-  display: block;
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: vertical;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: column;
+      -ms-flex-direction: column;
+          flex-direction: column;
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  box-sizing: border-box;
+  min-height: 0;
   background-color: whitesmoke;
   padding: 6px;
   z-index: 6;
+  /* 页签条按内容高度；nav.scss 的 height:100% 在容器有确定高度时会吃掉整个高度 */
+}
+.filter-container > .nav-panel {
+  -webkit-box-flex: 0;
+  -webkit-flex: 0 0 auto;
+      -ms-flex: 0 0 auto;
+          flex: 0 0 auto;
+  height: auto;
+}
+.filter-container {
+  /* 导航内容区吃满剩余高度；默认（菜单未指定高度）时仍按内容自然撑开 */
+}
+.filter-container > .nav-content {
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+}
+.filter-container {
+  /* 页签内容项改为纵向弹性布局：清单（.filter-tips）吸收多余高度 */
+}
+.filter-container > .nav-content > .content-item:not([hidden]) {
+  display: -webkit-box;
+  display: -webkit-flex;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-orient: vertical;
+  -webkit-box-direction: normal;
+  -webkit-flex-direction: column;
+      -ms-flex-direction: column;
+          flex-direction: column;
+  height: auto;
+  min-height: 0;
+}
+.filter-container > .nav-content > .content-item:not([hidden]) > .filter-tips {
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
 }
 
 input.filter-input {
@@ -1410,12 +1467,18 @@ input.filter-input:disabled, input.filter-input[readonly] {
           transform: rotate(45deg);
 }
 
+/* 默认宽度在原来 240px 的基础上 +28px（268px）：
+   保证悬停时的「仅筛选此项」五个字能完整显示，不被内容文字挤掉 */
 .filter-tips {
   font-size: 14px;
   color: #6c757d;
-  min-width: 240px;
+  min-width: 268px;
   min-height: 360px;
   max-height: 360px;
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 auto;
+      -ms-flex: 1 1 auto;
+          flex: 1 1 auto;
   overflow-y: auto;
   margin: 0 10px 10px 10px;
   border-left: 1px solid #ccc;
@@ -1566,12 +1629,84 @@ input.filter-input:disabled, input.filter-input[readonly] {
   -webkit-flex-direction: column;
       -ms-flex-direction: column;
           flex-direction: column;
-  min-width: 240px;
+  min-width: 268px;
   min-height: 170px;
   background-color: #fff;
   padding: 6px;
   border: 1px solid #ccc;
   border-radius: 0.375rem;
+}
+
+/* 下拉面板八向拖拽手柄：四条边 + 四个顶点。
+   手柄挂在菜单容器（position: absolute）上，因此绝对定位以菜单盒子为基准 */
+.filter-resize {
+  position: absolute;
+  /* 高于 .filter-container 的 z-index: 6，否则手柄会被面板本体盖住而收不到指针事件 */
+  z-index: 20;
+}
+
+.filter-resize-n,
+.filter-resize-s {
+  left: 6px;
+  right: 6px;
+  height: 5px;
+  cursor: ns-resize;
+}
+
+.filter-resize-n {
+  top: 0;
+}
+
+.filter-resize-s {
+  bottom: 0;
+}
+
+.filter-resize-e,
+.filter-resize-w {
+  top: 6px;
+  bottom: 6px;
+  width: 5px;
+  cursor: ew-resize;
+}
+
+.filter-resize-e {
+  right: 0;
+}
+
+.filter-resize-w {
+  left: 0;
+}
+
+.filter-resize-nw,
+.filter-resize-ne,
+.filter-resize-sw,
+.filter-resize-se {
+  width: 9px;
+  height: 9px;
+}
+
+.filter-resize-nw {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+}
+
+.filter-resize-ne {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+}
+
+.filter-resize-sw {
+  bottom: 0;
+  left: 0;
+  cursor: nesw-resize;
+}
+
+.filter-resize-se {
+  bottom: 0;
+  right: 0;
+  cursor: nwse-resize;
 }
 /*!************************************************************************************************************************************************************************************************!*\
   !*** css ./node_modules/css-loader/dist/cjs.js!./node_modules/postcss-loader/dist/cjs.js??ruleSet[1].rules[2].use[2]!./node_modules/sass-loader/dist/cjs.js!./src/core/style/copyMarquee.scss ***!

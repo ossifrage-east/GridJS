@@ -98,6 +98,7 @@ export const ASSISTANT = {
     FILTER_CONFIRM_CLASS_NAME: 'filter-confirm',
     FILTER_CANCEL_CLASS_NAME: 'filter-cancel',
     FILTER_COLOR_CONTAINER_CLASS_NAME: 'filter-color-container',
+    FILTER_RESIZE_CLASS_NAME: 'filter-resize',
     HIDDEN_CLASS_NAME: 'hidden',
     HIDDEN_CONTAINER_CLASS_NAME: 'hidden-container',
 }

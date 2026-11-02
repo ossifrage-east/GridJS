@@ -16,6 +16,25 @@ import '../style/filter.scss';
 import { Cell } from "../dataArchitecture/cell";
 import { compareMixedText } from "../dataArchitecture/matrixSorter";
 
+/** 下拉面板可拖拽缩放到的最小宽 / 高（像素）：再小就会出现横向滚动或挤掉按钮 */
+const RESIZE_MIN_WIDTH = 304;
+const RESIZE_MIN_HEIGHT = 260;
+
+/** 八个拖拽方向：四条边 + 四个顶点 */
+const RESIZE_DIRECTIONS = ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'] as const;
+
+/** 拖拽调整下拉面板尺寸的起点快照 */
+interface ResizeSession {
+    host: HTMLElement;
+    dir: string;
+    startX: number;
+    startY: number;
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+}
+
 /**
  * 筛选组件初始化选项
  * @property {HTMLElement} parentElement - 筛选组件的挂载父元素，筛选根节点会被追加到该元素内
@@ -62,6 +81,14 @@ export class Filter {
     private container: HTMLDivElement;
     /** 「按内容」页签的筛选结果提示区，展示当前列去重后的内容清单；**懒构建** */
     private tips: HTMLDivElement;
+    /** 本次打开时承载筛选面板的下拉菜单容器（关闭时据此复位尺寸） */
+    private menuHost: HTMLElement | null = null;
+    /** 当前拖拽调整下拉面板尺寸的会话（null = 未在拖拽） */
+    private resizeSession: ResizeSession | null = null;
+    /** 菜单关闭回调：清掉本次拖拽设置的尺寸，避免影响后续其它菜单 */
+    private readonly handleMenuClose = (): void => {
+        this.resetMenuSize();
+    };
     /**
      * 面板构建 Promise（null = 尚未构建）
      *
@@ -162,6 +189,9 @@ export class Filter {
 
         this.data = options.data;
         this.menu = options.menu;
+        // 菜单是所有筛选面板共用的同一个实例：关闭时把本实例拖拽出来的
+        // 宽高内联值复位，否则下一个菜单（右键菜单等）会沿用这份尺寸
+        this.menu.on('close', this.handleMenuClose);
         this.setArrow();
         this.setupEventListeners();
     }
@@ -364,6 +394,7 @@ export class Filter {
     public destroy(): void {
         this.filter.removeEventListener('click', this.boundHandleClick);
         this.data.off(DataEvents.VALUES_CHANGED, this.handleValuesChanged);
+        this.menu.off('close', this.handleMenuClose);
         this.filter.remove();
         if (this.navigator) this.navigator.destroy();
         // 从筛选条件注册表中移除本列条件
@@ -479,9 +510,136 @@ export class Filter {
         if (this.filter.style.display === 'none') return;
         this.menu.openMenu(this.filter);
         this.menu.addMenuElement(this.container);
+        // 记录承载面板的下拉菜单容器，并挂上八向拖拽手柄（关闭时随菜单内容一并移除）
+        this.menuHost = this.container.parentElement;
+        if (this.menuHost) this.attachResizeHandles(this.menuHost);
         // 每次打开时默认显示「按内容」页签，并按当前单元格所在列刷新内容清单
         this.navigator.selectItem('按内容');
         this.updateContentTips();
+    }
+
+    /**
+     * 复位下拉面板尺寸（菜单关闭时调用）
+     *
+     * 拖拽调整的宽高是写在菜单容器上的内联值，而该容器由所有菜单共用；
+     * 不复位的话，紧接着弹出的右键菜单会沿用上一次筛选面板的尺寸。
+     * 同时清掉内容清单的临时高度限制，让下次打开回到默认的 360px 上限。
+     * @private
+     * @returns {void}
+     */
+    private resetMenuSize(): void {
+        const host = this.menuHost;
+        if (host) {
+            host.style.width = '';
+            host.style.height = '';
+            host.style.maxHeight = '';
+            host.style.userSelect = '';
+        }
+        if (this.tips) {
+            this.tips.style.maxHeight = '';
+            this.tips.style.minHeight = '';
+        }
+        this.resizeSession = null;
+    }
+
+    /**
+     * 在下拉菜单容器上挂八个拖拽手柄（四边 + 四顶点）
+     *
+     * 手柄挂在菜单容器而非筛选容器上：菜单是绝对定位的盒子，
+     * 直接改它的 left/top/width/height 才能实现「拖左边 → 右边不动」等
+     * 四向缩放语义；筛选容器则用 flex 填满菜单，清单随高度一起伸展。
+     * @private
+     * @param {HTMLElement} host - 下拉菜单容器
+     * @returns {void}
+     */
+    private attachResizeHandles(host: HTMLElement): void {
+        for (const dir of RESIZE_DIRECTIONS) {
+            const handle = createDiv({
+                className: `${ASSISTANT.FILTER_RESIZE_CLASS_NAME} ${ASSISTANT.FILTER_RESIZE_CLASS_NAME}-${dir}`,
+            });
+            handle.addEventListener('pointerdown', (e) => this.startResize(e, host, dir));
+            host.appendChild(handle);
+        }
+    }
+
+    /**
+     * 开始拖拽调整下拉面板尺寸
+     * @private
+     * @param {PointerEvent} e - pointerdown 事件
+     * @param {HTMLElement} host - 下拉菜单容器
+     * @param {string} dir - 拖拽方向（n / s / e / w / ne / nw / se / sw）
+     * @returns {void}
+     */
+    private startResize(e: PointerEvent, host: HTMLElement, dir: string): void {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.resizeSession = {
+            host,
+            dir,
+            startX: e.clientX,
+            startY: e.clientY,
+            left: parseFloat(host.style.left) || 0,
+            top: parseFloat(host.style.top) || 0,
+            width: host.offsetWidth,
+            height: host.offsetHeight,
+        };
+        // 拖上下边时解除菜单默认的 max-height 上限，并让清单填满新增高度
+        if (dir.includes('n') || dir.includes('s')) {
+            host.style.maxHeight = 'none';
+            if (this.tips) {
+                this.tips.style.maxHeight = 'none';
+                this.tips.style.minHeight = '120px';
+            }
+        }
+        host.style.userSelect = 'none';
+        // 指针捕获到菜单容器：拖到面板外也能继续跟随
+        host.setPointerCapture?.(e.pointerId);
+        const onMove = (ev: PointerEvent): void => this.moveResize(ev);
+        const onEnd = (): void => {
+            host.removeEventListener('pointermove', onMove);
+            host.removeEventListener('pointerup', onEnd);
+            host.removeEventListener('pointercancel', onEnd);
+            host.style.userSelect = '';
+            this.resizeSession = null;
+        };
+        host.addEventListener('pointermove', onMove);
+        host.addEventListener('pointerup', onEnd);
+        host.addEventListener('pointercancel', onEnd);
+    }
+
+    /**
+     * 拖拽过程中按位移换算新的宽高（西 / 北向同时平移左上角，保证对边不动）
+     * @private
+     * @param {PointerEvent} e - pointermove 事件
+     * @returns {void}
+     */
+    private moveResize(e: PointerEvent): void {
+        const session = this.resizeSession;
+        if (!session) return;
+        const { host, dir } = session;
+        const dx = e.clientX - session.startX;
+        const dy = e.clientY - session.startY;
+        let width = session.width;
+        let height = session.height;
+        let left = session.left;
+        let top = session.top;
+
+        if (dir.includes('e')) width = session.width + dx;
+        if (dir.includes('w')) width = session.width - dx;
+        if (dir.includes('s')) height = session.height + dy;
+        if (dir.includes('n')) height = session.height - dy;
+
+        width = Math.max(RESIZE_MIN_WIDTH, width);
+        height = Math.max(RESIZE_MIN_HEIGHT, height);
+        // 触到最小尺寸后，左 / 上边界不再继续跟随指针（右 / 下边界保持不动）
+        if (dir.includes('w')) left = session.left + (session.width - width);
+        if (dir.includes('n')) top = session.top + (session.height - height);
+
+        host.style.width = `${width}px`;
+        host.style.height = `${height}px`;
+        if (dir.includes('w')) host.style.left = `${left}px`;
+        if (dir.includes('n')) host.style.top = `${top}px`;
     }
 
     /**
@@ -621,6 +779,8 @@ export class Filter {
                 className: ASSISTANT.FILTER_TIPS_TEXT_CLASS_NAME,
             });
             textSpan.textContent = text;
+            // 清单行文字超长时会被省略号截断：悬停显示完整内容的原生提示
+            textSpan.title = text;
             const countSpan = createDiv({
                 className: ASSISTANT.FILTER_TIPS_COUNT_CLASS_NAME,
             });
