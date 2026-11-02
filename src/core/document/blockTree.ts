@@ -128,6 +128,14 @@ export interface DocBlock {
     listStyle?: DocListStyle;
     /** `listItem` / `quote` 的额外缩进级数 */
     indent?: number;
+    /**
+     * 首行缩进（单位：字符数，可带小数）
+     *
+     * 与 {@link DocBlock.indent}（整段左缩进）不是一回事：只有第一行往里让，
+     * 折行后的第二行起仍从左边起——中文公文里「空两格」就是这个属性。
+     * 不并存进 `Char`：首行缩进是段落属性，写进字符会让「改段落」变成「逐字改字号」。
+     */
+    firstLineIndent?: number;
     /** 容器块的子块（本版用于表格单元格内的段落） */
     children?: DocBlock[];
     /** `table` 的行列：每行若干单元格块 */
@@ -456,6 +464,7 @@ export function cloneBlock(block: DocBlock): DocBlock {
     if (block.level !== undefined) copy.level = block.level;
     if (block.listStyle !== undefined) copy.listStyle = block.listStyle;
     if (block.indent !== undefined) copy.indent = block.indent;
+    if (block.firstLineIndent !== undefined) copy.firstLineIndent = block.firstLineIndent;
     if (block.children) copy.children = block.children.map((child) => cloneBlock(child));
     if (block.rows) copy.rows = block.rows.map((row) => row.map((cell) => cloneBlock(cell)));
     if (block.imageRef) copy.imageRef = { ...block.imageRef };

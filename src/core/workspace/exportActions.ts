@@ -39,20 +39,21 @@ export abstract class ExportActionsBase extends ContentBridgeBase {
             // （`test_sample.xls` 与 `test_sample.xlsx` 都 → `test_sample.grid`），
             // 由文件树在根目录内判冲突并给出加序号后的名称（`test_sample1.grid`），
             // 保证每个打开的文件都有独立的树节点与存档，不会互相覆盖
-            resolveName: (nativeName: string) => this.fileTree.resolveOpenedFileName(nativeName),
-            // 从本机打开的文件只有文件名（浏览器不暴露所在目录），因此它是
-            // 根目录下的文件 —— 与「路径」语义天然一致（根目录下路径 ≡ 文件名）
-            onOpened: (fileName: string) => {
+            resolveName: (nativeName: string, folderPath: string) => this.fileTree.resolveOpenedFileName(nativeName, folderPath),
+            // 打开的文件由右键「打开」的目标目录决定（右键文件夹 → 该文件夹；
+            // 右键文件 → 与它同目录；从主页面拖放 / 顶部按钮打开 → 根目录），
+            // 参数是**完整路径**，树与存档都按路径登记，因此不同目录可同名共存
+            onOpened: (path: string) => {
                 // 打开的文件即「当前文件」：登记到树中并高亮，刷新后据此恢复
-                this.fileTree.showActivedFile(fileName);
-                this.persistActivedFile(fileName);
-                this.rememberOpenedFile(fileName);
-                this.data.messageBox.success(`已打开 ${fileName}`);
+                this.fileTree.showActivedFile(path);
+                this.persistActivedFile(path);
+                this.rememberOpenedFile(path);
+                this.data.messageBox.success(`已打开 ${path}`);
             },
             onError: (message: string) => this.data.messageBox.error(message),
             // 文档类文件（docx / doc / md / txt）落到文档工作区：解析结果是块树，
             // 先写进 docs 仓再装载，使「刚打开的文件」与「刷新后恢复的文件」走同一条路
-            onDocument: (fileName: string, snapshot: DocSnapshot) => this.openParsedDocument(fileName, snapshot),
+            onDocument: (path: string, snapshot: DocSnapshot) => this.openParsedDocument(path, snapshot),
         });
         document.body.appendChild(this.fileOpener.getFileInput());
 
@@ -62,7 +63,7 @@ export abstract class ExportActionsBase extends ContentBridgeBase {
         this.fileTree = new FileTree({
             menu: this.menu,
             nodes: savedNodes ?? undefined,
-            onOpen: () => this.fileOpener.pickAndOpen(),
+            onOpen: (folderPath: string) => this.fileOpener.pickAndOpen(folderPath),
             // 双击树节点：切换到该文件（已在主页面显示时内容不变，见 activateFile）
             onActivate: (path: string) => this.activateFile(path),
             // 树结构/名称/路径变化即落库：下次刷新据此还原「刷新前的文件」

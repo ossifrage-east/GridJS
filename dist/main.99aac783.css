@@ -15,7 +15,7 @@
   src:  url(assets/626041596f.eot?zbrbpb#iefix) format('embedded-opentype'),
     url(assets/9db920c9a3.ttf?zbrbpb) format('truetype'),
     url(assets/d1cb4d386b.woff?zbrbpb) format('woff'),
-    url(assets/459f15dab3.svg?zbrbpb#gridjs) format('svg');
+    url(assets/e56c7ffe50.svg?zbrbpb#gridjs) format('svg');
   font-weight: normal;
   font-style: normal;
   font-display: block;
@@ -3357,14 +3357,34 @@ div {
   margin: 0 auto;
 }
 
+/* 纸张背景层：一页一张白卡，卡与卡之间露出工作区的灰底。
+   卡的位置 / 尺寸由 DocView.syncPageCards 按「纸 × 缩放」逐页写入内联样式，
+   这里只管外观（白纸 + 纸张阴影），与正文的布局完全无关。 */
+.doc-pages {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.doc-page-card {
+  position: absolute;
+  left: 0;
+  background: #ffffff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.16);
+}
+
 /* ————— 纸张 ————— */
 .doc-page {
+  /* 相对定位 + z-index：背景纸卡是绝对定位的，纸不抬层就会被纸卡盖住 */
+  position: relative;
+  z-index: 1;
   width: 794px;
   min-height: 1123px;
   padding: 96px 64px;
   box-sizing: border-box;
-  background: #ffffff;
-  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.16);
+  /* 纸本身透明：白底与阴影由下面那一排纸卡（.doc-pages）画出来，
+     这样「一页一张纸」的分页视图才画得出来（见 DocView.syncPageCards） */
+  background: transparent;
   color: #333333;
   font-family: "HarmonyOS Sans SC Regular", "Microsoft YaHei", sans-serif;
   font-size: 16px;
@@ -3374,6 +3394,9 @@ div {
 .doc-blocks {
   outline: none;
   min-height: 400px;
+  /* 文字区用自带的黑色 I 型光标：系统 I 型光标在部分主题下是白色，
+     压在白色纸面上几乎看不见（图见 assets/images/cursor/text-black.svg） */
+  cursor: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' width='16' height='24' viewBox='0 0 16 24'%3e %3cg fill='%23111111'%3e %3crect x='3' y='1' width='10' height='2'/%3e %3crect x='3' y='21' width='10' height='2'/%3e %3crect x='7' y='1' width='2' height='22'/%3e %3c/g%3e %3c/svg%3e") 8 12, text;
 }
 .doc-blocks:focus {
   outline: none;
@@ -3386,19 +3409,9 @@ div {
 }
 
 /* 分页留白：把下一段顶到下一页的正文起点。
-   分页线用 ::before 画在**上一页纸的底边**（留白顶端往上 margin 处）——
-   用 border 会多占 1px 把内容顶偏，用绝对定位的背景线不影响任何布局。 */
+   它本身不可见（页与页的灰缝由背景纸卡画出来），只负责把内容推下去。 */
 .doc-page-gap {
   position: relative;
-}
-.doc-page-gap::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: -webkit-calc(-1 * var(--doc-break-offset, 0px));
-  top: calc(-1 * var(--doc-break-offset, 0px));
-  border-top: 1px dashed #b0b0b0;
 }
 
 .doc-block {
@@ -3565,6 +3578,12 @@ div {
   word-break: break-word;
   overflow: auto;
 }
+.doc-markdown-stage {
+  /* 源码输入层与正文区同一支黑色 I 型光标（系统白色 I 型在纸上看不清） */
+}
+.doc-markdown-stage .doc-markdown-input {
+  cursor: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' width='16' height='24' viewBox='0 0 16 24'%3e %3cg fill='%23111111'%3e %3crect x='3' y='1' width='10' height='2'/%3e %3crect x='3' y='21' width='10' height='2'/%3e %3crect x='7' y='1' width='2' height='22'/%3e %3c/g%3e %3c/svg%3e") 8 12, text;
+}
 .doc-markdown-stage .doc-markdown-highlight {
   color: #333333;
   pointer-events: none;
@@ -3631,12 +3650,6 @@ div {
   overflow: hidden;
 }
 
-/* 打印时页边距由每页壳的 padding 画出，引擎不再另加（见 docView.print 的 @page 规则） */
-@media print {
-  .doc-page-gap::before {
-    display: none;
-  }
-}
 /* ————— 状态提示（无文档时的占位） ————— */
 .doc-empty {
   display: -webkit-box;

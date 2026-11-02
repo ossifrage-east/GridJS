@@ -433,6 +433,13 @@ export const DOC_PRINT_SCROLL_PADDING = 48;
 /** 分页留白块的属性名（同步回块树时据此跳过它） */
 export const DOC_PAGE_GAP_ATTR = 'data-page-gap';
 /**
+ * 屏幕分页显示时，相邻两张「纸」之间露出的灰色间隙（CSS 像素）
+ *
+ * 它不是布局距离（内容仍按「一页接一页」的纸高排），只是把每页纸卡的底边
+ * 收进来一点，让页与页之间露出工作区的灰底 —— 即 Word 分页视图的样子。
+ */
+export const DOC_PAGE_STACK_GAP = 18;
+/**
  * 逐块排页的块数上限
  *
  * 超过它就退化成「只算页数、不插留白」：分页是显示层的东西，不该把输入延迟拖下水。

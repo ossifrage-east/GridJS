@@ -202,7 +202,9 @@ export class App extends ExportActionsBase {
                 };
             },
             onChangeDocPage: (key, value) => this.docWorkspace?.setPageSetup(key, value),
-            onPrintDoc: () => this.docWorkspace?.print(),
+            // 「页面」页签的按钮打开的是打印预览（与表格「页面」同一口径），
+            // 真正开始打印由预览面板里的「打印」按钮触发
+            onPrintPreviewDoc: () => this.docWorkspace?.printPreview(),
         });
         const quickAccess = new QuickAccess({  // 快速访问分区
             parentElement: this.toolbar.getElements().tabs,

@@ -75,8 +75,8 @@ export interface ToolbarOptions {
     getDocPageSetup?: () => DocPageSetupView;
     /** 改一项文档页面设置（装配层写回文档元数据并重排纸张） */
     onChangeDocPage?: (key: DocPageKey, value: string) => void;
-    /** 打印当前文档 */
-    onPrintDoc?: () => void;
+    /** 打开当前文档的打印预览 */
+    onPrintPreviewDoc?: () => void;
 }
 
 /** 分区描述：元素 + 菜单里显示的名字（紧凑模式下作为「一级菜单」的标签） */
@@ -145,8 +145,8 @@ export class Toolbar extends EventEmitter {
     private readonly getDocPageSetup?: () => DocPageSetupView;
     /** 文档页面设置变更 */
     private readonly onChangeDocPage?: (key: DocPageKey, value: string) => void;
-    /** 打印文档 */
-    private readonly onPrintDoc?: () => void;
+    /** 文档打印预览 */
+    private readonly onPrintPreviewDoc?: () => void;
     /**
      * 根分类名 → 页签元素 / 分类清单标签
      *
@@ -176,7 +176,7 @@ export class Toolbar extends EventEmitter {
         this.isMarkdownActive = options.isMarkdownActive;
         this.getDocPageSetup = options.getDocPageSetup;
         this.onChangeDocPage = options.onChangeDocPage;
-        this.onPrintDoc = options.onPrintDoc;
+        this.onPrintPreviewDoc = options.onPrintPreviewDoc;
         this.container = createDiv({className: TOOLBAR_CLASS_NAME.CONTAINER});
         options.parentElement.appendChild(this.container);
 
@@ -255,7 +255,7 @@ export class Toolbar extends EventEmitter {
             menu: this.menu,
             getSetup: () => this.getDocPageSetup?.() ?? { orientation: 'portrait', paperSize: 'A4', marginPreset: 'normal', scaleMode: 'none' },
             onChange: (key, value) => this.onChangeDocPage?.(key, value),
-            onPrint: () => this.onPrintDoc?.(),
+            onPrintPreview: () => this.onPrintPreviewDoc?.(),
         });
 
         this.sections = {

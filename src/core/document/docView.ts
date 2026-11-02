@@ -30,6 +30,7 @@ import {
     DOC_MARGIN_PRESETS,
     DOC_MAX_PAGINATE_BLOCKS,
     DOC_PAGE_GAP_ATTR,
+    DOC_PAGE_STACK_GAP,
     DOC_PAPER_SIZES,
     DOC_ZOOM_PERCENT_MAX,
     DOC_ZOOM_PERCENT_MIN,
@@ -129,6 +130,15 @@ export class DocView {
     /** 纸张槽位（尺寸 = 纸 × 缩放；纸在其中以 `top left` 为原点缩放） */
     private readonly slot: HTMLDivElement;
 
+    /**
+     * 纸张背景层（一页一张白卡，卡间露出灰缝）
+     *
+     * 正文是**一条连续流**（分页只在流里插留白），所以纸本身是一整张长纸；
+     * 屏幕上要像 Word 那样「一页一张纸」，就在纸的下面铺一排与正文同宽的纸卡，
+     * 纸卡彼此错开 {@link DOC_PAGE_STACK_GAP} 像素，页与页之间于是露出灰底。
+     */
+    private readonly pagesLayer: HTMLDivElement;
+
     /** 纸张 */
     private readonly page: HTMLDivElement;
 
@@ -174,6 +184,7 @@ export class DocView {
         this.rulerH.appendChild(this.rulerHInner);
         this.rulerV.appendChild(this.rulerVInner);
         this.slot = createDiv({ className: 'doc-page-slot' });
+        this.pagesLayer = createDiv({ className: 'doc-pages' });
         this.page = createDiv({ className: 'doc-page' });
         this.blocksEl = createDiv({ className: 'doc-blocks' });
         this.blocksEl.setAttribute('contenteditable', 'true');
@@ -182,6 +193,8 @@ export class DocView {
         this.blocksEl.setAttribute('aria-multiline', 'true');
 
         this.page.appendChild(this.blocksEl);
+        // 背景层在前、纸在后：纸的底色是透明的，白卡从纸的下面透出来
+        this.slot.appendChild(this.pagesLayer);
         this.slot.appendChild(this.page);
         this.scroller.appendChild(this.slot);
         options.parentElement.appendChild(this.scroller);
@@ -308,11 +321,44 @@ export class DocView {
         const height = this.page.offsetHeight;
         if (width > 0) this.slot.style.width = `${width * z}px`;
         if (height > 0) this.slot.style.height = `${height * z}px`;
+        // 纸卡的步长取**单页**纸高（page 的高度是「N 页叠起来」的整叠高度）
+        if (width > 0) this.syncPageCards(width, this.pageGeometry().height, z);
         buildRuler(this.rulerHInner, width, z, true);
         // 纵向量的是「整叠纸」：分页后纸会被撑到 N 页高，标尺要跟着长
         buildRuler(this.rulerVInner, height, z, false);
         // 缩放 / 换纸之后滚动位置可能已经越界，刻度条要按新的 scrollLeft/Top 归位
         this.syncRulers();
+    }
+
+    /**
+     * 重排「一页一张纸」的背景纸卡
+     *
+     * 正文是一条连续流（分页只在流里插留白），因此纸本身是**一张整纸**；
+     * 这里在纸下面铺一排白卡，每张卡比纸高少一截 {@link DOC_PAGE_STACK_GAP}，
+     * 卡与卡之间就露出工作区的灰底（页与页看起来是分开的两张纸，与 Word 一致）。
+     *
+     * 纸卡不参与布局、不进模型，纯装饰：
+     * - 位置 / 尺寸全部按**缩放后的像素**现算（纸是 `transform: scale`，纸卡不在纸里，吃不到这个缩放）；
+     * - 页数不变时只改已有纸卡的尺寸，避免每帧重建 N 个节点。
+     * @param width - 纸张宽（布局尺寸，未缩放）
+     * @param paperHeight - 单页纸高（布局尺寸，未缩放）
+     * @param z - 当前缩放比例
+     * @private
+     */
+    private syncPageCards(width: number, paperHeight: number, z: number): void {
+        const pages = Math.max(1, this.pageCountValue);
+        const layer = this.pagesLayer;
+        while (layer.childElementCount > pages) layer.removeChild(layer.lastElementChild as HTMLElement);
+        while (layer.childElementCount < pages) layer.appendChild(createDiv({ className: 'doc-page-card' }));
+        const cardWidth = `${width * z}px`;
+        const cardHeight = `${Math.max(1, (paperHeight - DOC_PAGE_STACK_GAP) * z)}px`;
+        const step = paperHeight * z;
+        for (let i = 0; i < pages; i++) {
+            const card = layer.children[i] as HTMLElement;
+            card.style.width = cardWidth;
+            card.style.height = cardHeight;
+            card.style.top = `${i * step}px`;
+        }
     }
 
     /**
@@ -585,9 +631,6 @@ export class DocView {
                 spacer.setAttribute(DOC_PAGE_GAP_ATTR, String(target));
                 spacer.setAttribute('contenteditable', 'false');
                 spacer.style.height = `${gap}px`;
-                // 分页线画在**上一页纸的底边**上（留白的顶端再往上 margin 处），
-                // 交给样式表用这个变量定位，省得把「纸的边距」再算一遍
-                spacer.style.setProperty('--doc-break-offset', `${margin}px`);
                 this.blocksEl.insertBefore(spacer, blocks[i]);
                 shift += gap;
             }
@@ -675,6 +718,16 @@ export class DocView {
             // 一旦重渲染（撤销、切视图、重新打开）就整段弹回左边。
             el.style.marginLeft = `${block.indent * DOC_INDENT_STEP_PX}px`;
         }
+        if (block.firstLineIndent) {
+            el.setAttribute('data-first-line', String(block.firstLineIndent));
+            // 首行缩进存的是**字符数**，渲染时按块内首字符字号折成像素：
+            // 1 字符 = 该字号下的 1em（16px 正文即 16px，16pt 正文即 21.3px）。
+            // 与 `data-indent` 同理，样式必须在这里还原，否则重渲染后首行缩进会丢。
+            el.style.textIndent = `${block.firstLineIndent * firstCharPx(block)}px`;
+        }
+        // 空格宽度：块级默认值兜底「直接落在块元素下的文本」（空段落里刚打的字），
+        // 每个 run 段另有自己的 word-spacing（见 renderInline），会把这里的值盖掉
+        this.applySpaceWidth(el, block);
         if (block.align) this.applyBlockAlign(el, block.align);
         // 块内边距承担列表缩进：用 CSS 变量把「层级」传给样式表，
         // 而不是在 DOM 里插入项目符号文本（插文本会污染模型）
@@ -763,12 +816,16 @@ export class DocView {
     private renderInline(block: DocBlock, mono: boolean): DocumentFragment {
         const fragment = document.createDocumentFragment();
         const chars = block.chars ?? [];
+        // 空格宽度按「所在文字的字符宽度」算：汉字段里一个空格占一个汉字宽（全角），
+        // 拉丁段里占半个（半角）。先逐字符标好类别，切段时把类别并进 run 签名，
+        // 于是「中文 English 中文」这种同一样式混排也会切成不同的段。
+        const classes = spaceWidthClasses(chars);
         let index = 0;
         while (index < chars.length) {
             const span = this.spanAt(block, index);
-            const key = runKey(chars[index], span, mono);
+            const key = `${runKey(chars[index], span, mono)}|${classes[index]}`;
             let end = index + 1;
-            while (end < chars.length && runKey(chars[end], this.spanAt(block, end), mono) === key) {
+            while (end < chars.length && `${runKey(chars[end], this.spanAt(block, end), mono)}|${classes[end]}` === key) {
                 end += 1;
             }
             let text = '';
@@ -776,6 +833,9 @@ export class DocView {
 
             const holder = document.createElement('span');
             this.applyRunStyle(holder, chars[index], span, mono);
+            // 只加「一个字符宽 − 空格自然宽」的差额（word-spacing）：改的是空格自己的步进宽度，
+            // 换行机会、光标、输入法都不受影响。把空格换成撑宽的盒子会吃掉断行点，不能这么做。
+            if (text.indexOf(' ') >= 0) holder.style.wordSpacing = spaceWordSpacingOfText(chars.slice(index, end), mono);
             if (text.indexOf('\n') >= 0) {
                 const lines = text.split('\n');
                 for (let i = 0; i < lines.length; i++) {
@@ -825,6 +885,22 @@ export class DocView {
             el.style.color = char.fontColor ?? '#1a73e8';
             el.style.cursor = 'pointer';
         }
+    }
+
+    /**
+     * 给块元素写「块级空格宽度」
+     *
+     * 渲染出的每个 run 段都有自己的 `word-spacing`，块级值只兜底一种情况：
+     * 空段落里刚打的字直接挂在块元素下（没有 run 段可继承），此时靠块级值让空格立刻是「一格」宽。
+     * @param el - 块元素
+     * @param block - 块
+     */
+    private applySpaceWidth(el: HTMLElement, block: DocBlock): void {
+        if (block.type === 'table') return;
+        const value = spaceWordSpacingOfText(block.chars ?? [], block.type === 'code');
+        // 只在值真的变了才写：同步是一帧一次、且要遍历全部块，
+        // 每块都写一次内联样式会让「每敲一个字」都触发一轮全篇样式重算
+        if (el.style.wordSpacing !== value) el.style.wordSpacing = value;
     }
 
     /**
@@ -1005,7 +1081,12 @@ export class DocView {
             // 分页留白不是内容：读进模型会变成一段空段落（表现为「每存一次多一行」）
             if (el.hasAttribute(DOC_PAGE_GAP_ATTR)) continue;
             const block = this.readBlock(el);
-            if (block) blocks.push(block);
+            if (block) {
+                blocks.push(block);
+                // 文字变了，空格的「一格宽」也要跟着这一块的字号 / 语种重算
+                // （只改 word-spacing 这种纯呈现属性，不动节点，光标与输入法不受影响）
+                this.applySpaceWidth(el, block);
+            }
         }
         if (blocks.length === 0) return;
         this.store.update(blocks, label, mode);
@@ -1037,6 +1118,9 @@ export class DocView {
         }
         const indent = parseInt(el.getAttribute('data-indent') ?? '', 10);
         if (Number.isFinite(indent) && indent > 0) block.indent = indent;
+        // 首行缩进（字符数）：属性是唯一来源，样式里的 px 只是它的投影
+        const firstLine = parseFloat(el.getAttribute('data-first-line') ?? '');
+        if (Number.isFinite(firstLine) && firstLine > 0) block.firstLineIndent = firstLine;
 
         const align = this.readBlockAlign(el);
         if (align) block.align = align;
@@ -1463,6 +1547,16 @@ export class DocView {
         if (!this.blocksEl.contains(range.commonAncestorContainer)) return;
 
         if (!style) {
+            // 【多行文本按行拆成多个块】不能整段塞进一个块：分页是「整块不跨页」，
+            // 一个装着 N 行的块会被整块推到下一页，当前页剩下的空白就白搭了。
+            // 拆成「一行一个块」后，分页可以在行间断开 —— 与 Enter 换行的模型一致。
+            const lines = text.replace(/\r\n?/g, '\n').split('\n');
+            const caret = lines.length > 1 ? this.splitIntoBlocks(range, lines) : null;
+            if (caret) {
+                this.sync('粘贴', 'single', false);
+                this.restoreCaret(caret);
+                return;
+            }
             // 无待生效样式：交给浏览器（保留继承样式与撤销栈），再同步模型
             range.deleteContents();
             range.insertNode(document.createTextNode(text));
@@ -1491,6 +1585,56 @@ export class DocView {
         selection.removeAllRanges();
         selection.addRange(after);
         this.sync('输入', 'coalesce', false);
+    }
+
+    /**
+     * 把多行文本按行拆成多个块，插在当前选区处（粘贴多行时用）
+     *
+     * 拆块的语义与 Word 一致：光标**前**的文字留在原块并与第一行拼接，
+     * 光标**后**的文字搬到最后一个新块（跟在最后一行之后），光标停在粘贴内容末尾。
+     *
+     * 表格 / 代码块 / 图片 / 分割线是「整块语义」的宿主（拆开就不再是一个表格或一段代码），
+     * 不在这里拆，返回 null 交给调用方按原样整段插入。
+     * @param range - 当前选区（可能非折叠，先删掉选区内容再插入）
+     * @param lines - 已按行拆好的文本
+     * @returns 粘贴后光标应落的位置；未拆块时为 null
+     * @private
+     */
+    private splitIntoBlocks(range: Range, lines: string[]): DocCaret | null {
+        const host = this.closestBlock(range.startContainer);
+        if (!host) return null;
+        const type = host.getAttribute('data-type') ?? 'paragraph';
+        if (type === 'table' || type === 'code' || type === 'image' || type === 'hr') return null;
+
+        range.deleteContents();
+        // 光标之后的节点整段摘出来，最后接到末块末尾（前缀…粘贴内容…后缀）
+        const tail = document.createRange();
+        tail.selectNodeContents(host);
+        tail.setStart(range.startContainer, range.startOffset);
+        const after = tail.extractContents();
+
+        if (lines[0]) range.insertNode(document.createTextNode(lines[0]));
+
+        // 一行一个块：克隆宿主的块级属性（类型 / 级别 / 列表 / 缩进 / 对齐）但换新 id
+        let anchor: HTMLElement = host;
+        let caretBlockId = '';
+        for (let i = 1; i < lines.length; i++) {
+            const el = host.cloneNode(false) as HTMLElement;
+            el.setAttribute('data-id', nextBlockId());
+            const last = i === lines.length - 1;
+            if (lines[i]) el.appendChild(document.createTextNode(lines[i]));
+            // 空行给个占位 <br>（读模型时会认成空块）；末行有后缀时不加，
+            // 否则后缀会被顶到空行的下一行去
+            else if (!last || after.childNodes.length === 0) el.appendChild(document.createElement('br'));
+            anchor.parentNode?.insertBefore(el, anchor.nextSibling);
+            anchor = el;
+            caretBlockId = el.getAttribute('data-id') ?? '';
+        }
+        if (after.childNodes.length > 0) anchor.appendChild(after);
+        if (!caretBlockId) return null;
+
+        // 光标落在粘贴内容末尾（后缀之前）
+        return { blockId: caretBlockId, offset: Array.from(lines[lines.length - 1]).length };
     }
 
     /**
@@ -1643,6 +1787,131 @@ function runKey(char: Char, span: DocSpan | null, mono: boolean): string {
         span?.link ?? '',
         span?.vertAlign ?? '',
     ].join('|');
+}
+
+/**
+ * 块内「一个字符」的像素宽（首行缩进按它折算）
+ *
+ * 首行缩进在模型里存的是字符数，落到屏幕必须乘上该段落的字号：
+ * 12pt（16px）正文的一格是 16px，16pt（21.3px）正文的一格是 21.3px。
+ * @param block - 块
+ * @returns 像素宽
+ */
+function firstCharPx(block: DocBlock): number {
+    const chars = block.chars ?? [];
+    for (let i = 0; i < chars.length; i++) {
+        const size = chars[i]?.fontSize;
+        if (size) return size;
+        // 首个实义字符没有显式字号 → 用正文默认字号；开头的空格不参与判断
+        if (String(chars[i]?.char ?? '') !== ' ') break;
+    }
+    return DEFAULT_DOC_FONT_SIZE;
+}
+
+/* ———————————————————— 空格宽度（「一个字符宽」） ———————————————————— */
+
+/** 空格自然宽度测量缓存（key = 字体描述|字号），避免每个文字段都 new 一个 canvas */
+const spaceAdvanceCache = new Map<string, number>();
+
+/** 复用的 2D 上下文；取不到（受限环境）时按 1/4 字符宽估算 */
+let spaceMeasureCtx: CanvasRenderingContext2D | null = null;
+
+/**
+ * 该码点是否属于「全角字符集」（汉字 / 假名 / 谚文 / 全角标点）
+ * @param code - 码点
+ * @returns 是否全角
+ */
+function isWideCodePoint(code: number): boolean {
+    return (code >= 0x2e80 && code <= 0x9fff)   // CJK 部首 / 汉字
+        || (code >= 0xac00 && code <= 0xd7af)   // 谚文音节
+        || (code >= 0xf900 && code <= 0xfaff)   // 兼容汉字
+        || (code >= 0xfe30 && code <= 0xfe4f)   // 兼容形式
+        || (code >= 0xff00 && code <= 0xffef);  // 全角 ASCII / 全角标点
+}
+
+/**
+ * 逐字符标注「字符宽度类别」，供空格跟随所在文段的宽度
+ *
+ * 空格本身没有类别：它跟随前一个实义字符；行首（或整段都是空格）跟随后面的实义字符。
+ * 于是「中文 中文」里的空格按全角算，「word word」里的空格按半角算。
+ * @param chars - 字符数组
+ * @returns 每个字符的类别
+ */
+function spaceWidthClasses(chars: Char[]): ('wide' | 'narrow')[] {
+    const classes: ('wide' | 'narrow')[] = new Array(chars.length);
+    let last: 'wide' | 'narrow' = 'narrow';
+    for (let i = 0; i < chars.length; i++) {
+        const piece = String(chars[i]?.char ?? '');
+        if (piece === ' ' || piece === '\t' || piece === '\n' || piece === '') continue;
+        last = isWideCodePoint(piece.codePointAt(0) ?? 0) ? 'wide' : 'narrow';
+        break;
+    }
+    for (let i = 0; i < chars.length; i++) {
+        const piece = String(chars[i]?.char ?? '');
+        if (piece === ' ' || piece === '\t' || piece === '\n' || piece === '') {
+            classes[i] = last;
+            continue;
+        }
+        last = isWideCodePoint(piece.codePointAt(0) ?? 0) ? 'wide' : 'narrow';
+        classes[i] = last;
+    }
+    return classes;
+}
+
+/**
+ * 量一个空格在某字体 / 字号下的自然宽度（px）
+ * @param font - CSS font-family 列表
+ * @param fontSize - 字号（px）
+ * @returns 自然宽度
+ */
+function spaceAdvance(font: string, fontSize: number): number {
+    const key = `${font}|${fontSize}`;
+    const cached = spaceAdvanceCache.get(key);
+    if (cached !== undefined) return cached;
+    let width = fontSize * 0.25;
+    try {
+        if (!spaceMeasureCtx) spaceMeasureCtx = document.createElement('canvas').getContext('2d');
+        if (spaceMeasureCtx) {
+            spaceMeasureCtx.font = `${fontSize}px ${font}`;
+            const measured = spaceMeasureCtx.measureText(' ').width;
+            if (Number.isFinite(measured) && measured > 0) width = measured;
+        }
+    } catch {
+        // 量不到就沿用「1/4 字符宽」的估算值
+    }
+    spaceAdvanceCache.set(key, width);
+    return width;
+}
+
+/**
+ * 一段文字里「空格的附加宽度」（即 `word-spacing` 的值）
+ *
+ * 目标宽度：全角文段一个空格 = 1em（一个汉字宽）；半角文段 = 0.5em（一个拉丁字符宽）。
+ * 写差额而不是绝对宽度：空格仍是普通空格字符，断行机会、光标、输入法全交给浏览器，
+ * 不会像「撑宽的盒子」那样吃掉断行点。
+ * @param chars - 段内字符
+ * @param mono - 是否等宽（代码块）
+ * @returns CSS 长度
+ */
+function spaceWordSpacingOfText(chars: Char[], mono: boolean): string {
+    let head: Char | undefined = chars[0];
+    let wide = false;
+    for (let i = 0; i < chars.length; i++) {
+        const piece = String(chars[i]?.char ?? '');
+        if (piece === ' ' || piece === '\t' || piece === '\n' || piece === '') continue;
+        head = chars[i];
+        wide = isWideCodePoint(piece.codePointAt(0) ?? 0);
+        break;
+    }
+    const size = head && head.fontSize ? head.fontSize : DEFAULT_DOC_FONT_SIZE;
+    const font = mono
+        ? 'Consolas, "Courier New", monospace'
+        : head && head.fontFamily
+            ? `"${head.fontFamily}", ${DEFAULT_DOC_FONT_FAMILY}`
+            : DEFAULT_DOC_FONT_FAMILY;
+    const target = wide ? size : size / 2;
+    const extra = Math.max(0, target - spaceAdvance(font, size));
+    return `${Math.round(extra * 100) / 100}px`;
 }
 
 /**

@@ -48,8 +48,13 @@ export interface FileTreeOptions {
     nodes?: FileNode[];
     /** 菜单实例：「新建文件」下拉菜单复用全局菜单 */
     menu?: Menu | null;
-    /** 点击「打开」按钮时触发（由外部弹出文件选择对话框） */
-    onOpen?: () => void;
+    /**
+     * 点击右键菜单「打开」时触发（由外部弹出文件选择对话框）
+     *
+     * 参数为**打开文件应落入的文件夹路径**：右键文件夹时是它自身，
+     * 右键文件时是它所在的文件夹（根目录为空串）。打开进来的文件按此路径登记到树中。
+     */
+    onOpen?: (folderPath: string) => void;
     /**
      * 双击文件节点时触发（参数为**文件路径**，含扩展名）
      *
@@ -176,7 +181,11 @@ export class FileTreeUi {
      * @param {TreeNodeView | null} parent - 父节点（缺省为根节点「工作区」）
      */
     protected createFileNode(todo: string, parent: TreeNodeView | null = null): void {
-        this.addNode(this.availableFileName(todo, parent), { select: true, parent });
+        const view = this.addNode(this.availableFileName(todo, parent), { select: true, parent });
+        // 新建即切到主页面显示这个文件：主页面应是一份对应的空白文件，
+        // 而不是继续停留在上一个文件上。`addNode` 已补建空白存档（content.create），
+        // 且切换时装载逻辑对「尚无存档」的新键按空表 / 空文档处理，因此读到的是空白内容。
+        if (view) this.options.onActivate?.(this.pathWithSelf(view));
     }
 
 
@@ -756,8 +765,12 @@ export class FileTreeUi {
                 this.createFolderNode(parent);
                 break;
             case 'open':
-                // 「打开」由外部接管（弹出文件选择对话框并装载）
-                this.options.onOpen?.();
+                // 「打开」由外部接管（弹出文件选择对话框并装载）。
+                // 打开进来的文件要落在右键的目标目录里：右键文件夹 → 该文件夹；
+                // 右键文件 → 与它同目录（根目录为空串，即「工作区」下）。
+                this.options.onOpen?.(
+                    view.isFolder ? this.containerPathOf(view) : this.pathOf(view)
+                );
                 break;
 
             case 'cut':

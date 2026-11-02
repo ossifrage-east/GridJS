@@ -1,7 +1,7 @@
 /*  # 工具栏·文档页面设置分区 TS 文件（「页面」标签页）
     # 项目名称: silkspaces（藕丝空间）
     # 项目目标: 给文档工作区补上「页面」根分类 —— 与表格的「页面」同样是
-    #           纸张方向 / 纸张大小 / 页边距 / 缩放 + 打印，但落到文档自己的页面设置上。
+    #           打印预览 / 页边距 / 纸张方向 / 纸张大小 / 缩放，但落到文档自己的页面设置上。
     # 本文件职责: 只负责**外观与交互**：点选后把「哪个键、改成什么」交给装配层注入的回调。
     #             **不 import document/**：页面设置是文档模型的一部分，而工具栏必须
     #             对「文档」一无所知（与 Markdown 视图开关同一取舍，见 sectionDocView）。
@@ -46,8 +46,8 @@ export interface SectionDocPageOptions {
     getSetup: () => DocPageSetupView;
     /** 改某一项（装配层负责写回文档元数据并重排纸张） */
     onChange: (key: DocPageKey, value: string) => void;
-    /** 打印当前文档 */
-    onPrint: () => void;
+    /** 打开当前文档的打印预览 */
+    onPrintPreview: () => void;
 }
 
 /**
@@ -70,8 +70,8 @@ export class SectionDocPage {
     private readonly getSetup: () => DocPageSetupView;
     /** 变更回调 */
     private readonly onChange: (key: DocPageKey, value: string) => void;
-    /** 打印回调 */
-    private readonly onPrint: () => void;
+    /** 打印预览回调 */
+    private readonly onPrintPreview: () => void;
 
     /**
      * 创建实例
@@ -84,12 +84,12 @@ export class SectionDocPage {
         this.menu = options.menu;
         this.getSetup = options.getSetup;
         this.onChange = options.onChange;
-        this.onPrint = options.onPrint;
+        this.onPrintPreview = options.onPrintPreview;
         this.init();
     }
 
     /**
-     * 建按钮：打印 / 页边距 / 纸张方向 / 纸张大小 / 缩放
+     * 建按钮：打印预览 / 页边距 / 纸张方向 / 纸张大小 / 缩放
      * @private
      */
     private init(): void {
@@ -98,14 +98,14 @@ export class SectionDocPage {
             stateSource: this.bus,
             isDisabledOnEditting: false,
             menu: this.menu,
-            toDo: 'docPrint',
-            icon: 'icon-printer',
-            text: '打印',
-            title: '打印当前文档',
+            toDo: 'docPrintPreview',
+            icon: 'icon-printer-view',
+            text: '打印预览',
+            title: '打开打印预览',
             ishow: true,
             tshow: true,
             layout: 'vertical',
-            onClick: () => this.onPrint(),
+            onClick: () => this.onPrintPreview(),
         });
 
         this.createDropdown({

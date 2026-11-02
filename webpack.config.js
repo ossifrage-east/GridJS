@@ -19,9 +19,9 @@ const mainConfig = {
   mode: "development",   // 指定 development(开发环境) 和 production(生产环境)
   entry: resolve(__dirname, './src/index.ts'),  // 项目入口
   output: {
-    filename: '[name].[hash:8].js', // 输出文件名
+    filename: '[name].[contenthash:8].js', // 输出文件名（contenthash：按内容变化，缓存更稳）
     path: DIST, // 路径
-    assetModuleFilename: 'assets/[hash:10][ext][query]',  // 静态文件打包后的路径及文件名
+    assetModuleFilename: 'assets/[contenthash:10][ext][query]',  // 静态文件打包后的路径及文件名
     clean: false, // 已在上方统一清空，避免与 worker 配置互相删除产物
   },
   plugins: [
