@@ -36,7 +36,7 @@
  * @module SearchDialog
  */
 
-import { createDiv, createInput, createSpan } from "../../../utils/dom";
+import { createButton, createDiv, createInput, createSpan } from "../../../utils/dom";
 import { Dialog, DialogButtonOptions } from "../../common/dialog";
 import { Navigator } from "../../common/navigator";
 import { DataEvents } from "../../constant";
@@ -55,8 +55,11 @@ export interface SearchDialogOptions {
 const TAB_FIND = '查找';
 /** 「替换」页签文本 */
 const TAB_REPLACE = '替换';
-/** 每行控件的标签宽度（像素） */
-const LABEL_WIDTH = 68;
+/** 每行控件的标签宽度（像素；容得下「查找内容：」五个字加冒号） */
+const LABEL_WIDTH = 82;
+/** 「更多 / 更少」折叠按钮文本（与 Word 的「更多 ≫ / 更少 ≪」一致） */
+const MORE_TEXT = '更多 ≫';
+const LESS_TEXT = '更少 ≪';
 /**
  * 命中列表上限
  *
@@ -109,6 +112,12 @@ export class SearchDialog {
     private entireInputs: HTMLInputElement[] = [];
     private wildcardInputs: HTMLInputElement[] = [];
     private statusElements: HTMLElement[] = [];
+    /** 两页各有一个「更多 ≫ / 更少 ≪」折叠按钮 */
+    private moreButtons: HTMLButtonElement[] = [];
+    /** 两页各自的匹配选项容器（折叠时整块收起） */
+    private optionsWraps: HTMLElement[] = [];
+    /** 匹配选项是否已展开（两页共用一个状态，切页签不改变展开与否） */
+    private optionsExpanded: boolean = false;
 
     /** 当前关键字对应的命中列表（沿用 findAllInRect 的行优先序） */
     private hits: SearchHit[] = [];
@@ -276,6 +285,9 @@ export class SearchDialog {
         this.entireInputs = [];
         this.wildcardInputs = [];
         this.statusElements = [];
+        this.moreButtons = [];
+        this.optionsWraps = [];
+        this.optionsExpanded = false;
     }
 
     // ─────────────────────────── 构建 ───────────────────────────
@@ -316,8 +328,8 @@ export class SearchDialog {
         });
 
         const buttons: DialogButtonOptions[] = [
-            { text: '查找下一个', variant: 'primary', close: false, onClick: () => this.findNext() },
-            { text: '查找上一个', variant: 'secondary', close: false, onClick: () => this.findPrev() },
+            { text: '查找下一处', variant: 'primary', close: false, onClick: () => this.findNext() },
+            { text: '查找上一处', variant: 'secondary', close: false, onClick: () => this.findPrev() },
             { text: '替换', variant: 'warning', close: false, onClick: () => this.replaceCurrent() },
             { text: '全部替换', variant: 'danger', close: false, onClick: () => this.replaceAll() },
             { text: '关闭', variant: 'light' },
@@ -381,7 +393,9 @@ export class SearchDialog {
         findInput.addEventListener('keydown', (e) => {
             if ((e as KeyboardEvent).key === 'Enter') {
                 e.preventDefault();
-                this.findNext();
+                // 与 Word 一致：Shift+Enter 反向查找上一处
+                if ((e as KeyboardEvent).shiftKey) this.findPrev();
+                else this.findNext();
             }
         });
 
@@ -403,10 +417,25 @@ export class SearchDialog {
         });
 
         const rows: HTMLElement[] = [];
-        rows.push(this.buildRow('范围', rangeInput));
-        rows.push(this.buildRow('查找内容', findInput));
-        if (!isFind) rows.push(this.buildRow('替换为', replaceInput));
-        rows.push(this.buildOptionsRow());
+        rows.push(this.buildRow('范围：', rangeInput));
+        rows.push(this.buildRow('查找内容：', findInput));
+        if (!isFind) rows.push(this.buildRow('替换为：', replaceInput));
+
+        // 「更多 ≫ / 更少 ≪」与匹配选项：默认折叠，与 Word 一样把常用项留在明面
+        const moreButton = createButton({
+            className: 'gs-search-more',
+            textContent: this.optionsExpanded ? LESS_TEXT : MORE_TEXT,
+            attributes: { type: 'button' }
+        });
+        moreButton.addEventListener('click', () => this.toggleOptions());
+        this.moreButtons.push(moreButton);
+
+        const optionsWrap = this.buildOptionsRow();
+        optionsWrap.style.display = this.optionsExpanded ? 'flex' : 'none';
+        this.optionsWraps.push(optionsWrap);
+
+        rows.push(moreButton);
+        rows.push(optionsWrap);
         rows.push(statusElement);
 
         // 登记控件：同语义的输入框跨页签双向镜像（见 ensureBuilt 的 linkInputs）
@@ -439,23 +468,25 @@ export class SearchDialog {
     }
 
     /**
-     * 构建匹配选项行（区分大小写 / 完全匹配 / 通配符）
-     * @returns {HTMLElement} 选项行元素
+     * 构建匹配选项容器（区分大小写 / 全字匹配 / 使用通配符）
+     * @returns {HTMLElement} 选项容器（默认由调用方收起）
      */
     private buildOptionsRow(): HTMLElement {
-        const makeCheckbox = (text: string, sink: HTMLInputElement[]): HTMLElement => {
+        const makeCheckbox = (text: string, sink: HTMLInputElement[], title?: string): HTMLElement => {
             const input = createInput({ type: 'checkbox' });
             input.addEventListener('change', () => { this.dirty = true; });
             sink.push(input);
-            return createDiv({
+            const wrapper = createDiv({
                 children: [input, createSpan({ textContent: text })],
                 style: { display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }
             });
+            if (title) wrapper.setAttribute('title', title);
+            return wrapper;
         };
         const wraps = [
             makeCheckbox('区分大小写', this.caseInputs),
-            makeCheckbox('完全匹配', this.entireInputs),
-            makeCheckbox('通配符 ?/* ', this.wildcardInputs),
+            makeCheckbox('全字匹配', this.entireInputs),
+            makeCheckbox('使用通配符', this.wildcardInputs, '? 匹配单个字符，* 匹配任意长度'),
         ];
         return createDiv({
             children: wraps,
@@ -467,6 +498,15 @@ export class SearchDialog {
                 marginBottom: '0.5rem'
             }
         });
+    }
+
+    /** 仿 Word 的「更多 ≫ / 更少 ≪」折叠（两页同步切换） */
+    private toggleOptions(): void {
+        this.optionsExpanded = !this.optionsExpanded;
+        const show = this.optionsExpanded;
+        for (const button of this.moreButtons) button.textContent = show ? LESS_TEXT : MORE_TEXT;
+        // 内联 display:flex 不能被 `hidden` 覆盖，只能改 style.display
+        for (const wrap of this.optionsWraps) wrap.style.display = show ? 'flex' : 'none';
     }
 
     /**
@@ -512,6 +552,20 @@ export class SearchDialog {
             }
             .gs-search-dialog .panel-item.horizontal:not(.checked):hover {
                 border-bottom-color: #0d6efd;
+            }
+            /* 「更多 / 更少」：Word 里是一个靠左的文字链，不是按钮 */
+            .gs-search-dialog .gs-search-more {
+                align-self: flex-start;
+                border: none;
+                background: none;
+                color: #0d6efd;
+                padding: 0;
+                margin-bottom: 0.5rem;
+                font-size: 0.8125rem;
+                cursor: pointer;
+            }
+            .gs-search-dialog .gs-search-more:hover {
+                text-decoration: underline;
             }
         `;
         document.head.appendChild(styleSheet);
@@ -735,7 +789,7 @@ export class SearchDialog {
             return;
         }
         if (this.cursor < 0 || this.cursor >= this.hits.length) {
-            this.setStatus('请先点击「查找下一个」定位到某个单元格');
+            this.setStatus('请先点击「查找下一处」定位到某个单元格');
             return;
         }
         const hit = this.hits[this.cursor];

@@ -224,8 +224,17 @@ export class DocView {
         slot: HTMLDivElement;
         rulerH: HTMLDivElement;
         rulerV: HTMLDivElement;
+        /** 块容器（`contenteditable` 宿主；文档查找 / 替换在它上面做 DOM 扫描） */
+        blocks: HTMLDivElement;
     } {
-        return { scroller: this.scroller, page: this.page, slot: this.slot, rulerH: this.rulerH, rulerV: this.rulerV };
+        return {
+            scroller: this.scroller,
+            page: this.page,
+            slot: this.slot,
+            rulerH: this.rulerH,
+            rulerV: this.rulerV,
+            blocks: this.blocksEl,
+        };
     }
 
     /**

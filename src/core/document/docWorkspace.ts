@@ -35,6 +35,7 @@ import { DocPageSetup, blockText } from './blockTree';
 import { snapshotToDocx } from './converter/docxCodec';
 import { blocksToMarkdown } from './converter/markdownCodec';
 import { DocEditHost } from './docEditHost';
+import { hideDocFindReplace } from './docSearchDialog';
 import { DocPrinter } from './docPrinter';
 import { DocScrollbar } from './docScroller';
 import { DocStore } from './docStore';
@@ -242,6 +243,33 @@ export class DocWorkspace {
     /** 文档存储（供装配层做内容桥） */
     public get docStore(): DocStore {
         return this.store;
+    }
+
+    /** 是否已打开文档（查找 / 替换据此判断有没有可查内容） */
+    public get hasDoc(): boolean {
+        return this.store.hasDoc;
+    }
+
+    /**
+     * 当前可查找的块容器
+     *
+     * Markdown 源码视图里没有 `.doc-blocks`（正文在 textarea 里），因此返回 `null`，
+     * 由查找对话框给出「请切回页面视图」的提示，而不是在不存在的内容上假装查找。
+     * @returns 块容器；源码视图 / 未打开文档时为 null
+     */
+    public get docBlocks(): HTMLDivElement | null {
+        return this.mode === 'rich' ? this.view.getElements().blocks : null;
+    }
+
+    /**
+     * 把 DOM 上的查找替换结果同步回模型
+     *
+     * 替换是直接改 DOM 的（见 `docSearch.ts` 的说明），改完必须走 `DocView.sync`
+     * 才能进入撤销栈与落库队列；`'single'` 让一次「全部替换」成为一条撤销记录。
+     * @param label - 撤销记录的动作名
+     */
+    public syncDocFromDom(label: string = '替换'): void {
+        if (this.mode === 'rich') this.view.sync(label, 'single', false);
     }
 
     /**
@@ -552,6 +580,8 @@ export class DocWorkspace {
      */
     public printPreview(): void {
         if (!this.store.hasDoc) return;
+        // 预览是自绘的全屏遮罩，不走 Dialog 的互斥登记表，查找对话框不会被自动收起
+        hideDocFindReplace();
         // 预览前先把 DOM 里的最新编辑同步进模型，否则最后几个字符不在纸上
         if (this.mode === 'rich') this.view.sync('打印预览', 'coalesce', false);
         if (!this.printer) {

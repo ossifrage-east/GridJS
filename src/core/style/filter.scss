@@ -9,6 +9,8 @@
 /* 按钮尺寸 12px 内容区 + 4px 内边距 + 1px 边框 = 视觉 22px；
    随主页面缩放时由 scripts 侧设置 transform: scale(zoom) 与 transform-origin: top left
    （见 Filter.applyZoomScale），不要在样式表里覆盖 transform / transform-origin */
+/* 层级：内容区 canvas 2 < 筛选按钮 3 < 行头/列头 canvas、右侧/底部工具栏 4。
+   按钮必须低于行列表头与右侧工具栏，否则最后一列/最后一行上的按钮会盖住它们 */
 .filter {
     position: absolute;
     display: block;
@@ -17,7 +19,7 @@
     background-color: whitesmoke;
     padding: 4px;
     border: 1px solid #ccc;
-    z-index: 6;
+    z-index: 3;
 }
 
 // .filter::before {

@@ -500,9 +500,16 @@ export class SheetCanvas extends Canvas {
         // 超限后 OffscreenCanvas 静默变成空白 —— 表现就是「选区一大，选中框的
         // 半透明背景整片消失，只剩一个描边框」。同时为屏外区域做几百万像素的
         // 填充也是纯浪费（每帧都做）。故只给「选区 ∩ 视口」建画布。
+        //
+        // 注意单位：选区矩形是**逻辑坐标**（未乘 zoom），所以视口也要换算成
+        // 逻辑尺寸 `sheetWidth / zoom`。若误用 CSS 像素宽度，缩放 < 100% 时
+        // 裁剪区会小于真实可视范围，半透明背景在屏幕最右侧/最下方留下一条空白。
         const clip = clipRectToViewport(
             { left, top, width, height },
-            { width: this.data.visibleView.sheetWidth, height: this.data.visibleView.sheetHeight }
+            {
+                width: this.data.visibleView.sheetWidth / this.data.zoom,
+                height: this.data.visibleView.sheetHeight / this.data.zoom
+            }
         );
 
         this.ctx.save();
@@ -821,7 +828,11 @@ export class SheetCanvas extends Canvas {
         if (MergedCells.length === 0) return;
         const zoom = this.data.zoom;
         const dpr = window.devicePixelRatio;
-        const viewport = { width: this.data.visibleView.sheetWidth, height: this.data.visibleView.sheetHeight };
+        // 与 drawSelectedRect 同一口径：rect 是逻辑坐标，视口要除以 zoom
+        const viewport = {
+            width: this.data.visibleView.sheetWidth / zoom,
+            height: this.data.visibleView.sheetHeight / zoom
+        };
         for (const mergedCell of MergedCells) {
             // 隐藏行列不绘制；跨隐藏列/行时只取可见部分
             const rect = this.getVisibleCellRect(mergedCell.startCol, mergedCell.startRow);

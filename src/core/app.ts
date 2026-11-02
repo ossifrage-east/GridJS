@@ -45,8 +45,9 @@ import { QuickAccess } from "./toolbar/quickAccess";
 import { getSharedPrinter } from "./sheets/sheetPrinter";
 import { CommandBus } from "./contract/commandBus";
 import { SheetEditHost } from "./sheets/sheetEditHost";
-import { openFindReplace } from "./toolbar/start/searchDialog";
+import { openFindReplace, hideFindReplace } from "./toolbar/start/searchDialog";
 import { DocWorkspace } from "./document/docWorkspace";
+import { hideDocFindReplace, openDocFindReplace } from "./document/docSearchDialog";
 import { WorkspaceRouter } from "./workspace/workspaceRouter";
 import { ExportActionsBase } from "./workspace/exportActions";
 import favicon from "../assets/images/favicon.ico";
@@ -185,8 +186,16 @@ export class App extends ExportActionsBase {
             },
             // 计算菜单点选 → 把该项结果写入空白的活动单元格（实例稍后创建，回调按需取用）
             onCalculate: (label: string) => this.selectionCalc?.applyToActivedCell(label),
-            // 查询 / 替换是对话框而非一次编辑动作，需要数据源全表扫描，因此由装配层注入
-            onFindReplace: (mode: 'find' | 'replace') => openFindReplace(this.data, mode),
+            // 查询 / 替换是对话框而非一次编辑动作，需要数据源全表扫描，因此由装配层注入。
+            // 文档工作区与表格共用这套菜单：按当前工作区分流到各自的查找载体
+            //（文档扫 DOM、表格扫单元格字符），两个对话框由 Dialog 的互斥登记表保证不会同时出现。
+            onFindReplace: (mode: 'find' | 'replace') => {
+                if (this.workspaceRouter?.active === 'doc' && this.docWorkspace) {
+                    openDocFindReplace(this.docWorkspace, mode);
+                } else {
+                    openFindReplace(this.data, mode);
+                }
+            },
             // 视图切换同理：它是「工作区怎么显示」，不是一次编辑动作。文档工作区在
             // initDocWorkspace 里才创建（晚于工具栏），因此用闭包延迟取用。
             onToggleMarkdown: () => this.docWorkspace?.toggleMode(),
@@ -471,12 +480,39 @@ export class App extends ExportActionsBase {
             // 那一帧量到的尺寸是 0，画布会停在切换前的旧尺寸上；
             // 同时把导航面板从文档的右侧工具线搬回表格这边
             onShowSheet: () => {
+                // 两个查找对话框各自持有不同宿主：切走时把对侧那个收起来，
+                // 否则它会盖在另一个工作区上（Dialog 的互斥登记表只挡新建、不挡已打开的）
+                hideDocFindReplace();
                 this.moveNavPanelToSheet();
                 this.sheets.refreshLayout();
             },
-            onShowDoc: () => this.moveNavPanelToDoc(),
+            onShowDoc: () => {
+                hideFindReplace();
+                this.moveNavPanelToDoc();
+            },
         });
         this.workspaceRouter.mountSheet();
+        this.initDocFindShortcut();
+    }
+
+    /**
+     * 文档模式下接管 Ctrl+F / Ctrl+H
+     *
+     * `editCanvas` 在 document 的**冒泡阶段**直接打开表格查找框；这里必须挂在
+     * **捕获阶段**，先一步拦下并打开文档查找框，再 `stopPropagation()` 阻断
+     * 同一次按键继续冒泡到表格的监听（否则两个对话框会被同时唤起）。
+     * 表格模式不拦截，沿用表格侧原有入口。
+     */
+    private initDocFindShortcut() {
+        document.addEventListener('keydown', (event) => {
+            if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+            if (this.workspaceRouter?.active !== 'doc' || !this.docWorkspace) return;
+            const key = event.key.toLowerCase();
+            if (key !== 'f' && key !== 'h') return;
+            event.preventDefault();
+            event.stopPropagation();
+            openDocFindReplace(this.docWorkspace, key === 'h' ? 'replace' : 'find');
+        }, true);
     }
 
     private initScroller() {
