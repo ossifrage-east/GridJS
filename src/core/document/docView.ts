@@ -177,6 +177,15 @@ export class DocView {
     private composing: boolean = false;
 
     /**
+     * 组字文本所在的文本节点（`compositionstart` 时切出来，见 {@link DocView.isolateComposingText}）
+     *
+     * 把拼音和它前面的正文**分到两个文本节点**，页末组字溢到页脚时才能在
+     * 「拼音节点之前」插块级留白，把组字整体顶到下一页正文起点 ——
+     * 插元素不会搬动拼音节点，输入法不会被打断（搬节点 / 切节点才会）。
+     */
+    private composingNode: Text | null = null;
+
+    /**
      * 组字期间被摘掉的**旧行级留白**（摘的时候先记下来，见 {@link DocView.removePageGaps}）
      *
      * 排页的开头总是先摘掉旧留白再量。组字期间若正巧碰到「必须拆开组字文本节点」
@@ -580,8 +589,9 @@ export class DocView {
         }
         if (caret) this.restoreCaret(caret);
         // 重建 DOM 已经把组字打断（浏览器这时未必再发 compositionend）：
-        // 标记归零，否则后面的排页会被永久挡住
+        // 标记归零，否则后面的排页会被永久挡住；组字节点引用也要跟着失效
         this.composing = false;
+        this.composingNode = null;
         // 重渲染把分页留白也清掉了：内容一变就得重排一次页
         this.schedulePaginate();
     }
@@ -834,7 +844,7 @@ export class DocView {
         let page = startPage;
         let extra = 0;
         let lineTop = rects[0].top;
-        const splits: { node: Text; offset: number; gap: number }[] = [];
+        const splits: { node: Text; offset: number; gap: number; compose?: boolean }[] = [];
 
         for (let i = 0; i < rects.length; i++) {
             const item = rects[i];
@@ -849,11 +859,22 @@ export class DocView {
             // 第一行都放不下：不是「拆行」能解决的，交给调用方整块下推
             // （整块下推只插块级留白、不碰任何文本节点，组字期间也是安全的）
             if (i === 0) return null;
-            // 组字期间遇到「会动到组字文本节点」的行首：这一轮不拆（拆了会打断输入法）。
-            // 但页边界不能就这么消失 —— 旧留白已在排页开头被摘掉，不补回去的话
-            // 这一块及其后所有内容都会整体上移、压到分页位置。把这一块上一轮的
-            // 行级留白原样放回，等 compositionend 之后再正常拆行。
+            // 组字期间遇到「会动到组字文本节点」的行首：不能走常规拆行
+            // （`insertLineGap` 会把组字节点搬进新 span，输入法会立刻结束）。
             if (this.composing && this.hitsComposingNode(item.node, item.offset)) {
+                // 组字所在行溢到页脚：在行首插**块级**留白，断开行而**不搬动
+                // 组字文本节点**，拼音就会整体落到下一页正文起点，不再占页脚。
+                // 这比「把组字节点搬进新 span」温和：搬节点会立刻结束输入法。
+                const gapHere = (page + 1) * height - (item.top + shift + extra);
+                // 与普通行级留白一起**延后倒序插入**：先插靠后的行首，
+                // 前面节点的下标才不会被这一次 splitText 改掉
+                if (gapHere > 0 && this.composingNode !== null) {
+                    splits.push({ node: item.node, offset: item.offset, gap: gapHere, compose: true });
+                    extra += gapHere;
+                    page += 1;
+                    continue;
+                }
+                // 连行首都切不动（光标不在文本节点里）：退回旧做法，保住页边界
                 const restored = this.restoreComposingGaps(el);
                 // 放回了几条留白，这一块就还是停在原来的页数上；`added` 要计入后续块的位移
                 return { added: restored.added, lastPage: Math.min(page, startPage + restored.count) };
@@ -871,7 +892,13 @@ export class DocView {
         // 倒序插入：先处理靠后的行首，前面文本节点的下标才不受影响
         for (let s = splits.length - 1; s >= 0; s--) {
             const split = splits[s];
-            if (split.node.parentNode) this.insertLineGap(el, split.node, split.offset, split.gap);
+            if (!split.node.parentNode) continue;
+            if (split.compose) {
+                // 组字行首：只插块级留白，绝不搬动组字文本节点
+                this.insertComposingPageBreak(split.node, split.offset, split.gap);
+                continue;
+            }
+            this.insertLineGap(el, split.node, split.offset, split.gap);
         }
         return { added: extra, lastPage: page };
     }
@@ -947,6 +974,73 @@ export class DocView {
         probe.setStart(node, offset);
         probe.collapse(true);
         return probe.comparePoint(caret, 0) >= 1;
+    }
+
+    /**
+     * 把「即将组字的拼音」切到一个独立文本节点
+     *
+     * `compositionstart` 时拼音还没写进正文，此刻在光标处 `splitText` 是安全的；
+     * 切完之后拼音从新节点的下标 0 开始，页末换行时行首正好落在节点开头，
+     * 分页才能在它前面插留白（见 {@link DocView.insertComposingPageBreak}）——
+     * 组字期间再切节点会立刻结束输入法。
+     * @returns 承接组字的文本节点；光标不在文本节点里时 null（退回旧的保守处理）
+     */
+    private isolateComposingText(): Text | null {
+        const selection = window.getSelection();
+        if (!selection || selection.rangeCount === 0) return null;
+        const range = selection.getRangeAt(0);
+        if (!range.collapsed) return null;
+        const node = range.startContainer;
+        if (node.nodeType !== 3) return null;
+        const text = node as Text;
+        const offset = range.startOffset;
+        if (offset === 0) return text;
+        // 光标在节点中间 / 末尾：切出一个从光标开始的节点（末尾是空节点），
+        // 拼音落进去之后与前面的正文就不再共享文本节点
+        const host = text.splitText(offset);
+        const next = document.createRange();
+        next.setStart(host, 0);
+        next.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(next);
+        return host;
+    }
+
+    /**
+     * 组字行溢出到页脚时，在行首插一个**块级**页边界
+     *
+     * 关键：只往 DOM 里**插**一个 `contenteditable=false` 的留白元素，既不切
+     * 组字文本节点、也不搬动它。块级元素插在行内文本之间会把行断开，断点之后
+     * 的拼音与后续正文整体落到留白之后（下一页正文起点），输入法不受影响。
+     * @param node - 行首所在文本节点
+     * @param offset - 行首在节点内的偏移
+     * @param gap - 留白高度（把这一行顶到下一页正文起点所需）
+     * @returns 是否插入成功
+     */
+    private insertComposingPageBreak(node: Text, offset: number, gap: number): boolean {
+        if (gap <= 0) return false;
+        const composing = this.composingNode;
+        // 没能把拼音单独切出来时不敢动：切组字节点会直接结束输入法
+        if (!composing) return false;
+        const parent = node.parentNode;
+        if (!parent) return false;
+        // 行首在组字节点之前：按行首切开（切到的不是组字节点，安全）
+        const pivot = node !== composing && offset > 0 ? node.splitText(offset) : node;
+        const spacer = createDiv({ className: 'doc-page-gap' });
+        spacer.setAttribute(DOC_PAGE_GAP_ATTR, 'compose');
+        spacer.setAttribute('contenteditable', 'false');
+        // 同一节点可能跨多条页边界：本轮已经插过，就把高度累加
+        const previous = pivot.previousSibling as HTMLElement | null;
+        if (previous && previous.getAttribute && previous.getAttribute(DOC_PAGE_GAP_ATTR) === 'compose') {
+            const height = parseFloat(previous.style.height) || 0;
+            previous.style.height = `${Math.round((height + gap) * 100) / 100}px`;
+            return true;
+        }
+        spacer.style.height = `${Math.max(1, Math.round(gap))}px`;
+        const container = pivot.parentNode;
+        if (!container) return false;
+        container.insertBefore(spacer, pivot);
+        return true;
     }
 
     /**
@@ -1375,9 +1469,13 @@ export class DocView {
         // 输入法组字：组字期间同步不做、排页照做（排页内部会绕开组字文本节点）。
         this.blocksEl.addEventListener('compositionstart', () => {
             this.composing = true;
+            // 组字还没往正文写拼音：此刻把拼音单独切到一个文本节点最安全，
+            // 之后页末组字溢到页脚时才有「干净的分界点」插页边界
+            this.composingNode = this.isolateComposingText();
         });
         this.blocksEl.addEventListener('compositionend', () => {
             this.composing = false;
+            this.composingNode = null;
             // 此刻正文里已经是最终汉字：同步回模型，再由 sync 末尾安排一次排页
             this.scheduleSync();
         });
