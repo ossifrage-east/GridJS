@@ -143,6 +143,11 @@ export abstract class OpenRouterBase extends FileSessionBase {
         const key = this.toSheetKey(fileName);
         if (!key) return;
         const store = this.docWorkspace.docStore;
+        // 重新导入的正是内存里还开着的同一份文档（改了原始文件后再打开）：先丢弃旧
+        // 内存态（**不落库**）。否则紧接着 `docWorkspace.open()` 的首行
+        // `flushViewState()` 会把旧块树标脏，随后的 `load()` 再先 flush 一次，
+        // 就把刚写入的新存档覆盖回旧内容 —— 表现就是「重新打开还是老内容」。
+        if (store.docKey === key) store.discardCurrent();
         await store.writeSnapshot(key, snapshot);
         this.workspaceRouter.showDoc();
         await this.docWorkspace.open(key, this.docTitleOf(fileName));

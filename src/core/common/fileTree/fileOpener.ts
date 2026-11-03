@@ -18,6 +18,7 @@ import type { ExtractedImage } from "../../../utils/parser/sheetParser";
 import { DocumentParser } from "../../../utils/parser/documentParser";
 import { createBlankSnapshot, type DocSnapshot } from "../../document/blockTree";
 import { docxToSnapshot } from "../../document/converter/docxCodec";
+import { docToSnapshot } from "../../document/converter/docCodec";
 import { textToBlocks } from "../../document/converter/textCodec";
 import '../../style/fileOpener.scss';
 
@@ -164,6 +165,17 @@ export class FileOpener {
     private pendingFolder = '';
 
     /**
+     * 打开队列：**一次只开一个文件**
+     *
+     * 多文件拖入 / 多选时，若各个文件并行解析、并行装载，会同时争抢同一个
+     * 文档工作区（与同一个数据集合）：先完成的那份可能被后完成的覆盖，
+     * 也可能出现「存档键指向 A、内容却是 B」的串档，界面上就是其中一份空白。
+     * 串行还有一个直接好处：每个文件的「已打开」提示按打开顺序依次出现，
+     * 与用户看到的文件顺序一致。
+     */
+    private openQueue: Promise<void> = Promise.resolve();
+
+    /**
      * 构造函数
      * @param {FileOpenerOptions} options - 配置选项
      */
@@ -249,10 +261,25 @@ export class FileOpener {
 
     /**
      * 打开单个文件（解析 → 装载 → 通知外部登记文件树）
+     *
+     * 调用即入队：多个文件同时拖入 / 多选时**按调用顺序逐个打开**，
+     * 每个文件的装载与提示都完整结束后才开始下一个（见 {@link openQueue}）。
      * @param {File} file - 待打开的文件
      * @param {string} [folderPath=''] - 登记到文件树中的目录路径（根目录为空串）
      */
     public openFile(file: File, folderPath: string = ''): void {
+        this.openQueue = this.openQueue
+            .then(() => this.openOne(file, folderPath))
+            // 单个文件失败不该让队列卡死：这里只兜住异常，提示已在 openOne 里给出
+            .catch((): void => undefined);
+    }
+
+    /**
+     * 真正打开一个文件（队列内部使用，一次只有一个在跑）
+     * @param file - 待打开的文件
+     * @param folderPath - 登记到文件树中的目录路径（根目录为空串）
+     */
+    private async openOne(file: File, folderPath: string): Promise<void> {
         if (!FileOpener.isSupported(file)) {
             this.options.onError?.(`不支持的文件格式：${file.name}`);
             return;
@@ -269,12 +296,12 @@ export class FileOpener {
 
         // 解析 → 去重命名 → 装载 → 通知外部登记文件树。
         //
-        // 【为什么「去重命名 + 装载 + 登记」必须在同一个同步段（单个 then 回调）里做完】
+        // 【为什么「去重命名 + 装载 + 登记」必须在同一个同步段里做完】
         // 去重命名要看到「此前已登记进树的节点」才能判冲突；而装载（存档键）与登记
         // （树节点名）又**必须用同一个最终名**，否则节点名为 `test_sample1.grid`、
         // 存档却写在 `test_sample` 上，同一个文件两份身份。
-        // 若把它们拆到多个 then 回调，两个文件同时打开时（一次拖入 xls 与 xlsx）
-        // 两段之间会被对方的回调插入，仍会双双拿到未去重的名字而互相覆盖。
+        // 现在整个打开动作都在队列里串行执行，两个文件同时打开时也不会被对方的
+        // 回调插入，因此双双都能拿到正确的名字。
         //
         // 【为什么这里不再 `syncValuesToDB()`（性能约定，请勿加回）】
         // 原先装载完立刻整表序列化 + 写库，对大文件来说等于「刚读完一遍，马上再
@@ -287,24 +314,25 @@ export class FileOpener {
         // 仍由 syncValuesToDB() 强制落库兜底。
         // 文档类文件：交给文档工作区（块树），不再「提取纯文本铺到 A 列」
         if (this.options.onDocument && isDocumentExtension(extension)) {
-            this.openAsDocument(file, extension, nativeName, folderPath).catch((error: unknown) => {
+            try {
+                await this.openAsDocument(file, extension, nativeName, folderPath);
+            } catch (error: unknown) {
                 const reason = error instanceof Error ? error.message : String(error);
                 this.options.onError?.(`打开「${file.name}」失败：${reason}`);
-            });
+            }
             return;
         }
 
-        this.parse(file, extension)
-            .then((document) => {
-                const finalName = this.options.resolveName?.(nativeName, folderPath) ?? nativeName;
-                const filePath = joinPath(folderPath, finalName);
-                this.applyDocument(filePath, document);
-                this.options.onOpened?.(filePath);
-            })
-            .catch((error: unknown) => {
-                const reason = error instanceof Error ? error.message : String(error);
-                this.options.onError?.(`打开「${file.name}」失败：${reason}`);
-            });
+        try {
+            const document = await this.parse(file, extension);
+            const finalName = this.options.resolveName?.(nativeName, folderPath) ?? nativeName;
+            const filePath = joinPath(folderPath, finalName);
+            this.applyDocument(filePath, document);
+            this.options.onOpened?.(filePath);
+        } catch (error: unknown) {
+            const reason = error instanceof Error ? error.message : String(error);
+            this.options.onError?.(`打开「${file.name}」失败：${reason}`);
+        }
     }
 
     /**
@@ -330,11 +358,14 @@ export class FileOpener {
             // 走流式 XML 扫描（`xmlScanner`），不用 DOMParser：
             // 大文档不会把整棵 DOM 驻留内存，也为将来搬进 Worker 留好路
             snapshot = await docxToSnapshot(buffer, title);
+        } else if (extension === 'doc') {
+            // Word 97-2003 二进制：按片段表 + CHPX/PAPX 还原正文与格式，
+            // 不能只取纯文本 —— 那会把字号 / 颜色 / 高亮 / 缩进全部丢掉
+            const buffer = new Uint8Array(await file.arrayBuffer());
+            snapshot = docToSnapshot(buffer, title);
         } else {
-            // doc（二进制）/ md / txt：都没有可靠的富文本结构，按纯文本还原段落
-            const result = extension === 'doc'
-                ? await new DocumentParser().parse(file)
-                : { lines: (await file.text()).replace(/\r\n?/g, '\n').split('\n'), title };
+            // md / txt：没有富文本结构，按纯文本还原段落
+            const result = { lines: (await file.text()).replace(/\r\n?/g, '\n').split('\n'), title };
             snapshot = createBlankSnapshot(title);
             snapshot.blocks = textToBlocks(result.lines.join('\n'));
             // `.md` 保留源码形态：直接落进块的文本，Markdown 视图里仍是原文

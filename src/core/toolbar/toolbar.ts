@@ -339,6 +339,7 @@ export class Toolbar extends EventEmitter {
         this.sections.brush.setKind(kind);
         this.sections.font.setKind(kind);
         this.sections.align.setKind(kind);
+        this.sections.process.setKind(kind);
     }
 
     /**

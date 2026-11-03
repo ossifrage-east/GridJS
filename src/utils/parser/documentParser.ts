@@ -158,8 +158,108 @@ export class DocumentParser {
         if (!stream) {
             throw new Error('doc 文件中未找到 WordDocument 数据流，文件可能已损坏');
         }
-        // Word 正文以 CP1252（类 Latin-1）单字节存储为主，整体按 Latin-1 解码后扫描可打印字符
-        return this.buildResult(this.scanPrintableText(this.decodeLatin1(stream)));
+        // 优先按 FIB 的片段表（piece table）取正文：每个片段的文本可能是
+        // UTF-16LE（中文等）或压缩的 8 位（西文），逐片段按标记解码才不会串码。
+        // 片段表缺失 / 结构异常时再退回拉丁-1 扫描（老文档仍能尽力提取）。
+        const pieceText = this.readDocPieceText(cfb, stream);
+        const text = pieceText ?? this.decodeLatin1(stream);
+        return this.buildResult(this.scanPrintableText(text));
+    }
+
+    /**
+     * 按 Word 97 的片段表（CLX / PlcPcd）提取正文
+     *
+     * 二进制 .doc 的正文并不整段连续存放：`WordDocument` 流里是一段段「片段」，
+     * 每段在 `0Table` / `1Table` 流中登记了字符数与存放位置，并用 fCompressed 标记
+     * 该段是 8 位压缩文本还是 UTF-16LE 文本。只按单一编码整体解码会让中文文档
+     * 变成乱码 —— 中文正文通常就是 UTF-16LE 片段。
+     *
+     * 结构：FIB 里取表流名（flags bit 9）与 `fcClx / lcbClx`，CLX 中跳过 Prc
+     * （格式修订记录），再读 Pcdt：`lcbPcdt` + CP 数组 + PCD 数组。
+     * @param cfb - OLE2 复合文档
+     * @param stream - `WordDocument` 流
+     * @returns 正文；片段表不存在或异常时返回 null（调用方退回扫描方案）
+     * @private
+     */
+    private readDocPieceText(cfb: CompoundFile, stream: Uint8Array): string | null {
+        const flags = this.readUint16(stream, 0x0A);
+        const table = cfb.readStream((flags & 0x0200) !== 0 ? '1Table' : '0Table');
+        if (!table) return null;
+
+        const fcClx = this.readUint32(stream, 0x01A2);
+        const lcbClx = this.readUint32(stream, 0x01A6);
+        if (fcClx <= 0 || lcbClx <= 0 || fcClx + lcbClx > table.length) return null;
+
+        const end = fcClx + lcbClx;
+        let cursor = fcClx;
+        // Prc：clxt=1，后跟 cbGrpprl（2 字节）与定长格式数据；
+        // 可能有多个，逐个跳过后才到 Pcdt
+        while (cursor < end && table[cursor] === 0x01) {
+            const cb = this.readUint16(table, cursor + 1);
+            cursor += 3 + cb;
+        }
+        if (cursor >= end || table[cursor] !== 0x02) return null;
+
+        const lcbPcdt = this.readUint32(table, cursor + 1);
+        if (lcbPcdt < 12) return null;
+        const plc = cursor + 5;
+        if (plc + lcbPcdt > table.length) return null;
+        const count = Math.floor((lcbPcdt - 4) / 12);
+        if (count <= 0) return null;
+
+        const cpBase = plc;
+        const pcdBase = plc + (count + 1) * 4;
+        let text = '';
+        for (let i = 0; i < count; i++) {
+            const cpStart = this.readUint32(table, cpBase + i * 4);
+            const cpEnd = this.readUint32(table, cpBase + (i + 1) * 4);
+            if (cpEnd <= cpStart) continue;
+            const chars = cpEnd - cpStart;
+
+            const fcRaw = this.readUint32(table, pcdBase + i * 8 + 2);
+            const compressed = (fcRaw & 0x40000000) !== 0;
+            // 压缩片段：真实字节偏移 = 去标志位后的值 ÷ 2（见 MS-DOC Pcd.fc）
+            const fc = compressed
+                ? Math.floor((fcRaw & 0x3FFFFFFF) / 2)
+                : (fcRaw & 0x3FFFFFFF);
+
+            if (compressed) {
+                if (fc + chars > stream.length) continue;
+                for (let k = 0; k < chars; k++) text += String.fromCharCode(stream[fc + k]);
+            } else {
+                if (fc + chars * 2 > stream.length) continue;
+                for (let k = 0; k < chars; k++) {
+                    const offset = fc + k * 2;
+                    text += String.fromCharCode(stream[offset] | (stream[offset + 1] << 8));
+                }
+            }
+        }
+        return text.length > 0 ? text : null;
+    }
+
+    /**
+     * 读取小端 16 位整数（越界时返回 0）
+     * @param bytes - 字节数据
+     * @param offset - 偏移
+     * @returns 数值
+     * @private
+     */
+    private readUint16(bytes: Uint8Array, offset: number): number {
+        if (offset < 0 || offset + 2 > bytes.length) return 0;
+        return bytes[offset] | (bytes[offset + 1] << 8);
+    }
+
+    /**
+     * 读取小端 32 位整数（越界时返回 0）
+     * @param bytes - 字节数据
+     * @param offset - 偏移
+     * @returns 数值
+     * @private
+     */
+    private readUint32(bytes: Uint8Array, offset: number): number {
+        if (offset < 0 || offset + 4 > bytes.length) return 0;
+        return (bytes[offset] | (bytes[offset + 1] << 8)
+            | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
     }
 
     /**

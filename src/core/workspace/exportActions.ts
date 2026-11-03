@@ -44,6 +44,13 @@ export abstract class ExportActionsBase extends ContentBridgeBase {
             // 右键文件 → 与它同目录；从主页面拖放 / 顶部按钮打开 → 根目录），
             // 参数是**完整路径**，树与存档都按路径登记，因此不同目录可同名共存
             onOpened: (path: string) => {
+                // 从本机打开的是表格文件，而主页面此时停在文档工作区：内容虽已由
+                // 打开器装载进 `DataCollection`，但不切工作区就看不到 —— 先落库
+                // 文档（自动保存是防抖的），再切回表格，否则看起来「没打开」。
+                if (!this.isDocPath(path) && this.workspaceRouter?.active === 'doc') {
+                    void this.docWorkspace?.flush();
+                    this.workspaceRouter.showSheet();
+                }
                 // 打开的文件即「当前文件」：登记到树中并高亮，刷新后据此恢复
                 this.fileTree.showActivedFile(path);
                 this.persistActivedFile(path);

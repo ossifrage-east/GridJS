@@ -129,6 +129,15 @@ export class DocWorkspace {
     private viewStateTimer: number | null = null;
 
     /**
+     * 打开序号：并发打开两份文档时只有最后一次能落地
+     *
+     * `DocStore.load` 内部已有同样的守卫（防串档）；这里再守一层是为了挡住
+     * 「装载回来之后才执行的那一半」—— 恢复缩放、恢复滚动位置、重新渲染。
+     * 少了它，先完成的那次会把缩放 / 滚动位置按自己的存档写到刚打开的新文档上。
+     */
+    private openToken: number = 0;
+
+    /**
      * 构造函数
      * @param options.parentElement - 挂载点（主页面 splitPrev）
      * @param options.bus - 命令总线
@@ -395,9 +404,12 @@ export class DocWorkspace {
      * @param title - 标题
      */
     public async open(docKey: string, title: string): Promise<void> {
+        // 后发起的那次打开说了算：装载期间又有人点了别的文件，本次直接收场
+        const token = ++this.openToken;
         // 切文档前先把上一份的缩放 / 滚动位置写回去（防抖可能还没触发）
         this.flushViewState();
         await this.store.load(docKey, title);
+        if (token !== this.openToken) return;
         this.show();
         this.applyMode(this.store.meta.view === 'markdown' ? 'markdown' : 'rich');
         this.refresh();
@@ -411,6 +423,7 @@ export class DocWorkspace {
 
         // 滚动位置要等缩放后的排版落定再写回：同一帧写会被旧的内容尺寸钳住
         requestAnimationFrame(() => {
+            if (token !== this.openToken) return;
             if (!this.store.hasDoc) return;
             scroller.scrollLeft = Math.max(0, viewState.scrollLeft ?? 0);
             scroller.scrollTop = Math.max(0, viewState.scrollTop ?? 0);

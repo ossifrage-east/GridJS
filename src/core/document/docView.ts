@@ -167,6 +167,37 @@ export class DocView {
     private paginateFrame: number | null = null;
 
     /**
+     * 输入法组字中（`compositionstart` → `compositionend`）
+     *
+     * 组字期间**绝不能改正文 DOM**：分页要先摘掉旧留白，再对父节点 `normalize()`
+     * 把拆开的文本节点合回去 —— 正在组字的那个文本节点会被并进去，
+     * 浏览器随即结束组字，表现就是「拼音字母直接落进正文」。
+     * 分页留白又是插在页边界上的，所以问题只在页末 / 页首附近出现。
+     */
+    private composing: boolean = false;
+
+    /**
+     * 组字期间被摘掉的**旧行级留白**（摘的时候先记下来，见 {@link DocView.removePageGaps}）
+     *
+     * 排页的开头总是先摘掉旧留白再量。组字期间若正巧碰到「必须拆开组字文本节点」
+     * 的行首，这一轮就拆不动 —— 此时若让旧留白一直缺席，页边界就消失，
+     * 后续内容整体上移、压到分页位置，整篇排版都会乱掉。所以这里先把旧留白
+     * 记下来，拆不动时原样放回，保住页边界；组字结束后再正常拆行。
+     */
+    private composingGapBackup: {
+        /** 留白所属的块元素 */
+        block: HTMLElement;
+        /** 留白原来的父节点 */
+        parent: Node;
+        /** 留白原来的下一个兄弟（放回时的锚点） */
+        anchor: Node | null;
+        /** 留白元素本身 */
+        gap: HTMLElement;
+        /** 留白高度（CSS 像素） */
+        height: number;
+    }[] = [];
+
+    /**
      * 构造函数
      * @param options.store - 文档存储
      * @param options.parentElement - 挂载点
@@ -208,6 +239,14 @@ export class DocView {
             this.render();
             // 换文档 = 换一份页面设置：纸张 / 页边距跟着新文档的元数据走
             this.applyPageSetup(this.store.meta?.pageSetup ?? {});
+            // 撤销 / 重做：store 已按「旧树 → 新树」的文本差算好「改动末尾」，
+            // 这里在重渲染之后把光标送过去（不这样做会停在改动前的位置）
+            const caret = this.store.historyCaret;
+            if (!caret) return;
+            this.store.clearHistoryCaret();
+            // 焦点可能还留在工具栏的撤销按钮上：先让正文拿回焦点，光标才看得见
+            this.blocksEl.focus({ preventScroll: true });
+            this.restoreCaret(caret);
         });
         this.applyPageSetup(this.store.meta?.pageSetup ?? {});
     }
@@ -540,6 +579,9 @@ export class DocView {
             this.rendering = false;
         }
         if (caret) this.restoreCaret(caret);
+        // 重建 DOM 已经把组字打断（浏览器这时未必再发 compositionend）：
+        // 标记归零，否则后面的排页会被永久挡住
+        this.composing = false;
         // 重渲染把分页留白也清掉了：内容一变就得重排一次页
         this.schedulePaginate();
     }
@@ -586,17 +628,22 @@ export class DocView {
      * @returns 总页数
      */
     public paginate(): number {
-        const { height, margin } = this.pageGeometry();
+        // 排页会 splitText / normalize，可能把光标所在的文本节点切走：
+        // 先按（块 id + 偏移）记下光标，排完再放回去，否则光标会跳到上一页末尾。
+        // 组字期间选区归输入法所有，这里不能碰（改法见 removePageGaps / 行级拆分）。
+        const selection = window.getSelection();
+        const collapsed = !!selection && selection.rangeCount > 0 && selection.isCollapsed;
+        const caret = !this.composing && collapsed ? this.captureCaret() : null;
+        const { height, margin, contentHeight } = this.pageGeometry();
         const z = this.zoomValue || 1;
-        const children = Array.prototype.slice.call(this.blocksEl.children) as HTMLElement[];
-        // ① 摘掉上一轮的分页留白
-        for (let i = children.length - 1; i >= 0; i--) {
-            if (children[i].hasAttribute(DOC_PAGE_GAP_ATTR)) children[i].remove();
-        }
+        // ① 摘掉上一轮的分页留白（含块内「行级分页」留下的），并把被拆开的
+        //    文本节点合回去 —— 否则每排一次页，块里的文本节点就多切一刀
+        this.removePageGaps();
         const blocks = Array.prototype.slice.call(this.blocksEl.children) as HTMLElement[];
         if (blocks.length === 0) {
             this.pageCountValue = 1;
             this.applyFrame();
+            if (caret) this.restoreCaret(caret);
             return 1;
         }
         const top0 = this.blocksEl.getBoundingClientRect().top;
@@ -610,6 +657,7 @@ export class DocView {
             this.pageCountValue = pages;
             this.page.style.minHeight = `${height * pages}px`;
             this.applyFrame();
+            if (caret) this.restoreCaret(caret);
             return pages;
         }
         const tops: number[] = [];
@@ -620,37 +668,420 @@ export class DocView {
             bottoms.push((rect.bottom - top0) / z);
         }
 
-        // ② 决定每个块落在第几页（跨页的块整体下推，与 Word 的「段中不分页」同口径）
-        //    版面坐标 → 页号：整叠纸是「一页接一页」排的，第 n 页的纸顶在 n×纸高处，
-        //    它的正文起点再往下 margin；因此**不是**除以正文区高度（那会让第二页
-        //    的正文顶到上一页页脚的位置，页与页之间少掉两个页边距）。
+        // ② 逐块排页
+        //
+        // 版面坐标相对正文起点，第 n 页正文区是 `[n × 纸高, n × 纸高 + 正文区高]`；
+        // `pageOf` 把「正文区内的纵坐标」映射成页号，正文区之外（上下页边距）不参与。
+        //
+        // 跨页块**优先按行拆分**：把「刚好放不下的那一行」之前的文本留在本页，
+        // 之后的内容顶到下一页的正文起点。整段下推会让上一页底部空出一大块
+        //（正文区只有 931px，一段 200px 的段落被推走就空 200px），这正是要修掉的现象。
+        // 行高本身就是不可分割的排版单位，按行拆不会把一行劈成两半。
         const pageOf = (y: number): number => Math.floor((y + margin) / height);
+        /** 第 page 页正文区的下边界（版面坐标） */
+        const limitOf = (page: number): number => page * height + contentHeight;
         let page = 0;
         let shift = 0;
+
         for (let i = 0; i < blocks.length; i++) {
-            const start = pageOf(tops[i]);
-            const end = pageOf(Math.max(bottoms[i] - 1, tops[i]));
-            let target = Math.max(page, start);
-            if (end > target) target = end;
-            if (target <= page) continue;
-            // 需要把该块顶到 target 页的正文起点：留白 = 目标位置 − 当前（含已插留白）位置
-            const gap = target * height - (tops[i] + shift);
+            const top = tops[i] + shift;
+            let target = pageOf(top);
+            // 落在页脚区（正文区之下）的块不能留在这一页：整块顶到下一页正文起点
+            if (top > limitOf(target)) target += 1;
+            if (target > page) {
+                const gap = target * height - top;
+                if (gap > 0) {
+                    this.insertGap(blocks[i], gap, target);
+                    shift += gap;
+                }
+                page = target;
+            }
+            const bottomNow = bottoms[i] + shift;
+            if (bottomNow <= limitOf(page) + 1) continue;
+
+            // 跨页：先尝试行级拆分
+            const split = this.splitBlockAcrossPages(blocks[i], top0, z, page, height, contentHeight, shift);
+            if (split) {
+                shift += split.added;
+                page = split.lastPage;
+                continue;
+            }
+            // 拆不动（表格 / 空块 / 单行比正文区还高）：退回整块下推
+            const endPage = Math.max(page + 1, pageOf(bottomNow));
+            const gap = endPage * height - (tops[i] + shift);
             if (gap > 0) {
-                const spacer = createDiv({ className: 'doc-page-gap' });
-                spacer.setAttribute(DOC_PAGE_GAP_ATTR, String(target));
-                spacer.setAttribute('contenteditable', 'false');
-                spacer.style.height = `${gap}px`;
-                this.blocksEl.insertBefore(spacer, blocks[i]);
+                this.insertGap(blocks[i], gap, endPage);
                 shift += gap;
             }
-            page = target;
+            page = endPage;
         }
+
         const total = bottoms.length > 0 ? bottoms[bottoms.length - 1] + shift : 0;
         const pages = Math.max(1, pageOf(Math.max(total - 1, 0)) + 1);
         this.pageCountValue = pages;
         this.page.style.minHeight = `${Math.max(height, height * pages)}px`;
         this.applyFrame();
+        if (caret) this.restoreCaret(caret);
         return pages;
+    }
+
+    /**
+     * 摘掉上一轮插进正文的分页留白，并合并被拆开的文本节点
+     *
+     * 留白分两类：块与块之间的（直接子元素）与**块内跨页**的（夹在行内 span 之间）。
+     * 两类都是 `contenteditable=false` 的空元素，不承载文本；删掉它们之后
+     * `normalize()` 会把 `splitText` 切开的相邻文本节点合回去，模型读取不受影响。
+     */
+    private removePageGaps(): void {
+        const gaps = this.blocksEl.querySelectorAll(`[${DOC_PAGE_GAP_ATTR}]`);
+        // 每轮重新记：上一轮记下但没用上的（已经正常重排）不需要留到这一轮
+        this.composingGapBackup = [];
+        for (let i = gaps.length - 1; i >= 0; i--) {
+            const gap = gaps[i] as HTMLElement;
+            const parent = gap.parentNode;
+            if (!parent) continue;
+            // 组字期间先把**行级**留白的位置记下来：拆不动组字节点时要用它们把页边界放回去
+            if (this.composing && gap.getAttribute(DOC_PAGE_GAP_ATTR) === 'line') {
+                // 留白的父节点是 run 段（span）时，块是它的父元素；直接挂在块下时块就是父节点
+                const parentEl = parent.nodeType === 1 ? (parent as HTMLElement) : null;
+                const block = parentEl ? (parentEl.hasAttribute('data-id') ? parentEl : parentEl.parentElement) : null;
+                if (block) {
+                    this.composingGapBackup.push({
+                        block,
+                        parent,
+                        anchor: gap.nextSibling,
+                        gap,
+                        height: parseFloat(gap.style.height) || 0,
+                    });
+                }
+            }
+            parent.removeChild(gap);
+            // 组字期间不能 normalize：它会把正在组字的文本节点并回去，
+            // 浏览器随即结束组字（拼音字母直接落进正文）。组字结束后再合并。
+            if (!this.composing && parent.nodeType === 1) (parent as HTMLElement).normalize();
+        }
+    }
+
+    /**
+     * 把组字那个块上一轮的页边界放回去
+     *
+     * 只放回「这一块」的行级留白：其余块的留白会由本轮排页重新插好，
+     * 这时若把全部旧留白都塞回去，就会插两遍、把内容顶到更下面去。
+     * @param el - 当前正在拆的块
+     * @returns 放回的总高度与被放回的留白条数；这一块本来就没有行级留白时为 0 条
+     */
+    private restoreComposingGaps(el: HTMLElement): { added: number; count: number } {
+        let added = 0;
+        let count = 0;
+        for (let i = this.composingGapBackup.length - 1; i >= 0; i--) {
+            const item = this.composingGapBackup[i];
+            if (item.block !== el) continue;
+            this.composingGapBackup.splice(i, 1);
+            // 父节点已经被本次排页改掉 / 锚点已不在它下面：放不回去了，放弃
+            if (!item.parent.isConnected || (item.anchor && item.anchor.parentNode !== item.parent)) continue;
+            item.parent.insertBefore(item.gap, item.anchor);
+            added += item.height;
+            count += 1;
+        }
+        return { added, count };
+    }
+
+    /**
+     * 在块前插入一个分页留白
+     * @param before - 目标块
+     * @param gap - 留白高度（CSS 像素，未缩放）
+     * @param page - 目标页号（仅用于调试标记）
+     */
+    private insertGap(before: HTMLElement, gap: number, page: number): void {
+        const spacer = createDiv({ className: 'doc-page-gap' });
+        spacer.setAttribute(DOC_PAGE_GAP_ATTR, String(page));
+        spacer.setAttribute('contenteditable', 'false');
+        spacer.style.height = `${Math.max(0, Math.round(gap))}px`;
+        this.blocksEl.insertBefore(spacer, before);
+    }
+
+    /**
+     * 把一个跨页的块按行拆分（在「放不下的那一行」之前插入块级留白）
+     *
+     * 先逐字符量出每一行的行首，再把留白插在行首之前 —— 行内不能拆，
+     * 否则会在页面底部留下半行字。插留白只改 DOM 的视觉布局，
+     * 块 id / 块树 / 同步逻辑都不受影响（留白里没有文本）。
+     * @param el - 块元素
+     * @param top0 - 正文起点（视口坐标）
+     * @param z - 缩放比
+     * @param startPage - 块开始所在页
+     * @param height - 纸高（未缩放）
+     * @param contentHeight - 正文区高
+     * @param shift - 前面已插留白造成的累计位移
+     * @returns 新增留白总高与最后所在页；无法拆分时 null
+     */
+    private splitBlockAcrossPages(
+        el: HTMLElement,
+        top0: number,
+        z: number,
+        startPage: number,
+        height: number,
+        contentHeight: number,
+        shift: number
+    ): { added: number; lastPage: number } | null {
+        // 表格 / 分割线 / 图片没有「行」的语义，拆开就不再是一个整体
+        const type = el.getAttribute('data-type') ?? '';
+        if (type === 'table' || type === 'hr' || type === 'image') return null;
+
+        const rects = this.measureCharRects(el, top0, z);
+        if (!rects || rects.length < 2) return null;
+
+        let page = startPage;
+        let extra = 0;
+        let lineTop = rects[0].top;
+        const splits: { node: Text; offset: number; gap: number }[] = [];
+
+        for (let i = 0; i < rects.length; i++) {
+            const item = rects[i];
+            // 行首判定：纵坐标比当前行顶低一截才是新行。阈值取 8px（版面坐标）：
+            // 上下标只偏移 2–4px，不会被误判成换行；正常行距是 20px 以上。
+            const isLineStart = i === 0 || item.top > lineTop + 8;
+            if (isLineStart) lineTop = item.top;
+            else continue;
+
+            const actualBottom = item.bottom + shift + extra;
+            if (actualBottom <= page * height + contentHeight + 1) continue;
+            // 第一行都放不下：不是「拆行」能解决的，交给调用方整块下推
+            // （整块下推只插块级留白、不碰任何文本节点，组字期间也是安全的）
+            if (i === 0) return null;
+            // 组字期间遇到「会动到组字文本节点」的行首：这一轮不拆（拆了会打断输入法）。
+            // 但页边界不能就这么消失 —— 旧留白已在排页开头被摘掉，不补回去的话
+            // 这一块及其后所有内容都会整体上移、压到分页位置。把这一块上一轮的
+            // 行级留白原样放回，等 compositionend 之后再正常拆行。
+            if (this.composing && this.hitsComposingNode(item.node, item.offset)) {
+                const restored = this.restoreComposingGaps(el);
+                // 放回了几条留白，这一块就还是停在原来的页数上；`added` 要计入后续块的位移
+                return { added: restored.added, lastPage: Math.min(page, startPage + restored.count) };
+            }
+            // 单行比整页正文区还高，继续拆只会无限循环：放弃
+            if (page > startPage + 200) return null;
+
+            const gap = (page + 1) * height - (item.top + shift + extra);
+            if (gap > 0) splits.push({ node: item.node, offset: item.offset, gap });
+            extra += Math.max(0, gap);
+            page += 1;
+        }
+
+        if (splits.length === 0) return null;
+        // 倒序插入：先处理靠后的行首，前面文本节点的下标才不受影响
+        for (let s = splits.length - 1; s >= 0; s--) {
+            const split = splits[s];
+            if (split.node.parentNode) this.insertLineGap(el, split.node, split.offset, split.gap);
+        }
+        return { added: extra, lastPage: page };
+    }
+
+    /**
+     * 逐字符量出版面坐标（只用于行级分页）
+     *
+     * 用 Range 逐字符取矩形：比「按行取矩形」多花一点时间，但能把行首精确定位到
+     * 文本节点 + 偏移，之后才能安全地 `splitText` / 拆 span。
+     * 超长块直接放弃（返回 null）——分页是显示层，不值得为一段几千字的文本卡住输入。
+     * @param el - 块元素
+     * @param top0 - 正文起点（视口坐标）
+     * @param z - 缩放比
+     * @returns 字符矩形；无文本或超出上限时 null
+     */
+    private measureCharRects(
+        el: HTMLElement,
+        top0: number,
+        z: number
+    ): { node: Text; offset: number; top: number; bottom: number }[] | null {
+        const MAX_CHARS = 2400;
+        const result: { node: Text; offset: number; top: number; bottom: number }[] = [];
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+        const range = document.createRange();
+        let node = walker.nextNode() as Text | null;
+        while (node) {
+            const text = node.nodeValue ?? '';
+            for (let i = 0; i < text.length; i++) {
+                if (result.length > MAX_CHARS) return null;
+                range.setStart(node, i);
+                range.setEnd(node, i + 1);
+                const rect = range.getBoundingClientRect();
+                if (rect.height <= 0) continue;
+                result.push({
+                    node,
+                    offset: i,
+                    top: (rect.top - top0) / z,
+                    bottom: (rect.bottom - top0) / z,
+                });
+            }
+            node = walker.nextNode() as Text | null;
+        }
+        return result.length > 0 ? result : null;
+    }
+
+    /**
+     * 这个行首的拆分会不会动到正在组字的文本节点
+     *
+     * 会动到的两种情况：
+     * 1. 行首就在组字节点里 —— `splitText` 直接把节点切开；
+     * 2. 组字节点与行首在同一个父节点、且排在它后面 —— `insertLineGap` 会把
+     *    行首之后的兄弟节点搬进新 span，组字节点跟着被搬走。
+     * 两种都会让浏览器立刻结束组字（拼音字母落进正文），所以只能等组字结束再拆。
+     * @param node - 行首所在文本节点
+     * @param offset - 行首在节点内的偏移
+     * @returns 是否命中组字节点
+     */
+    private hitsComposingNode(node: Text, offset: number): boolean {
+        const selection = window.getSelection();
+        if (!selection || selection.rangeCount === 0) return false;
+        const caret = selection.getRangeAt(0).startContainer;
+        if (caret.nodeType !== 3) return false;
+        if (caret === node) {
+            // 同一个文本节点：只有「拆分点落在组字区里」才会打断输入法。
+            // 组字那段拼音永远在光标左侧，所以拆分点在光标**之后**时，
+            // 拼音仍留在原节点里，切出来的只是它右边还没组字的文字 —— 安全。
+            // 这一条很关键：普通段落整段只有一个文本节点，若一律拦下，
+            // 只要段落跨页、在页内任意位置打字都会命中守卫，整篇内容就会上移。
+            return offset < selection.getRangeAt(0).startOffset;
+        }
+        if (caret.parentNode !== node.parentNode) return false;
+        const probe = document.createRange();
+        probe.setStart(node, offset);
+        probe.collapse(true);
+        return probe.comparePoint(caret, 0) >= 1;
+    }
+
+    /**
+     * 在某个文本位置插入「行级分页留白」
+     *
+     * 行内 span 是块的直接子元素，所以拆法是：把「该位置之后」的节点搬进一个
+     * 同样式的空 span，再在两者之间插留白。这样块的直接子元素顺序仍是
+     * 「文字、留白、文字」，`readInline` 遍历时留白没有文本，模型不受影响。
+     * @param el - 块元素
+     * @param node - 行首所在文本节点
+     * @param offset - 行首在文本节点内的偏移
+     * @param gap - 留白高度
+     */
+    private insertLineGap(el: HTMLElement, node: Text, offset: number, gap: number): void {
+        const spacer = createDiv({ className: 'doc-page-gap' });
+        spacer.setAttribute(DOC_PAGE_GAP_ATTR, 'line');
+        spacer.setAttribute('contenteditable', 'false');
+        spacer.style.height = `${Math.max(1, Math.round(gap))}px`;
+
+        // 行首在文本节点中间：先切开文本
+        const pivot = offset > 0 ? node.splitText(offset) : node;
+        const parent = pivot.parentNode;
+        if (!parent) return;
+
+        // 文本直接挂在块下（空段落里刚输入的字）：留白插在文本之前
+        if (parent === el) {
+            el.insertBefore(spacer, pivot);
+            return;
+        }
+        // 常规形态：文本在 run span 里，span 是块的直接子元素
+        if (parent.nodeType === 1 && parent.parentNode === el) {
+            const holder = parent as HTMLElement;
+            const clone = holder.cloneNode(false) as HTMLElement;
+            let cursor: Node | null = pivot;
+            while (cursor) {
+                const next = cursor.nextSibling;
+                clone.appendChild(cursor);
+                cursor = next;
+            }
+            el.insertBefore(spacer, holder.nextSibling);
+            el.insertBefore(clone, spacer.nextSibling);
+            return;
+        }
+        // 更深的嵌套（当前渲染不会出现）：保留切好的文本，不插留白，
+        // 下一次 `normalize()` 会把相邻文本节点合回去，内容不丢
+    }
+
+    /**
+     * 光标右侧紧邻的分页留白
+     *
+     * 只在「右侧第一个可编辑内容之前正好是留白」时返回它；其余情况返回 null，
+     * 让浏览器的原生删除行为照常工作（同段落内的删字、段尾合并下一段都靠它）。
+     * @param range - 折叠光标
+     * @returns 留白元素；右侧没有留白时为 null
+     */
+    private gapAfterCaret(range: Range): HTMLElement | null {
+        const node = range.startContainer;
+        if (node.nodeType === 3 /* Node.TEXT_NODE */) {
+            // 光标不在文本末尾：右侧字符在同一个节点里，原生删除可用
+            if (range.startOffset < (node.nodeValue ?? '').length) return null;
+        } else if (node.nodeType === 1 /* Node.ELEMENT_NODE */) {
+            let sibling = (node as HTMLElement).childNodes[range.startOffset] ?? null;
+            while (sibling) {
+                if (isPageGap(sibling)) return sibling as HTMLElement;
+                if (hasEditableText(sibling)) return null;
+                sibling = sibling.nextSibling;
+            }
+        }
+        // 沿祖先向上找「右侧兄弟」：留白夹在当前节点的外层容器之后时也能命中
+        let cursor: Node | null = node;
+        while (cursor && cursor !== this.blocksEl) {
+            let sibling = cursor.nextSibling;
+            while (sibling) {
+                if (isPageGap(sibling)) return sibling as HTMLElement;
+                if (hasEditableText(sibling)) return null;
+                sibling = sibling.nextSibling;
+            }
+            cursor = cursor.parentNode;
+        }
+        return null;
+    }
+
+    /**
+     * 光标左侧紧邻的分页留白（{@link gapAfterCaret} 的镜像）
+     * @param range - 折叠光标
+     * @returns 留白元素；左侧没有留白时为 null
+     */
+    private gapBeforeCaret(range: Range): HTMLElement | null {
+        const node = range.startContainer;
+        if (node.nodeType === 3 /* Node.TEXT_NODE */) {
+            if (range.startOffset > 0) return null;
+        } else if (node.nodeType === 1 /* Node.ELEMENT_NODE */) {
+            let sibling = (node as HTMLElement).childNodes[range.startOffset - 1] ?? null;
+            while (sibling) {
+                if (isPageGap(sibling)) return sibling as HTMLElement;
+                if (hasEditableText(sibling)) return null;
+                sibling = sibling.previousSibling;
+            }
+        }
+        let cursor: Node | null = node;
+        while (cursor && cursor !== this.blocksEl) {
+            let sibling = cursor.previousSibling;
+            while (sibling) {
+                if (isPageGap(sibling)) return sibling as HTMLElement;
+                if (hasEditableText(sibling)) return null;
+                sibling = sibling.previousSibling;
+            }
+            cursor = cursor.parentNode;
+        }
+        return null;
+    }
+
+    /**
+     * 越过一个分页留白删掉相邻页的一个字符
+     *
+     * 删除后光标**留在原处**：向前删时原处就是「上一页页末」，向后删时就是
+     * 「下一页页首」，正是删完一个字之后该在的位置。程序化改 DOM 不会触发
+     * `input`，因此这里手动排一次同步（模型、撤销栈、分页都靠它收尾）。
+     * @param gap - 分页留白
+     * @param forward - true 删除留白之后的第一个字符（Delete），false 删除之前的最后一个字符（Backspace）
+     */
+    private deleteAcrossPageGap(gap: HTMLElement, forward: boolean): void {
+        const text = forward
+            ? firstTextAfter(gap, this.blocksEl)
+            : lastTextBefore(gap, this.blocksEl);
+        if (!text) return;
+        const value = text.nodeValue ?? '';
+        if (!value) return;
+        if (forward) {
+            text.deleteData(0, firstCodePointLength(value));
+        } else {
+            const size = lastCodePointLength(value);
+            text.deleteData(value.length - size, size);
+        }
+        this.scheduleSync();
     }
 
     /**
@@ -825,16 +1256,12 @@ export class DocView {
     private renderInline(block: DocBlock, mono: boolean): DocumentFragment {
         const fragment = document.createDocumentFragment();
         const chars = block.chars ?? [];
-        // 空格宽度按「所在文字的字符宽度」算：汉字段里一个空格占一个汉字宽（全角），
-        // 拉丁段里占半个（半角）。先逐字符标好类别，切段时把类别并进 run 签名，
-        // 于是「中文 English 中文」这种同一样式混排也会切成不同的段。
-        const classes = spaceWidthClasses(chars);
         let index = 0;
         while (index < chars.length) {
             const span = this.spanAt(block, index);
-            const key = `${runKey(chars[index], span, mono)}|${classes[index]}`;
+            const key = runKey(chars[index], span, mono);
             let end = index + 1;
-            while (end < chars.length && `${runKey(chars[end], this.spanAt(block, end), mono)}|${classes[end]}` === key) {
+            while (end < chars.length && runKey(chars[end], this.spanAt(block, end), mono) === key) {
                 end += 1;
             }
             let text = '';
@@ -934,8 +1361,24 @@ export class DocView {
      */
     private bindEvents(): void {
         // 输入 → 合并到一帧后同步（避免每个字符都走一次 getComputedStyle 全树遍历）
-        this.blocksEl.addEventListener('input', () => {
+        this.blocksEl.addEventListener('input', (event) => {
             if (this.rendering) return;
+            // 组字中途的 input 是临时的拼音串：不写进模型，但**仍要排页** ——
+            // 否则拼音占位把后面的文字挤到页脚空白里，要等组字结束才跳回下一页。
+            if (this.composing || (event as InputEvent).isComposing) {
+                this.schedulePaginate();
+                return;
+            }
+            this.scheduleSync();
+        });
+
+        // 输入法组字：组字期间同步不做、排页照做（排页内部会绕开组字文本节点）。
+        this.blocksEl.addEventListener('compositionstart', () => {
+            this.composing = true;
+        });
+        this.blocksEl.addEventListener('compositionend', () => {
+            this.composing = false;
+            // 此刻正文里已经是最终汉字：同步回模型，再由 sync 末尾安排一次排页
             this.scheduleSync();
         });
 
@@ -969,6 +1412,28 @@ export class DocView {
             if (input.data == null) return;
             event.preventDefault();
             this.insertText(input.data, this.pendingStyle);
+        });
+
+        // 【跨页删除】页末 / 页首的删除键要能越过分页留白
+        //
+        // 分页留白是 `contenteditable=false` 的块级元素，浏览器把它当成一个
+        // 「不可编辑的整体」：光标停在它前面按 Delete、或停在它后面按 Backspace，
+        // 默认行为删不掉相邻页上的第一个 / 最后一个字符（有时还会把留白本身删掉）。
+        // 这里只在「紧邻位置就是留白」时接管，其余情况一律放行给浏览器 —— 
+        // 段落合并、词删除（Ctrl+Delete）、输入法组字都仍由原生行为处理。
+        this.blocksEl.addEventListener('keydown', (event) => {
+            if (event.key !== 'Delete' && event.key !== 'Backspace') return;
+            if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing) return;
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0 || !selection.isCollapsed) return;
+            const range = selection.getRangeAt(0);
+            if (!this.blocksEl.contains(range.startContainer)) return;
+
+            const forward = event.key === 'Delete';
+            const gap = forward ? this.gapAfterCaret(range) : this.gapBeforeCaret(range);
+            if (!gap) return;
+            event.preventDefault();
+            this.deleteAcrossPageGap(gap, forward);
         });
 
         // 【单击 = 取消选区 + 把光标放到点击处】
@@ -1100,8 +1565,11 @@ export class DocView {
         if (blocks.length === 0) return;
         this.store.update(blocks, label, mode);
         if (reset) this.render();
-        // 内容高度可能变了（打字换行、插入图片）：重排一次页
-        this.schedulePaginate();
+        // 内容高度可能变了（打字换行、插入图片）：重排一次页。
+        // **必须在本帧内同步排完**：若再排到下一帧，浏览器会先画一帧
+        // 「新字符还留在页脚空白里」的中间状态，页末逐字输入时就表现为闪一下。
+        // （重渲染那条路自己已经重新安排过排页，这里不必重复。）
+        if (!reset) this.paginate();
     }
 
     /**
@@ -1745,6 +2213,88 @@ export class DocView {
     }
 }
 
+/* ———————————————————— 分页留白两侧的删除 ——————————————————— */
+
+/**
+ * 是否分页留白元素
+ * @param node - 节点
+ * @returns 是否留白
+ */
+function isPageGap(node: Node): boolean {
+    return node.nodeType === 1 && (node as Element).hasAttribute(DOC_PAGE_GAP_ATTR);
+}
+
+/**
+ * 子树里是否还有可编辑的文字
+ *
+ * 空 span / 空段落不算：光标可以直接越过它们继续找下一段真正的内容。
+ * @param node - 节点
+ * @returns 是否含文字
+ */
+function hasEditableText(node: Node): boolean {
+    if (node.nodeType === 3 /* Node.TEXT_NODE */) return (node.nodeValue ?? '').length > 0;
+    if (node.nodeType !== 1 /* Node.ELEMENT_NODE */) return false;
+    if (isPageGap(node)) return false;
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null);
+    return walker.nextNode() !== null;
+}
+
+/**
+ * 取留白之后的第一段文字（按文档顺序，不跨出正文）
+ * @param gap - 分页留白
+ * @param host - 正文容器
+ * @returns 文本节点；没有时 null
+ */
+function firstTextAfter(gap: Node, host: HTMLElement): Text | null {
+    const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT, null);
+    let node = walker.nextNode() as Text | null;
+    while (node) {
+        // 参数在前、node 在后 → 位掩码含 FOLLOWING（4）
+        if (gap.compareDocumentPosition(node) & 4 && (node.nodeValue ?? '').length > 0) return node;
+        node = walker.nextNode() as Text | null;
+    }
+    return null;
+}
+
+/**
+ * 取留白之前的最后一段文字（{@link firstTextAfter} 的镜像）
+ * @param gap - 分页留白
+ * @param host - 正文容器
+ * @returns 文本节点；没有时 null
+ */
+function lastTextBefore(gap: Node, host: HTMLElement): Text | null {
+    const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT, null);
+    let found: Text | null = null;
+    let node = walker.nextNode() as Text | null;
+    while (node) {
+        // 参数在前、node 在后 → 位掩码含 PRECEDING（2）
+        if ((gap.compareDocumentPosition(node) & 2) && (node.nodeValue ?? '').length > 0) found = node;
+        node = walker.nextNode() as Text | null;
+    }
+    return found;
+}
+
+/**
+ * 首个码点占几个 UTF-16 单元（代理对算一个字符）
+ * @param text - 文本
+ * @returns 1 或 2
+ */
+function firstCodePointLength(text: string): number {
+    const first = text.charCodeAt(0);
+    return first >= 0xd800 && first <= 0xdbff && text.length > 1 ? 2 : 1;
+}
+
+/**
+ * 末个码点占几个 UTF-16 单元（代理对算一个字符）
+ * @param text - 文本
+ * @returns 1 或 2
+ */
+function lastCodePointLength(text: string): number {
+    if (text.length < 2) return 1;
+    const last = text.charCodeAt(text.length - 1);
+    return last >= 0xdc00 && last <= 0xdfff ? 2 : 1;
+}
+
 /**
  * 读一个元素上的线型（内联样式优先，其次计算样式）
  *
@@ -1817,55 +2367,13 @@ function firstCharPx(block: DocBlock): number {
     return DEFAULT_DOC_FONT_SIZE;
 }
 
-/* ———————————————————— 空格宽度（「一个字符宽」） ———————————————————— */
+/* ———————————————————— 空格宽度（半角） ———————————————————— */
 
 /** 空格自然宽度测量缓存（key = 字体描述|字号），避免每个文字段都 new 一个 canvas */
 const spaceAdvanceCache = new Map<string, number>();
 
 /** 复用的 2D 上下文；取不到（受限环境）时按 1/4 字符宽估算 */
 let spaceMeasureCtx: CanvasRenderingContext2D | null = null;
-
-/**
- * 该码点是否属于「全角字符集」（汉字 / 假名 / 谚文 / 全角标点）
- * @param code - 码点
- * @returns 是否全角
- */
-function isWideCodePoint(code: number): boolean {
-    return (code >= 0x2e80 && code <= 0x9fff)   // CJK 部首 / 汉字
-        || (code >= 0xac00 && code <= 0xd7af)   // 谚文音节
-        || (code >= 0xf900 && code <= 0xfaff)   // 兼容汉字
-        || (code >= 0xfe30 && code <= 0xfe4f)   // 兼容形式
-        || (code >= 0xff00 && code <= 0xffef);  // 全角 ASCII / 全角标点
-}
-
-/**
- * 逐字符标注「字符宽度类别」，供空格跟随所在文段的宽度
- *
- * 空格本身没有类别：它跟随前一个实义字符；行首（或整段都是空格）跟随后面的实义字符。
- * 于是「中文 中文」里的空格按全角算，「word word」里的空格按半角算。
- * @param chars - 字符数组
- * @returns 每个字符的类别
- */
-function spaceWidthClasses(chars: Char[]): ('wide' | 'narrow')[] {
-    const classes: ('wide' | 'narrow')[] = new Array(chars.length);
-    let last: 'wide' | 'narrow' = 'narrow';
-    for (let i = 0; i < chars.length; i++) {
-        const piece = String(chars[i]?.char ?? '');
-        if (piece === ' ' || piece === '\t' || piece === '\n' || piece === '') continue;
-        last = isWideCodePoint(piece.codePointAt(0) ?? 0) ? 'wide' : 'narrow';
-        break;
-    }
-    for (let i = 0; i < chars.length; i++) {
-        const piece = String(chars[i]?.char ?? '');
-        if (piece === ' ' || piece === '\t' || piece === '\n' || piece === '') {
-            classes[i] = last;
-            continue;
-        }
-        last = isWideCodePoint(piece.codePointAt(0) ?? 0) ? 'wide' : 'narrow';
-        classes[i] = last;
-    }
-    return classes;
-}
 
 /**
  * 量一个空格在某字体 / 字号下的自然宽度（px）
@@ -1895,7 +2403,9 @@ function spaceAdvance(font: string, fontSize: number): number {
 /**
  * 一段文字里「空格的附加宽度」（即 `word-spacing` 的值）
  *
- * 目标宽度：全角文段一个空格 = 1em（一个汉字宽）；半角文段 = 0.5em（一个拉丁字符宽）。
+ * 目标宽度是 **0.5em**：Word 里的 ASCII 空格是半角，中文段里「4 个空格」正好等于
+ * 「2 个汉字宽」（官方文档常用 4 个空格做两字缩进）。按 1em 撑宽会让这 4 个空格
+ * 变成 4 字宽，导入 Word 文档时首段就比原文多缩一倍。
  * 写差额而不是绝对宽度：空格仍是普通空格字符，断行机会、光标、输入法全交给浏览器，
  * 不会像「撑宽的盒子」那样吃掉断行点。
  * @param chars - 段内字符
@@ -1904,12 +2414,10 @@ function spaceAdvance(font: string, fontSize: number): number {
  */
 function spaceWordSpacingOfText(chars: Char[], mono: boolean): string {
     let head: Char | undefined = chars[0];
-    let wide = false;
     for (let i = 0; i < chars.length; i++) {
         const piece = String(chars[i]?.char ?? '');
         if (piece === ' ' || piece === '\t' || piece === '\n' || piece === '') continue;
         head = chars[i];
-        wide = isWideCodePoint(piece.codePointAt(0) ?? 0);
         break;
     }
     const size = head && head.fontSize ? head.fontSize : DEFAULT_DOC_FONT_SIZE;
@@ -1918,7 +2426,7 @@ function spaceWordSpacingOfText(chars: Char[], mono: boolean): string {
         : head && head.fontFamily
             ? `"${head.fontFamily}", ${DEFAULT_DOC_FONT_FAMILY}`
             : DEFAULT_DOC_FONT_FAMILY;
-    const target = wide ? size : size / 2;
+    const target = size / 2;
     const extra = Math.max(0, target - spaceAdvance(font, size));
     return `${Math.round(extra * 100) / 100}px`;
 }

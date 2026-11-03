@@ -274,6 +274,40 @@ export function writeCharStyle(char: Char, style: CharStylePatch): void {
 }
 
 /**
+ * 在块文本开头插入一段文字，并把原有字符区间整体右移
+ *
+ * 用于 Word 自动编号这类「不在正文里、但必须显示」的文字：编号只有落成正文的一部分，
+ * 才能和段落的首行缩进、字体排在一起（「一、」「二、」是手工写的，「三、」是自动编号）。
+ * @param block - 块
+ * @param text - 插入到开头的文字
+ */
+export function prefixBlockText(block: DocBlock, text: string): void {
+    const prefix = charsFromText(text);
+    if (prefix.length === 0) return;
+    // 新字符沿用段首字符的样式：编号与正文的字号 / 字体 / 加粗不能跳变
+    const sample = block.chars[0];
+    if (sample) {
+        const style: CharStylePatch = {};
+        if (sample.fontFamily) style.fontFamily = sample.fontFamily;
+        if (sample.fontSize) style.fontSize = sample.fontSize;
+        if (sample.fontWeight) style.bold = true;
+        if (sample.fontStyle) style.italic = true;
+        if (sample.underline) style.underline = true;
+        if (sample.strikethrough) style.strike = true;
+        if (sample.fontColor) style.color = sample.fontColor;
+        for (const char of prefix) writeCharStyle(char, style);
+    }
+    // 插在开头 = 原有字符下标全部右移，区间不平移会让高亮 / 上下标错位
+    if (block.spans) {
+        for (const span of block.spans) {
+            span.start += prefix.length;
+            span.end += prefix.length;
+        }
+    }
+    block.chars.splice(0, 0, ...prefix);
+}
+
+/**
  * 创建一个新块
  * @param options - 块类型与初始文本
  * @returns 新块

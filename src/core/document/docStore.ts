@@ -39,6 +39,15 @@ function blocksToText(blocks: DocBlock[]): string {
     return blocks.map((block) => blockText(block)).join('\n');
 }
 
+/**
+ * 取单个块的纯文本（块缺失时为空串）
+ * @param block - 块
+ * @returns 纯文本
+ */
+function textOfBlock(block: DocBlock | undefined): string {
+    return block ? blockText(block) : '';
+}
+
 /** 文档内容发生变化（视图据此重绘） */
 export const DOC_CHANGED = 'doc:changed';
 
@@ -55,6 +64,19 @@ export const DOC_RESET = 'doc:reset';
  * - `none`：不记撤销（撤销/重做自身的回写、装载）
  */
 export type DocUpdateMode = 'coalesce' | 'single' | 'none';
+
+/**
+ * 撤销 / 重做之后光标应落到的位置
+ *
+ * 刻意与 `docView` 的 `DocCaret` 保持同一形状，但**不 import 它**：
+ * 存储层不该认识视图层，两份同形接口比一条反向依赖划算得多。
+ */
+export interface DocHistoryCaret {
+    /** 块 id */
+    blockId: string;
+    /** 块内码点偏移 */
+    offset: number;
+}
 
 /**
  * 文档存储
@@ -95,6 +117,19 @@ export class DocStore extends EventEmitter {
     /** 最近一次落库失败的原因（供上层提示，不影响继续编辑） */
     private lastError: string = '';
 
+    /**
+     * 撤销 / 重做后光标要跟随到的位置
+     *
+     * 在 {@link undo} / {@link redo} 里按「旧树 → 新树」的文本差算出，
+     * 随后的 `DOC_RESET` 由视图取走并恢复光标（见 {@link DocView} 的订阅）。
+     * 其它会发 `DOC_RESET` 的路径（装载 / 关闭 / 导入）都会把它清空 ——
+     * 否则一次撤销留下的位置会把下一份文档的光标也拽过去。
+     */
+    private historyCaretValue: DocHistoryCaret | null = null;
+
+    /** 装载序号：并发打开多份文档时，只有最后一次装载允许落地 */
+    private loadToken: number = 0;
+
     // ─────────────────────────── 只读访问 ───────────────────────────
 
     /** 当前文档存档键 */
@@ -133,6 +168,21 @@ export class DocStore extends EventEmitter {
         return this.undoManager.canRedo();
     }
 
+    /**
+     * 撤销 / 重做后光标应跟随到的位置（没有待跟随位置时为 null）
+     *
+     * 只在 {@link undo} / {@link redo} 之后的那个 `DOC_RESET` 上有效；
+     * 视图取走后应调用 {@link clearHistoryCaret}，避免下一次重渲染又跳回来。
+     */
+    public get historyCaret(): DocHistoryCaret | null {
+        return this.historyCaretValue;
+    }
+
+    /** 清掉待跟随的光标位置 */
+    public clearHistoryCaret(): void {
+        this.historyCaretValue = null;
+    }
+
     // ─────────────────────────── 装载与切换 ───────────────────────────
 
     /**
@@ -144,8 +194,14 @@ export class DocStore extends EventEmitter {
      * @param title - 文档标题（通常为该文件去掉后缀的名字）
      */
     public async load(docKey: string, title: string = ''): Promise<void> {
+        // 并发装载时**最后发起的那次**说了算：进入时就抢序号（同步、按调用顺序），
+        // 等待落库之后再核对一次，早先的装载直接放弃，不再改写 snapshotData。
+        // 少了这个守卫，「同时打开两份文档」会出现「键指向 B、内容却是 A」的串档。
+        const token = ++this.loadToken;
         await this.flush();
+        if (token !== this.loadToken) return;
         this.key = docKey;
+        this.historyCaretValue = null;
         this.resetUndo();
 
         let snapshot: DocSnapshot | null = null;
@@ -155,6 +211,8 @@ export class DocStore extends EventEmitter {
         } catch {
             snapshot = null;
         }
+        // 读库期间又有人发起装载：本次结果作废（否则会把新文档覆盖成旧内容）
+        if (token !== this.loadToken) return;
 
         if (!snapshot) {
             snapshot = createBlankSnapshot(title || this.titleFromKey(docKey));
@@ -189,7 +247,38 @@ export class DocStore extends EventEmitter {
      */
     public async close(): Promise<void> {
         await this.flush();
+        // 关掉之后再有挂起的装载返回，也不能把内容写回来
+        this.loadToken += 1;
         this.key = '';
+        this.historyCaretValue = null;
+        this.snapshotData = createBlankSnapshot();
+        this.resetUndo();
+        this.emit(DOC_RESET);
+    }
+
+    /**
+     * 丢弃当前文档的内存态（**不落库**）
+     *
+     * 用于「同一个存档键的文件被重新导入」：调用方已经把新解析出的存档直接写进
+     * `docs` 仓，此时内存里还留着旧的块树与（视图状态带来的）脏标记。
+     * 若不丢弃，紧接着 {@link load} 开头的 {@link flush} 会把旧内容写回同一个键，
+     * 把刚写入的新存档覆盖掉 —— 表现就是「重新打开 docx 还是老内容」。
+     */
+    public discardCurrent(): void {
+        if (this.saveTimer !== null) {
+            clearTimeout(this.saveTimer);
+            this.saveTimer = null;
+        }
+        if (this.burstTimer !== null) {
+            clearTimeout(this.burstTimer);
+            this.burstTimer = null;
+        }
+        this.burstBefore = null;
+        this.dirty = false;
+        this.key = '';
+        this.historyCaretValue = null;
+        // 丢弃内存态之后，挂起的装载（如果还有）同样不再有效
+        this.loadToken += 1;
         this.snapshotData = createBlankSnapshot();
         this.resetUndo();
         this.emit(DOC_RESET);
@@ -283,6 +372,8 @@ export class DocStore extends EventEmitter {
      */
     public replaceBlocks(blocks: DocBlock[]): void {
         this.flushBurst();
+        // 整体替换（导入 / 外部写回）没有「变更末尾」可言，不该沿用上一次撤销的位置
+        this.historyCaretValue = null;
         this.snapshotData.blocks = normalizeBlocks(blocks);
         this.markDirty();
         this.emit(DOC_RESET);
@@ -297,8 +388,11 @@ export class DocStore extends EventEmitter {
      */
     public undo(): boolean {
         this.flushBurst();
+        this.historyCaretValue = null;
         const done = this.undoManager.undo((action, isUndo) => {
             const target = isUndo ? action.data.before : action.data.after;
+            // 先按「当前树 → 回写树」算光标，再改 snapshotData（算的时候旧树还在）
+            this.historyCaretValue = this.caretAfterChange(this.snapshotData.blocks, target as DocBlock[]);
             this.snapshotData.blocks = cloneBlocks(target as DocBlock[]);
             this.markDirty();
         });
@@ -315,8 +409,10 @@ export class DocStore extends EventEmitter {
      */
     public redo(): boolean {
         this.flushBurst();
+        this.historyCaretValue = null;
         const done = this.undoManager.redo((action, isUndo) => {
             const target = isUndo ? action.data.before : action.data.after;
+            this.historyCaretValue = this.caretAfterChange(this.snapshotData.blocks, target as DocBlock[]);
             this.snapshotData.blocks = cloneBlocks(target as DocBlock[]);
             this.markDirty();
         });
@@ -325,6 +421,45 @@ export class DocStore extends EventEmitter {
             this.emit(DOC_CHANGED);
         }
         return done;
+    }
+
+    /**
+     * 按「旧树 → 新树」的文本差算出「改动末尾」的光标位置
+     *
+     * 撤销 / 重做要把光标送到变动的字符之后（Word 的行为）：只沿用原来的
+     * `(块 id, 偏移)` 会停在「改动前」的位置，撤销一次粘贴后光标可能落在段首，
+     * 甚至因为偏移超出新文本长度而被夹到别处。
+     *
+     * 做法：先找**最后一个**文本不同的块，再在该块内取「公共前缀 + 公共后缀」
+     * 之外的区间，光标落在它的末尾。找不到差异（纯格式改动）时返回 null，
+     * 由视图保留原光标。
+     * @param from - 变更前的块树
+     * @param to - 变更后的块树
+     * @returns 光标位置；无文本差异时为 null
+     */
+    private caretAfterChange(from: DocBlock[], to: DocBlock[]): DocHistoryCaret | null {
+        const count = Math.max(from.length, to.length);
+        let lastDiff = -1;
+        for (let i = 0; i < count; i++) {
+            if (textOfBlock(from[i]) !== textOfBlock(to[i])) lastDiff = i;
+        }
+        if (lastDiff < 0) return null;
+        // 结构型改动（撤销一次回车 / 粘贴）会让下标落在「新树已没有的块」上：
+        // 退到新树的最后一块，再按前后缀算出的位置就是这次改动的落点。
+        const target = to[lastDiff] ?? to[to.length - 1];
+        if (!target) return null;
+
+        const oldText = textOfBlock(from[lastDiff]);
+        const newText = textOfBlock(target);
+        let prefix = 0;
+        while (prefix < oldText.length && prefix < newText.length && oldText[prefix] === newText[prefix]) prefix += 1;
+        let suffix = 0;
+        while (suffix < oldText.length - prefix
+            && suffix < newText.length - prefix
+            && oldText[oldText.length - 1 - suffix] === newText[newText.length - 1 - suffix]) {
+            suffix += 1;
+        }
+        return { blockId: target.id, offset: newText.length - suffix };
     }
 
     /**

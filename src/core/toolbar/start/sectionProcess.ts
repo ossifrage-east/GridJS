@@ -20,7 +20,7 @@ import { TOOLBAR_CLASS_NAME } from "../../constant";
 import { BtnBase } from "../../common/button";
 import { Menu } from "../../common/menu";
 import { CommandBus } from "../../contract/commandBus";
-import { EDIT_STATE_CHANGED } from "../../contract/editHost";
+import { EDIT_STATE_CHANGED, WorkspaceKind } from "../../contract/editHost";
 
 /**
  * 「计算」菜单项的 todo → 即时计算项名
@@ -237,10 +237,29 @@ export class SectionProcess {
         this.toolbars = {
             calculateBtn,
             sortBtn,
+            frozenBtn,
             filterBtn,
             searchBtn,
         };
         this.setupStateListeners();
+    }
+
+    /**
+     * 按工作区类型收敛按钮
+     *
+     * 文档里这个分区只剩「查询」：求和 / 排序 / 冻结 / 筛选都绑在表格的选区与工作表上，
+     * 在文档中没有对应语义。查询是两类载体共用的（文档侧走 `openDocFindReplace`）。
+     * @param kind - 工作区类型
+     */
+    public setKind(kind: WorkspaceKind): void {
+        const doc = kind === 'doc';
+        const hide = (btn?: BtnBase): void => {
+            if (btn) btn.getElements().container.hidden = doc;
+        };
+        hide(this.toolbars.calculateBtn);
+        hide(this.toolbars.sortBtn);
+        hide(this.toolbars.frozenBtn);
+        hide(this.toolbars.filterBtn);
     }
 
     /**

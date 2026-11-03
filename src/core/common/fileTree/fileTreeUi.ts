@@ -127,7 +127,7 @@ export class FileTreeUi {
     protected options: FileTreeOptions;
     /** 根节点视图集合 */
     protected rootViews: TreeNodeView[] = [];
-    /** 当前选中节点（Shift 连选时为主操作对象，即最后点击的那个） */
+    /** 当前选中节点（多选时为主操作对象，即最后点击的那个） */
     protected selected: TreeNodeView | null = null;
     /**
      * Shift 连选的锚点（上一次**单击**选中的节点）
@@ -557,11 +557,30 @@ export class FileTreeUi {
      * @returns {TreeNodeView[]} 要移动的节点集合
      */
     protected collectDragSources(view: TreeNodeView): TreeNodeView[] {
+        const targets = this.collectActionTargets(view);
+        return targets.length > 0 ? targets : [view];
+    }
+
+    /**
+     * 收集右键「复制 / 剪切 / 删除」要作用的节点（即整组选区）
+     *
+     * - 只取当前**可见**的选中行（搜索过滤 / 折叠的内部行不参与）；
+     * - 文件夹与其子孙同时被选中时只保留文件夹：子孙会随文件夹整体处理，
+     *   再单独处理一次就会复制出多余的一份、或删除时重复收集路径；
+     * - 根节点「工作区」不可复制 / 剪切 / 删除，一律排除。
+     *
+     * 顺序按树中的可见顺序，剪贴板数据与来源视图按下标严格对应。
+     * @private
+     * @param {TreeNodeView} view - 被右键的节点（未在选区中时退化为只操作它）
+     * @returns {TreeNodeView[]} 操作目标；右键根节点且无其它选中项时为空
+     */
+    protected collectActionTargets(view: TreeNodeView): TreeNodeView[] {
         const candidates = this.visibleRows()
             .filter((node) => this.highlighted.has(node) && !this.isRootView(node));
         const topLevel = candidates.filter((node) => !candidates.some(
             (other) => other !== node && other.isFolder && this.isDescendantView(other, node)));
-        return topLevel.length > 0 ? topLevel : [view];
+        if (topLevel.length > 0) return topLevel;
+        return this.isRootView(view) ? [] : [view];
     }
 
     /**
@@ -597,11 +616,17 @@ export class FileTreeUi {
      * Shift + 左键为**连选**：从上次单击的节点（锚点）到本次点击的节点，
      * 区间内所有**可见**行一并高亮（用于表示多个文件被选中），
      * 且不改变展开状态 —— Shift 点文件夹只是把它并入选区，不应顺带收起。
+     * Ctrl / Cmd + 左键为**点选切换**：把该行加入或移出选区，
+     * 用于挑选不相邻的多个文件（同样不改变文件夹展开状态）。
      * @private
-     * @param {MouseEvent} e - 点击事件（取 shiftKey）
+     * @param {MouseEvent} e - 点击事件（取 shiftKey / ctrlKey / metaKey）
      * @param {TreeNodeView} view - 被点击的节点
      */
     protected handleRowClick(e: MouseEvent, view: TreeNodeView): void {
+        if ((e.ctrlKey || e.metaKey) && this.highlighted.size > 0) {
+            this.toggleSelect(view);
+            return;
+        }
         if (e.shiftKey && this.selectionAnchor && this.highlighted.size > 0) {
             this.selectRange(this.selectionAnchor, view);
             return;
@@ -774,16 +799,16 @@ export class FileTreeUi {
                 break;
 
             case 'cut':
-                this.clipboard = modelSerializeNodes([view]);
-                this.clipboardIsCut = true;
-                this.clipboardSources = [view];
-                break;
-            case 'copy':
-                this.clipboard = modelSerializeNodes([view]);
-                this.clipboardIsCut = false;
+            case 'copy': {
+                // 多选时整组进入剪贴板（按树中可见顺序），与来源视图按下标对应
+                const targets = this.collectActionTargets(view);
+                if (targets.length === 0) break;
+                this.clipboard = modelSerializeNodes(targets);
+                this.clipboardIsCut = todo === 'cut';
                 // 复制同样记录来源：用于阻止把文件夹粘贴进它自己的子孙
-                this.clipboardSources = [view];
+                this.clipboardSources = targets;
                 break;
+            }
             case 'paste':
                 this.pasteNodes(parent);
                 break;
@@ -791,7 +816,8 @@ export class FileTreeUi {
                 this.startRename(view);
                 break;
             case 'remove':
-                this.removeNodes([view]);
+                // 删除整组选区；根节点由 removeNodes 自身保护
+                this.removeNodes(this.collectActionTargets(view));
                 break;
             case 'property':
                 this.showProperty(view);
@@ -1130,6 +1156,31 @@ export class FileTreeUi {
         }
         // 锚点保持不动；主操作对象改为被点节点
         this.selected = to;
+    }
+
+    /**
+     * Ctrl / Cmd + 单击：把节点加入或移出选区（不改变文件夹展开状态）
+     *
+     * 移出的若是主操作对象或连选锚点，则改取选区中最后一个仍选中的节点，
+     * 使后续 Shift 连选仍能正常扩展。
+     * @private
+     * @param {TreeNodeView} view - 被点击的节点
+     */
+    protected toggleSelect(view: TreeNodeView): void {
+        if (this.highlighted.has(view)) {
+            view.row.classList.remove(TREE.SELECTED);
+            this.highlighted.delete(view);
+            if (this.selected === view || this.selectionAnchor === view) {
+                const remaining = this.visibleRows().filter((node) => this.highlighted.has(node));
+                this.selected = remaining.length > 0 ? remaining[remaining.length - 1] : null;
+                this.selectionAnchor = this.selected;
+            }
+            return;
+        }
+        view.row.classList.add(TREE.SELECTED);
+        this.highlighted.add(view);
+        this.selected = view;
+        this.selectionAnchor = view;
     }
 
     /**

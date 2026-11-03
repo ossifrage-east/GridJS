@@ -34,11 +34,28 @@ import {
     createBlankSnapshot,
     createBlock,
     normalizeBlocks,
+    prefixBlockText,
     writeCharStyle,
 } from '../blockTree';
 
 /** 主文档部件在 ZIP 内的路径 */
 const DOCUMENT_PART = 'word/document.xml';
+
+/** 编号定义部件在 ZIP 内的路径 */
+const NUMBERING_PART = 'word/numbering.xml';
+
+/** 单个编号级别（`w:lvl`）的定义 */
+interface NumberingLevel {
+    /** 起始编号（`w:start` / `w:startOverride`） */
+    start: number;
+    /** 编号格式（`w:numFmt`）：bullet / decimal / chineseCounting … */
+    numFmt: string;
+    /** 编号模板（`w:lvlText`）：`%1、` 里的 `%1` 由第 1 级编号替换 */
+    lvlText: string;
+}
+
+/** numId → 各级编号定义（ilvl → 级别） */
+type NumberingMap = Map<number, Map<number, NumberingLevel>>;
 
 /** 命名空间（写入侧用） */
 const NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
@@ -74,19 +91,211 @@ export async function docxToSnapshot(buffer: Uint8Array, title: string): Promise
     const bytes = await zip.readEntry(archive, DOCUMENT_PART);
     if (!bytes) throw new Error('不是有效的 .docx（缺少 word/document.xml）');
 
-    const blocks = parseDocumentXml(decodeUtf8(bytes));
+    // 编号定义决定「列表项该画项目符号还是序号」：Word 的自动编号（「一、」「三、」）
+    // 走 `numbering.xml` 里的 numFmt / lvlText，不能一律当成项目符号，也不能一律画成「1.」。
+    const numberingBytes = await zip.readEntry(archive, NUMBERING_PART);
+    const numberings = numberingBytes ? parseNumberingXml(decodeUtf8(numberingBytes)) : new Map<number, Map<number, NumberingLevel>>();
+
+    const blocks = parseDocumentXml(decodeUtf8(bytes), numberings);
     const snapshot = createBlankSnapshot(title);
     snapshot.blocks = normalizeBlocks(blocks);
     return snapshot;
 }
 
 /**
+ * 解析 `word/numbering.xml`，建立「numId → 各级编号定义」映射
+ *
+ * 逐级读取 `w:lvl` 的 `w:start` / `w:numFmt` / `w:lvlText`，并合并
+ * `w:lvlOverride`（`w:startOverride` 与整级覆盖）：Word 的中文编号
+ * （`chineseCounting` + `%1、`）只有靠这三项才能算出「三、」这样的编号文字。
+ * @param xml - 部件文本
+ * @returns numId → 各级编号定义
+ */
+function parseNumberingXml(xml: string): NumberingMap {
+    /** abstractNumId → ilvl → 级别定义 */
+    const abstractLevels = new Map<string, Map<number, NumberingLevel>>();
+    /** numId → 未合并的 abstractNumId 与各级覆盖 */
+    const numEntries = new Map<number, { abstractId: string | null; overrides: Map<number, NumberingLevel> }>();
+
+    let currentAbstract: string | null = null;
+    let currentLevels: Map<number, NumberingLevel> | null = null;
+    let currentNumId: number | null = null;
+    let numAbstractId: string | null = null;
+    let numOverrides: Map<number, NumberingLevel> | null = null;
+    let overrideIlvl = 0;
+
+    /** 正在读取的 `<w:lvl>`：abstractNum 里是级别定义，lvlOverride 里是覆盖定义 */
+    let lvlIlvl: number | null = null;
+    let lvlStart = 1;
+    let lvlFmt = 'decimal';
+    let lvlText = '';
+    let lvlTarget: 'abstract' | 'override' | null = null;
+
+    scanXml(new TextEncoder().encode(xml), {
+        onStart(name, attrs) {
+            switch (name) {
+                case 'abstractNum':
+                    currentAbstract = attrs['w:abstractNumId'] ?? null;
+                    currentLevels = new Map();
+                    break;
+                case 'lvl':
+                    lvlIlvl = parseInt(attrs['w:ilvl'] ?? '0', 10) || 0;
+                    lvlStart = 1;
+                    lvlFmt = 'decimal';
+                    lvlText = '';
+                    lvlTarget = currentAbstract !== null ? 'abstract' : 'override';
+                    break;
+                case 'start': {
+                    if (lvlIlvl === null) break;
+                    const value = parseInt(attrs['w:val'] ?? '1', 10);
+                    lvlStart = value > 0 ? value : 1;
+                    break;
+                }
+                case 'numFmt':
+                    if (lvlIlvl !== null) lvlFmt = (attrs['w:val'] ?? 'decimal').toLowerCase();
+                    break;
+                case 'lvlText':
+                    if (lvlIlvl !== null) lvlText = attrs['w:val'] ?? '';
+                    break;
+                case 'num': {
+                    const value = parseInt(attrs['w:numId'] ?? '', 10);
+                    currentNumId = Number.isFinite(value) ? value : null;
+                    numAbstractId = null;
+                    numOverrides = new Map();
+                    break;
+                }
+                case 'abstractNumId':
+                    if (currentNumId !== null) numAbstractId = attrs['w:val'] ?? null;
+                    break;
+                case 'lvlOverride':
+                    overrideIlvl = parseInt(attrs['w:ilvl'] ?? '0', 10) || 0;
+                    break;
+                case 'startOverride': {
+                    const value = parseInt(attrs['w:val'] ?? '1', 10);
+                    // 只给了起始值时，其余字段留空，合并阶段再沿用 abstract 里的同级定义
+                    numOverrides?.set(overrideIlvl, {
+                        start: value > 0 ? value : 1,
+                        numFmt: '',
+                        lvlText: '',
+                    });
+                    break;
+                }
+                default:
+                    break;
+            }
+        },
+        onEnd(name) {
+            if (name === 'lvl' && lvlIlvl !== null) {
+                const def: NumberingLevel = { start: lvlStart, numFmt: lvlFmt, lvlText: lvlText };
+                if (lvlTarget === 'abstract') currentLevels?.set(lvlIlvl, def);
+                else if (lvlTarget === 'override') numOverrides?.set(overrideIlvl, def);
+                lvlIlvl = null;
+                lvlTarget = null;
+            } else if (name === 'abstractNum') {
+                if (currentAbstract !== null && currentLevels) abstractLevels.set(currentAbstract, currentLevels);
+                currentAbstract = null;
+                currentLevels = null;
+            } else if (name === 'num') {
+                if (currentNumId !== null) {
+                    numEntries.set(currentNumId, {
+                        abstractId: numAbstractId,
+                        overrides: numOverrides ?? new Map(),
+                    });
+                }
+                currentNumId = null;
+                numAbstractId = null;
+                numOverrides = null;
+            }
+        },
+    });
+
+    const numberings: NumberingMap = new Map();
+    numEntries.forEach((entry, numId) => {
+        const levels = new Map<number, NumberingLevel>();
+        const base = entry.abstractId ? abstractLevels.get(entry.abstractId) : undefined;
+        base?.forEach((def, ilvl) => levels.set(ilvl, def));
+        entry.overrides.forEach((def, ilvl) => {
+            const inherited = levels.get(ilvl);
+            levels.set(ilvl, {
+                start: def.start,
+                numFmt: def.numFmt || inherited?.numFmt || 'decimal',
+                lvlText: def.lvlText || inherited?.lvlText || `%${ilvl + 1}.`,
+            });
+        });
+        numberings.set(numId, levels);
+    });
+    return numberings;
+}
+
+/** 该级编号是否是 Word 默认的「1.」有序编号（与 CSS 计数器画出来的一致，可继续用列表渲染） */
+function isDefaultDecimalLevel(level: NumberingLevel, ilvl: number): boolean {
+    return level.numFmt === 'decimal' && level.lvlText === `%${ilvl + 1}.`;
+}
+
+/** 整数 → 中文数字（1–99）；超出范围退回十进制 */
+function chineseNumber(value: number): string {
+    const digits = '零一二三四五六七八九';
+    if (value <= 0 || value >= 100) return String(value);
+    if (value < 10) return digits.charAt(value);
+    const tens = Math.floor(value / 10);
+    const ones = value % 10;
+    return (tens === 1 ? '' : digits.charAt(tens)) + '十' + (ones ? digits.charAt(ones) : '');
+}
+
+/** 按 numFmt 格式化一个编号值（numFmt 在解析时统一小写，这里同样按小写比较） */
+function formatListNumber(value: number, numFmt: string): string {
+    const fmt = numFmt.toLowerCase();
+    if (fmt === 'chinesecounting' || fmt === 'chinesecountingthousand') {
+        return chineseNumber(value);
+    }
+    return String(value);
+}
+
+/**
+ * 按 Word 的编号规则推进计数并算出本段编号文字
+ *
+ * 同一 numId 的各级计数按段落顺序递增；进入更深一级时把更深的计数清空（重新起算）。
+ * `%1`…`%9` 依次用对应级别的计数替换。
+ * @param numId - 编号定义 ID
+ * @param ilvl - 当前级别
+ * @param levels - 该 numId 的各级定义
+ * @param counters - 各 numId 的计数状态（跨段落保留）
+ * @returns 编号文字（如「三、」）
+ */
+function nextListLabel(
+    numId: number,
+    ilvl: number,
+    levels: Map<number, NumberingLevel>,
+    counters: Map<number, number[]>
+): string {
+    let state = counters.get(numId);
+    if (!state) {
+        state = [];
+        counters.set(numId, state);
+    }
+    const level = levels.get(ilvl);
+    const start = level?.start ?? 1;
+    state[ilvl] = state[ilvl] === undefined ? start : state[ilvl] + 1;
+    for (let deeper = ilvl + 1; deeper < 9; deeper++) state[deeper] = undefined;
+    const template = level?.lvlText || `%${ilvl + 1}.`;
+    return template.replace(/%([1-9])/g, (_match, digit: string) => {
+        const index = parseInt(digit, 10) - 1;
+        const def = levels.get(index);
+        if (state[index] === undefined) state[index] = def?.start ?? 1;
+        return formatListNumber(state[index], def?.numFmt ?? 'decimal');
+    });
+}
+
+/**
  * 扫描 `word/document.xml` 并组装块树
  * @param xml - 部件文本
+ * @param numberings - 编号定义映射（见 {@link parseNumberingXml}）
  * @returns 块树
  */
-function parseDocumentXml(xml: string): DocBlock[] {
+function parseDocumentXml(xml: string, numberings: NumberingMap): DocBlock[] {
     const root: DocBlock[] = [];
+    /** 编号计数（numId → 各级当前值），按段落出现顺序推进 */
+    const listCounters = new Map<number, number[]>();
     /** 段落目标栈：根数组，或某个单元格块的 children */
     const containers: DocBlock[][] = [root];
     /** 当前段落 */
@@ -95,6 +304,14 @@ function parseDocumentXml(xml: string): DocBlock[] {
     let paraStyle = '';
     let paraAlign: 'left' | 'center' | 'right' | 'justify' | undefined;
     let paraListLevel: number | null = null;
+    /**
+     * 当前段落的编号定义 ID（`w:numPr/w:numId/w:val`）
+     *
+     * `numId = 0` 是 Word 表示「本段不参与编号」的写法：段落可能从样式继承了编号，
+     * 再用 `numId=0` 显式取消。若只看 `numPr` 是否存在就当成列表项，
+     * 这类普通段落会被错误地渲染出项目符号。
+     */
+    let paraNumId: number | null = null;
     let paraIndent = 0;
     /** 首行缩进：`w:firstLineChars`（百分之一字符，200 = 2 字符） */
     let paraFirstLineChars = 0;
@@ -154,10 +371,30 @@ function parseDocumentXml(xml: string): DocBlock[] {
         } else if (style === 'title') {
             paragraph.type = 'heading';
             paragraph.level = 1;
-        } else if (paraListLevel !== null) {
-            paragraph.type = 'listItem';
-            paragraph.level = Math.max(0, Math.min(4, paraListLevel));
-            paragraph.listStyle = 'bullet';
+        } else if (paraListLevel !== null && paraNumId !== 0) {
+            // `numId=0` 表示显式取消编号（普通段落），不能当作列表项
+            const ilvl = Math.max(0, Math.min(4, paraListLevel));
+            const levels = paraNumId !== null ? numberings.get(paraNumId) : undefined;
+            const level = levels?.get(ilvl);
+            if (levels && level && paraNumId !== null && level.numFmt !== 'bullet') {
+                // 一律推进计数（多级编号的模板可能引用上一级），再决定是交给 CSS
+                // 计数器还是把编号文字写进正文
+                const label = nextListLabel(paraNumId, ilvl, levels, listCounters);
+                if (isDefaultDecimalLevel(level, ilvl)) {
+                    paragraph.type = 'listItem';
+                    paragraph.level = ilvl;
+                    paragraph.listStyle = 'ordered';
+                } else {
+                    // 非默认编号格式（「三、」「(1)」…）：CSS 计数器画不出来，
+                    // 把 Word 的编号值写进段落开头，「三、」才不会变成「1.」或消失
+                    prefixBlockText(paragraph, label);
+                }
+            } else {
+                // 项目符号；没有编号定义可依（numbering.xml 缺失或 numId 悬空）时也沿用旧行为
+                paragraph.type = 'listItem';
+                paragraph.level = ilvl;
+                paragraph.listStyle = 'bullet';
+            }
         }
         if (paraAlign) paragraph.align = paraAlign;
         if (paraIndent > 0) paragraph.indent = paraIndent;
@@ -173,6 +410,7 @@ function parseDocumentXml(xml: string): DocBlock[] {
         paraStyle = '';
         paraAlign = undefined;
         paraListLevel = null;
+        paraNumId = null;
         paraIndent = 0;
         paraFirstLineChars = 0;
         paraFirstLineTwips = 0;
@@ -229,6 +467,10 @@ function parseDocumentXml(xml: string): DocBlock[] {
                     break;
                 case 'ilvl':
                     paraListLevel = parseInt(attrs['w:val'] ?? '0', 10) || 0;
+                    break;
+                case 'numId':
+                    // 0 = 显式取消编号（见 paraNumId 的注释）
+                    paraNumId = parseInt(attrs['w:val'] ?? '0', 10) || 0;
                     break;
                 case 'ind': {
                     const left = parseInt(attrs['w:left'] ?? attrs['w:start'] ?? '0', 10) || 0;

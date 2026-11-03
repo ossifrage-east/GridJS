@@ -120,6 +120,8 @@ export function buildProfiles(sections: ToolbarSections): Record<WorkspaceKind, 
                 { el: sections.font.getElements().sectionFont, title: '字体' },
                 { el: sections.align.getElements().sectionAlign, title: '段落对齐' },
                 { el: sections.para.getElements().sectionParagraph, title: '段落样式' },
+                // 同一个分区换了名字：文档里只剩「查询」（求和 / 排序 / 冻结 / 筛选由 setKind 隐藏）
+                { el: sections.process.getElement().sectionProcess, title: '查询' },
             ],
         },
         {
